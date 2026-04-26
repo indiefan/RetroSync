@@ -21,7 +21,11 @@ die()  { printf '\033[1;31m[upgrade]\033[0m %s\n' "$*" >&2; exit 1; }
 
 if [[ ${EUID} -ne 0 ]]; then
   log "elevating via sudo for the installer step..."
-  exec sudo -E "$0" "$@"
+  # Plain `sudo` (no -E) — some sudoers policies reject env preservation
+  # with "not allowed to preserve the environment". Operators who need
+  # to override RETROSYNC_DIR / RETROSYNC_USER should invoke directly:
+  #   sudo RETROSYNC_DIR=... bash /opt/retrosync/install/upgrade.sh
+  exec sudo "$0" "$@"
 fi
 
 [[ -d "${RETROSYNC_DIR}/.git" ]] || die \
