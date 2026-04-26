@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# RetroSync `wrap` dispatcher — pre-launch sync + lease grab, exec
+# emulator, post-exit lease release. Installed to
+# ~/.local/bin/retrosync-wrap and invoked by Steam ROM Manager-generated
+# Steam shortcuts as the executable, with the original emulator command
+# passed after `--`.
+#
+# Why bash, not Python: os.execvp would replace this process, so the
+# bash trap wouldn't fire on emulator exit. A small bash script that
+# fork-execs the emulator AND traps EXIT to fire post-exit cleanup is
+# the simplest reliable pattern (see emudeck-sync-design.md §12.4).
+#
+# The four heavy lifters are Python subcommands:
+#   retrosync wrap-extract-rom   --  prints the ROM path from emu args
+#   retrosync wrap-derive-game-id ROM_PATH   prints "system:game_id"
+#   retrosync wrap-pre  SOURCE_ID SYSTEM:GAME_ID   pre-launch sync
+#   retrosync wrap-post SOURCE_ID SYSTEM:GAME_ID   post-exit cleanup
+#
+# Failure model: pre-launch sync errors are logged but never block
+# the emulator from launching. Post-exit cleanup is best-effort.
+# Hard-mode lease contention IS allowed to block (wrap-pre exits 1).
+
+set -u
+
+SOURCE_ID="${RETROSYNC_DECK_SOURCE_ID:-deck-1}"
+PRE_TIMEOUT="${RETROSYNC_WRAP_PRE_TIMEOUT:-10}"
+POST_TIMEOUT="${RETROSYNC_WRAP_POST_TIMEOUT:-30}"
+RETROSYNC_BIN="${RETROSYNC_BIN:-retrosync}"
+
+# Strip our own options if any (none for now); everything after `--`
+# is the emulator command line. SRM patcher inserts `--` at the right
+# spot.
+ARGS=("$@")
+if [[ "${1:-}" == "--" ]]; then
+  ARGS=("${@:2}")
+fi
+
+# Find the ROM path among the args (best-effort — if we can't find one,
+# we still launch but skip the sync).
+ROM_PATH="$("${RETROSYNC_BIN}" wrap-extract-rom -- "${ARGS[@]}" 2>/dev/null \
+            | head -n1 || true)"
+SYSTEM_GAME=""
+if [[ -n "${ROM_PATH}" ]]; then
+  SYSTEM_GAME="$("${RETROSYNC_BIN}" wrap-derive-game-id "${ROM_PATH}" \
+                  2>/dev/null | head -n1 || true)"
+fi
+
+cleanup() {
+  if [[ -n "${SYSTEM_GAME}" ]]; then
+    "${RETROSYNC_BIN}" wrap-post "${SOURCE_ID}" "${SYSTEM_GAME}" \
+        --timeout "${POST_TIMEOUT}" || true
+  fi
+}
+trap cleanup EXIT
+
+if [[ -n "${SYSTEM_GAME}" ]]; then
+  if ! "${RETROSYNC_BIN}" wrap-pre "${SOURCE_ID}" "${SYSTEM_GAME}" \
+        --timeout "${PRE_TIMEOUT}"; then
+    # wrap-pre exits non-zero only on hard-mode lease contention.
+    # Print the message wrap-pre wrote to stderr (already done by the
+    # subcommand) and refuse to launch.
+    exit 1
+  fi
+fi
+
+# Hand off to the emulator. exec replaces the bash process — wait,
+# we want the trap to fire so we can't exec. Use a child + wait.
+"${ARGS[@]}"
+status=$?
+exit "${status}"

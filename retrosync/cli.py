@@ -11,6 +11,7 @@ from pathlib import Path
 import click
 
 from . import conflicts as conflicts_mod
+from . import leases as leases_mod
 from .cloud import RcloneCloud, compose_paths, hash8, sha256_bytes
 from .config import DEFAULT_CONFIG_PATH, Config
 from .sources.base import SaveRef
@@ -479,6 +480,104 @@ def cmd_conflicts_resolve(ctx: click.Context, conflict_id: int,
     state.close()
 
 
+# ---------------- lease ----------------
+
+@main.group("lease")
+def cmd_lease() -> None:
+    """Inspect and manage active-device leases."""
+
+
+def _split_source_game(spec: str) -> tuple[str, str]:
+    if ":" not in spec:
+        raise click.ClickException(
+            f"expected <source>:<game-id>, got {spec!r}")
+    src, gid = spec.split(":", 1)
+    return src, gid
+
+
+@cmd_lease.command("list")
+@click.option("--system", default="snes", show_default=True,
+              help="System namespace to scan.")
+@click.pass_context
+def cmd_lease_list(ctx: click.Context, system: str) -> None:
+    """Walk every game manifest under <remote>/<system>/ and print any
+    active leases. Shows expired leases too (marked) so you can spot
+    crashed-device locks."""
+    cfg: Config = ctx.obj["config"]
+    cloud = RcloneCloud(remote=cfg.cloud.rclone_remote,
+                        binary=cfg.cloud.rclone_binary,
+                        config_path=cfg.cloud.rclone_config_path)
+    base = f"{cloud.remote.rstrip('/')}/{system}"
+    try:
+        entries = cloud.lsjson(base)
+    except Exception as exc:  # noqa: BLE001
+        raise click.ClickException(f"listing {base}: {exc}")
+    found = 0
+    for e in entries:
+        if not e.get("IsDir"):
+            continue
+        game_id = e["Name"]
+        paths = compose_paths(remote=cloud.remote, system=system,
+                              game_id=game_id, save_filename=f"{game_id}.bin")
+        try:
+            manifest = cloud.read_manifest(paths)
+        except Exception as exc:  # noqa: BLE001
+            click.echo(f"  {game_id}: ERROR reading manifest ({exc})")
+            continue
+        if manifest is None or manifest.active_lease is None:
+            continue
+        found += 1
+        click.echo(f"{system}/{game_id}: {leases_mod.describe(manifest.active_lease)}")
+    if not found:
+        click.echo("(no active leases)")
+
+
+@cmd_lease.command("show")
+@click.argument("spec")
+@click.option("--system", default="snes", show_default=True)
+@click.pass_context
+def cmd_lease_show(ctx: click.Context, spec: str, system: str) -> None:
+    """`<source>:<game-id>` — show that game's lease (or `(none)`)."""
+    _src, game_id = _split_source_game(spec)
+    cfg: Config = ctx.obj["config"]
+    cloud = RcloneCloud(remote=cfg.cloud.rclone_remote,
+                        binary=cfg.cloud.rclone_binary,
+                        config_path=cfg.cloud.rclone_config_path)
+    paths = compose_paths(remote=cloud.remote, system=system,
+                          game_id=game_id, save_filename=f"{game_id}.bin")
+    manifest = cloud.read_manifest(paths)
+    lease = manifest.active_lease if manifest else None
+    click.echo(leases_mod.describe(lease))
+
+
+@cmd_lease.command("release")
+@click.argument("spec")
+@click.option("--system", default="snes", show_default=True)
+@click.option("--force", is_flag=True,
+              help="Release even if the lease is held by a different source.")
+@click.pass_context
+def cmd_lease_release(ctx: click.Context, spec: str, system: str,
+                      force: bool) -> None:
+    """`<source>:<game-id> [--force]` — release the lease.
+
+    The operator escape hatch: when a device crashed and left the
+    lease hanging until expiry, --force clears it now."""
+    src, game_id = _split_source_game(spec)
+    cfg: Config = ctx.obj["config"]
+    cloud = RcloneCloud(remote=cfg.cloud.rclone_remote,
+                        binary=cfg.cloud.rclone_binary,
+                        config_path=cfg.cloud.rclone_config_path)
+    paths = compose_paths(remote=cloud.remote, system=system,
+                          game_id=game_id, save_filename=f"{game_id}.bin")
+    cleared = leases_mod.release(cloud=cloud, paths=paths,
+                                 source_id=src, force=force)
+    if cleared:
+        click.echo(f"released lease on {system}/{game_id}")
+    else:
+        click.echo(f"no change to {system}/{game_id} lease (held by other "
+                   f"source — re-run with --force to override)")
+
+
 # ---------------- sync-status ----------------
 
 @main.command("sync-status")
@@ -544,6 +643,219 @@ def cmd_migrate_paths(ctx: click.Context, system: str, dry_run: bool) -> None:
     state.close()
 
 
+# ---------------- deck (EmuDeck / Steam Deck) ----------------
+
+@main.command("wrap-extract-rom",
+              context_settings={"ignore_unknown_options": True,
+                                "allow_extra_args": True})
+@click.pass_context
+def cmd_wrap_extract_rom(ctx: click.Context) -> None:
+    """Print the ROM-path argument from an emulator command line.
+
+    Usage:  retrosync wrap-extract-rom -- <emulator-args...>
+
+    Used by the bash wrap dispatcher to find the ROM among the args
+    Steam ROM Manager generated. Exits non-zero if no ROM is found
+    so the dispatcher can skip the sync."""
+    from .deck.wrap import cmd_extract_rom
+    sys.exit(cmd_extract_rom(list(ctx.args)))
+
+
+@main.command("wrap-derive-game-id")
+@click.argument("rom_path")
+@click.pass_context
+def cmd_wrap_derive_game_id(ctx: click.Context, rom_path: str) -> None:
+    """Print `<system>:<game_id>` for ROM_PATH.
+
+    System is the EmuDeck `roms/<system>/` directory the ROM lives
+    under; game_id is the canonical slug of the ROM filename."""
+    from .deck.wrap import cmd_derive_game_id
+    cfg: Config = ctx.obj["config"]
+    sys.exit(cmd_derive_game_id(rom_path, config=cfg))
+
+
+@main.command("wrap-pre")
+@click.argument("source_id")
+@click.argument("system_game")
+@click.option("--timeout", "timeout_sec", type=float, default=10.0,
+              show_default=True)
+@click.pass_context
+def cmd_wrap_pre(ctx: click.Context, source_id: str, system_game: str,
+                 timeout_sec: float) -> None:
+    """Pre-launch sync + lease grab for SYSTEM:GAME_ID under SOURCE_ID."""
+    if ":" not in system_game:
+        raise click.ClickException("expected system:game_id")
+    system, game_id = system_game.split(":", 1)
+    from .deck.wrap import cmd_wrap_pre
+    cfg: Config = ctx.obj["config"]
+    sys.exit(cmd_wrap_pre(source_id=source_id, system=system,
+                          game_id=game_id, config=cfg,
+                          timeout_sec=timeout_sec))
+
+
+@main.command("wrap-post")
+@click.argument("source_id")
+@click.argument("system_game")
+@click.option("--timeout", "timeout_sec", type=float, default=30.0,
+              show_default=True)
+@click.pass_context
+def cmd_wrap_post(ctx: click.Context, source_id: str, system_game: str,
+                  timeout_sec: float) -> None:
+    """Post-exit cleanup for SYSTEM:GAME_ID under SOURCE_ID."""
+    if ":" not in system_game:
+        raise click.ClickException("expected system:game_id")
+    system, game_id = system_game.split(":", 1)
+    from .deck.wrap import cmd_wrap_post
+    cfg: Config = ctx.obj["config"]
+    sys.exit(cmd_wrap_post(source_id=source_id, system=system,
+                           game_id=game_id, config=cfg,
+                           timeout_sec=timeout_sec))
+
+
+@main.command("flush")
+@click.option("--timeout", "timeout_sec", type=float, default=10.0,
+              show_default=True,
+              help="Hard cap so suspend isn't blocked.")
+@click.pass_context
+def cmd_flush(ctx: click.Context, timeout_sec: float) -> None:
+    """Drain in-flight uploads. Run before suspend by the systemd hook."""
+    from .deck.flush import flush as do_flush
+    cfg: Config = ctx.obj["config"]
+    res = do_flush(config=cfg, timeout_sec=timeout_sec)
+    click.echo(f"flush: attempted={res.attempted} succeeded={res.succeeded} "
+               f"failed={res.failed} timed_out={res.timed_out}")
+
+
+@main.command("sync-pending")
+@click.pass_context
+def cmd_sync_pending(ctx: click.Context) -> None:
+    """Re-attempt any uploads that errored during an offline window.
+
+    Fired by NetworkManager-dispatcher on `up` so the daemon doesn't
+    have to wait for the next inotify burst to discover that it can
+    reach Drive again."""
+    from .deck.flush import sync_pending
+    cfg: Config = ctx.obj["config"]
+    res = sync_pending(config=cfg)
+    click.echo(f"sync-pending: attempted={res.attempted} "
+               f"succeeded={res.succeeded} failed={res.failed}")
+
+
+# ---------------- filename-map ----------------
+
+@main.group("filename-map")
+def cmd_filename_map() -> None:
+    """Inspect / invalidate the per-source save filename cache."""
+
+
+@cmd_filename_map.command("list")
+@click.option("--source", "source_id", help="Restrict to one source.")
+@click.pass_context
+def cmd_filename_map_list(ctx: click.Context,
+                          source_id: str | None) -> None:
+    cfg: Config = ctx.obj["config"]
+    state = StateStore(cfg.state.db_path)
+    rows = state.list_filename_map(source_id=source_id)
+    if not rows:
+        click.echo("(no filename map entries)")
+        state.close()
+        return
+    for r in rows:
+        rom = r.get("rom_stem") or "-"
+        click.echo(f"{r['source_id']:<14}  {r['game_id']:<28} "
+                   f"{r['filename']:<40} rom_stem={rom} "
+                   f"observed={r['observed_at']}")
+    state.close()
+
+
+@cmd_filename_map.command("invalidate")
+@click.argument("source_id")
+@click.argument("game_id", required=False)
+@click.pass_context
+def cmd_filename_map_invalidate(ctx: click.Context, source_id: str,
+                                game_id: str | None) -> None:
+    """`<source>` clears that source; `<source> <game-id>` one entry."""
+    cfg: Config = ctx.obj["config"]
+    state = StateStore(cfg.state.db_path)
+    n = state.invalidate_filename_map(source_id, game_id)
+    state.close()
+    click.echo(f"invalidated {n} entry/entries")
+
+
+# ---------------- deck patch-srm ----------------
+
+@main.group("deck")
+def cmd_deck() -> None:
+    """Steam Deck / EmuDeck-specific operations."""
+
+
+@cmd_deck.command("patch-srm")
+@click.option("--config-path", default=None,
+              help="Path to userConfigurations.json. Default: "
+                   "~/.config/steam-rom-manager/userData/userConfigurations.json")
+@click.option("--wrapper-path", default=None,
+              help="Path to retrosync-wrap. Default: ~/.local/bin/retrosync-wrap")
+@click.option("--unpatch", is_flag=True,
+              help="Restore the parsers' original executables.")
+@click.option("--dry-run", is_flag=True,
+              help="Print the new config without writing it.")
+@click.pass_context
+def cmd_deck_patch_srm(ctx: click.Context,
+                       config_path: str | None,
+                       wrapper_path: str | None,
+                       unpatch: bool, dry_run: bool) -> None:
+    """Patch Steam ROM Manager parsers to call retrosync-wrap.
+
+    After patching, re-run SRM's "Save to Steam" so every shortcut
+    bakes in the wrapper. Idempotent — re-running is a no-op."""
+    from .deck import srm as srm_mod
+    cp = Path(config_path) if config_path else srm_mod.DEFAULT_SRM_CONFIG_PATH
+    wp = Path(wrapper_path) if wrapper_path else srm_mod.DEFAULT_WRAPPER_PATH
+    try:
+        summary, _ = srm_mod.patch_srm_config(
+            config_path=cp, wrapper_path=wp,
+            unpatch=unpatch, write=not dry_run)
+    except FileNotFoundError as exc:
+        raise click.ClickException(str(exc))
+    click.echo(f"parsers={summary.parsers_total} "
+               f"patched={summary.patched} "
+               f"already_patched={summary.already_patched} "
+               f"unpatched={summary.unpatched} "
+               f"skipped={summary.skipped}")
+    if not dry_run and not unpatch and summary.patched > 0:
+        click.echo()
+        click.echo("Open Steam ROM Manager (EmuDeck → Tools → Steam ROM "
+                   "Manager) and re-run \"Add Games\" → \"Parse\" → "
+                   "\"Save to Steam\" to bake the wrapper into your "
+                   "shortcuts.")
+
+
+@cmd_deck.command("detect-paths")
+@click.option("--system", default="snes", show_default=True)
+@click.pass_context
+def cmd_deck_detect_paths(ctx: click.Context, system: str) -> None:
+    """Print the EmuDeck root, saves dir, and ROM dir we'd use.
+
+    Useful for validating the install before running the daemon — if
+    this prints sensible paths, the daemon will too."""
+    from .deck import emudeck_paths
+    paths = emudeck_paths.detect_paths(system=system)
+    if paths is None:
+        click.echo("EmuDeck install not detected — checked:")
+        for p in emudeck_paths.EMUDECK_ROOT_CANDIDATES:
+            click.echo(f"  {p}")
+        sys.exit(1)
+    click.echo(f"emudeck_root  : {paths.emudeck_root}")
+    click.echo(f"saves_root    : {paths.saves_root}")
+    click.echo(f"roms_root     : {paths.roms_root}")
+    click.echo(f"retroarch_cfg : {paths.retroarch_cfg or '(not found)'}")
+    if paths.retroarch_cfg is not None:
+        warnings = emudeck_paths.check_core_save_overrides(
+            paths.retroarch_cfg)
+        for w in warnings:
+            click.echo(f"WARNING: {w.detail}")
+
+
 @main.command("dump-config")
 @click.pass_context
 def cmd_dump_config(ctx: click.Context) -> None:
@@ -554,6 +866,7 @@ def cmd_dump_config(ctx: click.Context) -> None:
         "cloud": cfg.cloud.__dict__,
         "orchestrator": cfg.orchestrator.__dict__,
         "state": cfg.state.__dict__,
+        "lease": cfg.lease.__dict__,
         "sources": [{"id": s.id, "adapter": s.adapter, "options": s.options}
                     for s in cfg.sources],
     }

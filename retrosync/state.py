@@ -88,6 +88,21 @@ CREATE TABLE IF NOT EXISTS conflicts (
 
 CREATE INDEX IF NOT EXISTS conflicts_open
   ON conflicts(resolved_at) WHERE resolved_at IS NULL;
+
+-- Per-(source, game) record of the canonical save filename on the device.
+-- For sources where the save filename is dictated by the user's ROM
+-- filename (the EmuDeck case: RetroArch derives the save path from the
+-- loaded ROM path), this table caches that mapping so a bootstrap-pull
+-- knows where to write the bytes without re-scanning the ROMs directory
+-- on every sync.
+CREATE TABLE IF NOT EXISTS device_filename_map (
+  source_id   TEXT NOT NULL,
+  game_id     TEXT NOT NULL,
+  filename    TEXT NOT NULL,
+  rom_stem    TEXT,
+  observed_at TEXT NOT NULL,
+  PRIMARY KEY (source_id, game_id)
+);
 """
 
 # Lightweight migrations applied on every open. SQLite doesn't have an
@@ -433,6 +448,67 @@ class StateStore:
             "SELECT * FROM conflicts "
             "WHERE game_id=? AND resolved_at IS NULL "
             "ORDER BY id", (game_id,))]
+
+    # ----------- device_filename_map -----------
+
+    def get_filename_map(self, source_id: str,
+                         game_id: str) -> dict | None:
+        row = self._conn.execute(
+            "SELECT * FROM device_filename_map "
+            "WHERE source_id=? AND game_id=?",
+            (source_id, game_id)).fetchone()
+        if not row:
+            return None
+        return {
+            "source_id": row["source_id"],
+            "game_id": row["game_id"],
+            "filename": row["filename"],
+            "rom_stem": row["rom_stem"],
+            "observed_at": row["observed_at"],
+        }
+
+    def set_filename_map(self, *, source_id: str, game_id: str,
+                         filename: str, rom_stem: str | None) -> None:
+        with self.tx() as c:
+            c.execute("""
+                INSERT INTO device_filename_map
+                  (source_id, game_id, filename, rom_stem, observed_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(source_id, game_id) DO UPDATE SET
+                    filename = excluded.filename,
+                    rom_stem = COALESCE(excluded.rom_stem, device_filename_map.rom_stem),
+                    observed_at = excluded.observed_at
+            """, (source_id, game_id, filename, rom_stem, _utcnow_iso()))
+
+    def invalidate_filename_map(self, source_id: str,
+                                game_id: str | None = None) -> int:
+        with self.tx() as c:
+            if game_id is None:
+                cur = c.execute(
+                    "DELETE FROM device_filename_map WHERE source_id=?",
+                    (source_id,))
+            else:
+                cur = c.execute(
+                    "DELETE FROM device_filename_map "
+                    "WHERE source_id=? AND game_id=?",
+                    (source_id, game_id))
+            return cur.rowcount
+
+    def list_filename_map(self,
+                          source_id: str | None = None) -> list[dict]:
+        sql = "SELECT * FROM device_filename_map"
+        args: tuple = ()
+        if source_id is not None:
+            sql += " WHERE source_id=?"
+            args = (source_id,)
+        sql += " ORDER BY source_id, game_id"
+        return [{
+            "source_id": r["source_id"],
+            "game_id": r["game_id"],
+            "filename": r["filename"],
+            "rom_stem": r["rom_stem"],
+            "observed_at": r["observed_at"],
+        } for r in self._conn.execute(sql, args)]
 
     def tombstone_missing(self, source_id: str,
                           present_paths: set[str]) -> int:

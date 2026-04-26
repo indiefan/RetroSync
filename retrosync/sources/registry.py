@@ -52,5 +52,10 @@ def _load_pocket() -> None:
     from . import pocket  # noqa: F401  (registers itself on import)
 
 
+def _load_emudeck() -> None:
+    from . import emudeck  # noqa: F401  (registers itself on import)
+
+
 register_lazy("fxpak", _load_fxpak)
 register_lazy("pocket", _load_pocket)
+register_lazy("emudeck", _load_emudeck)

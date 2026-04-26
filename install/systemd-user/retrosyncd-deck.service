@@ -1,0 +1,20 @@
+[Unit]
+Description=RetroSync — Steam Deck (EmuDeck) inotify daemon
+Documentation=https://github.com/indiefan/RetroSync
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Type=simple; the daemon runs the inotify orchestrator forever and
+# only exits on SIGTERM/SIGINT. Restart=always covers occasional crashes.
+Type=simple
+Environment=RETROSYNC_CONFIG=%h/.config/retrosync/config.yaml
+Environment=RCLONE_CONFIG=%h/.config/retrosync/rclone.conf
+ExecStart=%h/.local/share/retrosync/.venv/bin/retrosyncd --config ${RETROSYNC_CONFIG}
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

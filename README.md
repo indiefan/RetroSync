@@ -2,20 +2,26 @@
 
 Hands-off save backup from retro flash carts to Google Drive.
 
-Two hardware targets so far:
+Three hardware targets so far:
 
 - **FXPak Pro** (SNES) over USB — continuous, ~30s polling.
 - **Analogue Pocket** (SNES core) over USB mass-storage — on-demand, fired
   by udev when you flip the Pocket into "Mount as USB Drive".
+- **Steam Deck (EmuDeck)** over WiFi — inotify-driven, sub-10-second
+  push from in-game save to cloud + pre-launch pull via a Steam ROM
+  Manager-installed shortcut wrapper.
 
-Both feed into the same Google Drive bucket so a save made on either
-side picks up where the other left off. The foundation is built so adding
-EverDrives (N64 / GB / MD) and other handheld emulator targets later
+All three feed into the same Google Drive bucket so a save made on any
+device picks up where the others left off. The foundation is built so
+adding EverDrives (N64 / GB / MD) and other emulator targets later
 doesn't require redesign.
 
-See [docs/design.pdf](docs/design.pdf) for the full design and
+See [docs/design.pdf](docs/design.pdf) for the full design,
 [docs/pocket-sync-design.md](docs/pocket-sync-design.md) for the
-bidirectional / Pocket Sync extension.
+bidirectional / Pocket Sync extension, and
+[docs/emudeck-sync-design.md](docs/emudeck-sync-design.md) for the
+Steam Deck / EmuDeck extension (lease coordination, inotify push, SRM
+shortcut wrapper).
 
 ---
 
@@ -160,6 +166,23 @@ retrosync conflicts resolve <id> --winner {cloud | device | <hash>}
 # Pocket sync (normally fired by udev; manual override):
 sudo retrosync pocket-sync --device /dev/sda1
 
+# Active-device leases (cloud-stored coordinator across devices):
+retrosync lease list                     # who's holding what (per system)
+retrosync lease show deck-1:super_metroid
+retrosync lease release deck-1:super_metroid --force
+
+# EmuDeck / Steam Deck:
+retrosync deck detect-paths              # debug saves/roms detection
+retrosync deck patch-srm                 # (re)apply the SRM wrapper patch
+retrosync deck patch-srm --unpatch       # restore originals
+retrosync flush --timeout 10             # drain in-flight uploads (suspend)
+retrosync sync-pending                   # retry deferred uploads (reconnect)
+
+# Per-source ROM-stem → save filename cache (EmuDeck/Pocket bootstrap):
+retrosync filename-map list
+retrosync filename-map invalidate deck-1
+retrosync filename-map invalidate deck-1 super_metroid
+
 # Migrate the legacy unknown_*/<crc32>_* cloud layout:
 retrosync migrate-paths --dry-run        # plan only
 retrosync migrate-paths                  # apply
@@ -241,6 +264,62 @@ ROM.
 Each plug-in fires a one-shot sync. Watch progress with
 `journalctl -u 'retrosync-pocket-sync@*'`.
 
+### Steam Deck (EmuDeck) setup
+
+The Deck runs its own user-systemd daemon that watches RetroArch's
+saves directory with inotify and pushes to the same Drive bucket the
+Pi uses. Pre-launch syncs are wired in via a Steam ROM Manager
+shortcut wrapper. Full design: [docs/emudeck-sync-design.md](docs/emudeck-sync-design.md).
+
+1. SSH to the Deck (or open a Konsole in Desktop Mode) **as the `deck`
+   user — NOT root**. SteamOS keeps `/usr` read-only, so the install is
+   user-space.
+
+   ```bash
+   git clone https://github.com/indiefan/RetroSync.git
+   cd RetroSync
+   bash install/setup-deck.sh
+   ```
+
+   The installer:
+   - Detects EmuDeck and the RetroArch saves dir from `retroarch.cfg`.
+   - Drops a static `rclone` binary into `~/.local/bin/`.
+   - Builds a venv at `~/.local/share/retrosync/.venv`.
+   - Installs the wrap dispatcher (`~/.local/bin/retrosync-wrap`).
+   - Writes `~/.config/retrosync/config.yaml` with a pre-filled
+     `deck-1` source.
+   - Installs user-systemd units (`retrosyncd-deck.service`,
+     `retrosyncd-suspend.service`, `retrosync-reconnect.service`).
+   - `loginctl enable-linger deck` so the daemon survives Game Mode.
+   - Walks you through `rclone config` for Google Drive.
+   - Patches Steam ROM Manager parser configs (idempotent).
+
+2. **Re-run Steam ROM Manager once** (EmuDeck → Tools → Steam ROM
+   Manager) → Add Games → Parse → Save to Steam. This regenerates
+   your shortcuts with the wrapper baked in. After that, every game
+   you launch via Steam runs a pre-launch sync first.
+
+3. The lease coordinator (active across FXPak / Pocket / Deck) declares
+   "this device is currently playing X" so other devices don't silently
+   overwrite. Soft mode (default) just warns on contention; switch to
+   hard mode in `config.yaml` once every device runs v0.3+:
+
+   ```yaml
+   lease:
+     mode: hard
+   ```
+
+4. Operational logs:
+   ```bash
+   journalctl --user -u retrosyncd-deck -f       # watch saves stream
+   retrosync deck detect-paths                   # debug path detection
+   retrosync lease list                          # who's holding what
+   retrosync filename-map list                   # ROM-stem → save cache
+   ```
+
+5. Re-running `bash install/setup-deck.sh` is safe (idempotent). The
+   SRM patch and config writes detect existing state and leave it alone.
+
 ---
 
 ## Project layout
@@ -253,26 +332,43 @@ retrosync/
 │   │   ├── usb2snes.py    # WebSocket client for SNI / QUsb2snes
 │   │   ├── fxpak.py       # FXPak Pro adapter
 │   │   ├── pocket.py      # Analogue Pocket adapter (mounted SD)
+│   │   ├── emudeck.py     # EmuDeck (RetroArch saves dir) adapter
 │   │   └── registry.py    # config 'adapter' string -> ctor
 │   ├── pocket/            # udev-fired one-shot Pocket sync runner
+│   ├── deck/              # Steam Deck / EmuDeck-specific code
+│   │   ├── emudeck_paths.py  # auto-detect EmuDeck root + saves dir
+│   │   ├── srm.py            # Steam ROM Manager config patcher
+│   │   ├── wrap.py           # pre-launch sync + lease grab subcommands
+│   │   └── flush.py          # pre-suspend / network-reconnect helper
 │   ├── game_id.py         # canonical slug + alias resolution
+│   ├── filename_map.py    # ROM-scan + cache for ROM-stem-named saves
 │   ├── state.py           # SQLite store
-│   ├── cloud.py           # rclone wrapper, path scheme, manifest v2
+│   ├── cloud.py           # rclone wrapper, path scheme, manifest v3
 │   ├── orchestrator.py    # FXPak poll/diff/debounce loop
+│   ├── inotify_orchestrator.py  # inotify-driven push (EmuDeck)
+│   ├── inotify_watch.py   # ctypes inotify wrapper + debouncer
 │   ├── sync.py            # bidirectional engine (shared)
+│   ├── leases.py          # active-device lease (acquire/heartbeat/release)
+│   ├── lease_tracker.py   # per-source held-leases bookkeeping
 │   ├── conflicts.py       # conflict storage + resolve helpers
 │   ├── migrate.py         # one-shot legacy-layout migration
 │   ├── daemon.py          # systemd entry point
 │   ├── cli.py             # operator CLI
 │   └── config.py
 ├── install/
-│   ├── setup.sh           # one-shot installer
-│   ├── systemd/           # unit files (incl. Pocket sync template)
-│   └── udev/              # 99-retrosync-pocket.rules
+│   ├── setup.sh                   # Pi-side installer
+│   ├── setup-deck.sh              # Steam Deck installer
+│   ├── bin/
+│   │   └── retrosync-wrap         # bash dispatcher for SRM shortcuts
+│   ├── systemd/                   # Pi-side unit files
+│   ├── systemd-user/              # Deck-side user units
+│   ├── networkmanager/            # Deck-side NM dispatcher (reconnect)
+│   └── udev/                      # 99-retrosync-{pocket,fxpak}.rules
 ├── docs/
-│   ├── design.pdf                # original design
-│   ├── pocket-sync-design.md     # Pocket Sync extension
-│   ├── architecture.png          # diagram
+│   ├── design.pdf                 # original design
+│   ├── pocket-sync-design.md      # Pocket Sync extension
+│   ├── emudeck-sync-design.md     # EmuDeck / Steam Deck extension
+│   ├── architecture.png           # diagram
 │   └── imaging.md
 ├── tests/
 └── pyproject.toml
