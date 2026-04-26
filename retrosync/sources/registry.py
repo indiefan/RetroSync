@@ -56,6 +56,11 @@ def _load_emudeck() -> None:
     from . import emudeck  # noqa: F401  (registers itself on import)
 
 
+def _load_everdrive64() -> None:
+    from . import everdrive64  # noqa: F401  (adapter registers on import)
+
+
 register_lazy("fxpak", _load_fxpak)
 register_lazy("pocket", _load_pocket)
 register_lazy("emudeck", _load_emudeck)
+register_lazy("everdrive64", _load_everdrive64)

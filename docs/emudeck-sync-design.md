@@ -1202,3 +1202,348 @@ Test matrix: see step 13 in the plan.
    the winner via `retrosync conflicts resolve <id> --winner deck`.
 8. Cloud's `current.srm` becomes the deck-side bytes. Both device's
    `last_synced_hash` are reset; next sync converges.
+
+---
+
+## 21. Addendum: post-implementation refinements
+
+Sections 1–20 describe the design as drafted. This addendum captures
+what actually shipped and the bugs / use-cases the original draft
+didn't anticipate. Wherever this section contradicts the earlier
+spec, the addendum is correct for the current code.
+
+The implementation lives across PRs #19, #20, #21, #22, #23, #24, #25,
+#26, #27, #28 — roughly chronological order of operator-driven
+discoveries during a real Deck install.
+
+### 21.1. `retrosync promote <game> <selector>` — operator escape hatch
+
+**New CLI command not in the design.** Forces any historical version
+to become cloud's `current.<ext>`. The selector is one of:
+
+- A hash (full sha256 or 8-char prefix matching `retrosync versions`).
+- A cloud path (e.g. `gdrive:.../versions/snes/...--<hash8>.srm`).
+
+Mechanism:
+
+1. Resolve the selector → cloud path. Tries `state.db` first, then
+   scans cloud's `versions/` (and per-`device_kind` subfolders) so
+   promote works cross-source: the Pi can promote a Deck-uploaded
+   version even though the Pi's `state.db` doesn't have a row for it.
+2. Download the bytes; verify hash matches the selector.
+3. Overwrite cloud's `current.<ext>`.
+4. Patch the manifest's `current_hash` to the promoted hash.
+
+Critically, promote **does not** bump any source's
+`source_sync_state.last_synced_hash`. That was a deliberate revision
+from a first-cut implementation that did bump them — bumping
+mis-triggers case 5 on the next sync (engine sees "device advanced
+from promoted to its-stale-prior" and uploads stale bytes back,
+undoing the promote). Leaving `last_synced_hash` alone gives every
+keeping-up device case 6 (cloud advanced, device unchanged → pull)
+on the next sync, which is exactly the desired behavior.
+
+Use case driving its existence: a stale-SRAM device uploaded a blank
+save that became cloud's current; the operator needs to revert. Was
+previously a multi-step "stop daemon → pull bytes → write to device →
+restart daemon" cookbook (cf. pocket-sync-design §16.17); now one
+command.
+
+### 21.2. `_pull_to_device` self-heal on manifest/current.srm desync
+
+**New mechanism not in the design.** Cross-source manifest writes can
+race: each device's `refresh_manifest` writes its own view of
+`current_hash`, and a stale view can overwrite a fresh one. Concrete
+incident from a real install:
+
+- Deck uploads `8eb431ab`; cloud `current.srm` becomes those bytes;
+  Deck's `refresh_manifest` writes `current_hash=8eb431ab`. Consistent.
+- Pi runs a pass. Pi's local `current_hash` for the cart is still
+  `fb5ae542` (Pi's stale view from before catching up). Pi's
+  `refresh_manifest` writes `current_hash=fb5ae542`, **clobbering**
+  Deck's manifest write.
+- Now `manifest.current_hash = fb5ae542` but `current.srm` bytes hash
+  to `8eb431ab`. Next pull throws `CloudError("download hash mismatch
+  for current.srm: manifest says fb5ae542, got 8eb431ab")`.
+
+The actual bytes at `current.<ext>` are the truth; the manifest's
+`current_hash` is metadata. `_pull_to_device` now:
+
+- Logs a warning when the actual hash differs from `expected_hash`.
+- Trusts the downloaded bytes; writes them to the device.
+- Updates `state.db.current_hash` to the **actual** hash.
+- Returns the actual hash so callers can `set_sync_state` to match.
+
+The next `refresh_manifest` pass writes a manifest whose `current_hash`
+matches reality, repairing the cloud-side desync automatically. The
+underlying race (cross-source manifest writes overwriting each
+other's `current_hash`) is still latent for uploads; this is a
+tactical fix that breaks the loop on pulls. A proper fix is tracked
+as future work — likely splitting `current_hash` updates from the
+rest of the manifest refresh so only the writer of `current.<ext>`
+touches it.
+
+### 21.3. `cloud_wins_on_diverged_device` — case 7 inverse priority
+
+**New config option not in the design.** Mirror of
+`cloud_wins_on_unknown_device` for case 7 (both moved since last
+agreed hash):
+
+```yaml
+cloud_wins_on_diverged_device: true   # off by default
+```
+
+Default behavior (the design's spec) routes case 7 through
+`conflict_winner`. With the typical `conflict_winner: device`, case 7
+auto-resolves by uploading the device's bytes — fine when those bytes
+are a deliberate save, **wrong** when they're session noise (a
+power-cycle artifact, a different game's autosave leftover, the cart
+hot-swap residue). The operator hit exactly this: the FXPak's
+unrelated post-power-on bytes overwrote a deliberate Deck save.
+
+With `cloud_wins_on_diverged_device: true`, case 7 instead:
+
+- Uploads the device's bytes to `versions/<device-kind>/...` with
+  `update_current=False` (recoverable via `retrosync promote`).
+- Pulls cloud's current to the device (when `cloud_to_device` is on).
+- Sets `last_synced_hash` to the actual hash from the pull
+  (interacts with §21.2's self-heal).
+
+**Recommended on the Pi/FXPak side** for the reason above. Less
+useful on the Deck where local edits via wrap-pre + inotify almost
+always represent deliberate in-game saves.
+
+### 21.4. `InotifyOrchestrator` periodic re-scan
+
+**New mechanism not in the design.** New config knob:
+
+```yaml
+orchestrator:
+  inotify_rescan_sec: 60   # 0 to disable
+```
+
+The design's `InotifyOrchestrator` was purely event-driven on local
+file changes — but cross-device promotes / uploads to cloud's
+`current.<ext>` are invisible to inotify (no local file change).
+Without `wrap-pre` firing, the Deck would never pull cloud-newer
+saves. The operator hit this: a Pi-side promote sat in cloud for
+minutes; the Deck only picked it up after RetroArch incidentally
+flushed the SRM during play (way too late).
+
+The periodic re-scan is the safety net: every `inotify_rescan_sec`,
+the orchestrator walks the saves dir and runs `sync_one_game` on
+each. Cheap when nothing's changed (per-pass manifest cache
+short-circuits most cloud calls); meaningful when another device
+promoted / uploaded.
+
+A `_sync_lock` (`asyncio.Lock`) serializes inotify-fired and
+periodic-fired passes against each other so they don't race on the
+same game's manifest read-modify-write.
+
+### 21.5. ES-DE / EmulationStation low-integration support
+
+**New install path not in the design.** The design's `wrap` mechanism
+hooks into Steam ROM Manager-generated Steam shortcuts. EmuDeck's
+"low integration" mode skips Steam entirely and launches games via
+ES-DE / EmulationStation — so SRM-patched shortcuts never fire.
+
+The implementation grew a parallel hook integration:
+
+- `install/scripts/es-de-game-start.sh` and `es-de-game-end.sh` —
+  thin shims that call the same `retrosync wrap-pre` / `wrap-post`
+  Python subcommands the SRM dispatcher uses.
+- `setup-deck.sh::install_es_de_hooks()` — detects the ES-DE
+  install root across the four known layouts:
+    - `~/ES-DE/` (ES-DE 3.0+ native, what the operator had).
+    - `~/.emulationstation/` (legacy / pre-3.0).
+    - `~/.var/app/org.es_de.frontend/config/ES-DE/` (modern Flatpak).
+    - `~/.var/app/com.gitlab.es-de.EmulationStation-DE/.emulationstation/`
+      (older Flatpak slug).
+  Plus `ES_DE_HOME` env override for non-standard installs.
+- Hook scripts are namespaced (`00-retrosync-*.sh`) so we own them
+  and re-running setup-deck is safe.
+- `setup-deck.sh::patch_srm()` skips cleanly when SRM's
+  `userConfigurations.json` is absent (low-integration installs
+  never have one); no scary "patch failed" warning.
+
+Operator must enable "Custom event scripts" once via ES-DE's UI
+(Main Menu → Other Settings) — we deliberately don't toggle the XML
+ourselves.
+
+### 21.6. ES-DE bug workaround: shell-escaped ROM path
+
+**Bug not anticipated in the design.** ES-DE on some setups (the
+operator's was one) passes the ROM path to custom event scripts with
+literal backslash escapes baked into the argument value:
+
+    [pre] launching with ROM=/run/.../Final\ Fantasy\ III\ \(U\)\ \(v1.1\).sfc
+    ERROR: derive_game_id: ...with-backslashes does not exist
+
+`Path(rom_path).exists()` then fails on the literal-with-backslashes
+path and the hook bails silently. The fix in the hook scripts: if
+the literal path doesn't resolve, strip backslashes and retry. SNES /
+console ROM filenames don't legitimately contain `\`.
+
+### 21.7. Hook script hardening
+
+Beyond §21.6, two changes to the ES-DE hook scripts that matter for
+real Deck installs:
+
+- **PATH-safe binary resolution.** ES-DE on Game Mode / Steam-launched
+  sessions inherits a minimal PATH that often doesn't include
+  `~/.local/bin`. Hook scripts now resolve `retrosync` via absolute
+  path (`~/.local/bin/retrosync`), with `RETROSYNC_BIN` env override.
+- **Dedicated log file.** `~/.local/share/retrosync/wrap-pre.log` and
+  `wrap-post.log`. ES-DE's own log doesn't reliably capture stderr
+  from custom event scripts; this is what the operator can `tail -f`
+  to debug.
+- **Default timeout 10s → 30s.** The design's 10s pre-launch sync
+  timeout is fine for steady-state but too tight for a cold rclone
+  download on first launch (no cached creds, slow Drive cold start).
+  ES-DE waits synchronously, so a too-tight timeout silently skips
+  the sync.
+
+### 21.8. `RETROSYNC_CONFIG` env var honored
+
+**Bug fix, not anticipated.** Click's `--config` had a hardcoded
+default that always won over the env var, so `RETROSYNC_CONFIG=...
+retrosync ...` from a bare shell silently used `/etc/retrosync/
+config.yaml` (the Pi default) and crashed with FileNotFoundError on
+the Deck. Three places fixed:
+
+- `retrosync/cli.py`: `@click.option("--config", envvar="RETROSYNC_CONFIG")`.
+- `retrosync/daemon.py`: argparse default reads the env var first.
+- `setup-deck.sh::install_retrosync_app()`: the trampoline script
+  exports `RETROSYNC_CONFIG=~/.config/retrosync/config.yaml` (using
+  bash `:=` defaulting) so bare-shell invocations on the Deck just
+  work, while explicit env / `--config` overrides still take
+  precedence.
+
+### 21.9. EmuDeck path detection broadened
+
+The design's `emudeck_paths.detect_emudeck_root()` only checked two
+hardcoded paths. Extended in setup-deck.sh + the Python helper to
+cover:
+
+- `~/Emulation/`
+- `/run/media/mmcblk0p1/Emulation/`
+- `/run/media/deck/mmcblk0p1/Emulation/`
+- `/run/media/*/Emulation/` and `/run/media/*/*/Emulation/` (glob
+  for arbitrary SD-card mounts).
+- `EMUDECK_ROOT` env override.
+
+**New: split saves-on-internal / ROMs-on-SD-card support.** The design
+assumed `<emudeck_root>/roms/<system>/` and `<emudeck_root>/saves/...`
+share a single root. EmuDeck supports putting ROMs on the SD card
+while saves live on internal storage. setup-deck now handles this:
+
+1. Detect `saves_root` from `retroarch.cfg`'s `savefile_directory`.
+2. If `<saves_root_parent>/roms/<system>/` doesn't exist, scan the
+   SD-card mounts for one that does.
+3. `ROMS_ROOT` env var for full manual override.
+
+`retrosync deck detect-paths` gained a `--emudeck-root` flag so the
+bash installer can pass through what it detected rather than
+re-detecting in Python.
+
+### 21.10. Default `cloud_wins_on_unknown_device: true` on the Deck
+
+**Default flipped from the design's implicit `false`.** A fresh Deck
+joining an existing cloud-synced fleet hits case 4 (no prior
+agreement) for every game it has never played. With the design's
+default `conflict_winner: device`, the Deck's "I have no save yet"
+state happily overwrites a real cloud save (preserved in
+`versions/`, but the operator has to recover by hand). The operator
+hit exactly this for FF6.
+
+`setup-deck.sh::write_config()` now writes
+`cloud_wins_on_unknown_device: true` for new installs. Existing
+configs are not modified — `write_config` skips when the file
+exists. Operators on an existing install can opt in with one line.
+
+### 21.11. rclone download URL fix
+
+**Bug fix.** The original installer URL pattern was
+`https://downloads.rclone.org/${RCLONE_VERSION}/rclone-${RCLONE_VERSION}-${arch}.zip`
+unconditionally. rclone publishes its rolling-current build at the
+root (`downloads.rclone.org/rclone-current-<arch>.zip`) and only
+versioned releases live under `/v1.x.y/`. Default `RCLONE_VERSION=
+current` got 404. Fixed by branching on the version string. Dropped
+`-s` from `curl` so future failures show the HTTP error.
+
+### 21.12. Operator recovery cookbook
+
+Common scenarios that came up during real-world testing:
+
+**Cross-device handoff failed silently** (e.g. the Deck had stale
+local bytes and overwrote cloud's good save before drift detection
+landed):
+
+```bash
+# On the device with the good save still on disk (often the FXPak):
+retrosync versions <game_id>          # find a sane version's hash
+retrosync promote <game_id> <hash8>   # force cloud current to that hash
+# Then the next sync on each device pulls the promoted bytes (case 6).
+```
+
+**Force-write cloud's current to the cart** (when the Pi's auto-
+resolve is fighting you and you want to bypass the engine):
+
+```bash
+# On the Pi, with the SNES on:
+retrosync load <game_id> snes
+# Writes cloud's current.srm bytes directly to the cart via usb2snes.
+# Daemon sees IN_SYNC on next poll. No engine arbitration involved.
+```
+
+**Manifest desync** (manifest's `current_hash` ≠ actual `current.srm`
+hash): self-heals automatically on the next pull (§21.2). No manual
+action required — just wait one poll cycle, or restart the daemon
+to trigger an immediate pass.
+
+**Stuck pending versions from earlier crashes**: re-running the
+daemon after the engine's resilience improvements (§21.2, §21.4)
+clears them on the next pass. If they persist, `retrosync sync-status`
+will show the stale `last_synced_hash`; manually re-running
+`retrosync load` or `promote` re-syncs.
+
+### 21.13. Operator note: in-game save vs RetroArch save state
+
+**Documentation, not code.** Repeated source of confusion during
+testing. RetroArch has two save concepts:
+
+- **SRAM save** (`.srm`): what the game's own "Save Game" menu writes.
+  This is what RetroSync syncs.
+- **Save state** (`.state`, `.state.auto`): RetroArch's snapshot of
+  the entire emulator state. Independent of the game's save system.
+
+EmuDeck enables both "Auto Save State" and "Auto Load State" by
+default. After enabling RetroSync, **disable both** in the EmuDeck
+app → Quick Settings (or in RetroArch's Settings → Saving). With
+auto-state on, RetroArch loads its session snapshot regardless of
+what's in the SRAM, masking RetroSync's pulls. Real hardware (FXPak
+Pro) has no equivalent — only SRAM exists there — so cross-device
+handoff requires the operator to use the in-game Save Game menu, not
+just exit-and-resume via save state.
+
+### 21.14. Open issues / future fixes
+
+- **Cross-source manifest write race** (§21.2). The self-heal in
+  `_pull_to_device` repairs the symptom but the root cause is still
+  there: each source's `refresh_manifest` writes the manifest with
+  its own view of `current_hash`. Likely fix is to decouple
+  `current_hash` updates from the rest of the manifest refresh —
+  only the writer of `current.<ext>` should touch it.
+- **`current_hash` consistency across sources of truth.** Today
+  `current_hash` lives in three places: cloud manifest, cloud
+  `current.<ext>` bytes, and per-source `state.db.files.current_hash`.
+  These can diverge. Worth consolidating into "manifest reflects
+  cloud bytes" + "state.db reflects local bytes" with no overlap.
+- **ES-DE custom event scripts toggle.** We don't auto-enable it
+  during install (XML editing risk). Could be a one-shot
+  `retrosync deck enable-es-de-hooks` that does the safe XML edit.
+- **`wrap-derive-game-id` rejects non-ROM paths** (e.g. ES-DE
+  launching `retroarch.sh` directly via a "Tools" entry). Currently
+  derives a meaningless `system_game="emulators:retroarch"` and
+  no-ops harmlessly; could exit earlier with a structured "skip"
+  signal.

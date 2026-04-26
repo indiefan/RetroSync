@@ -34,7 +34,10 @@ from .cloud import (
 )
 from .config import Config, LeaseConfig, OrchestratorConfig, SourceConfig
 from .lease_tracker import LeaseTracker
-from .sources.base import SaveRef, SaveSource, SourceError
+from .sources.base import (SaveRef, SaveSource, SourceError,
+                           default_group_refs,
+                           default_read_canonical_bytes,
+                           default_write_canonical_bytes)
 from .sources.registry import build as build_source
 from .state import (ST_DEBOUNCING, ST_READY, StateStore, VersionRow)
 from .sync import (
@@ -183,8 +186,24 @@ class BackupOrchestrator:
         refresh_targets: dict[str, tuple[str, str, object]] = {}
 
         present_paths = {ref.path for ref in refs}
-        for ref in refs:
-            await self._poll_one(ref, ctx, refresh_targets)
+        # Group refs by source-defined key. For single-file sources the
+        # default groups one-per-ref (preserving existing behavior).
+        # Multi-file sources (EverDrive 64) override `group_refs` to
+        # group per-format files by game_id so the engine sees one
+        # logical save per group.
+        grouper = getattr(self._source, "group_refs", None)
+        groups = (grouper(refs) if grouper is not None
+                  else default_group_refs(self._source, refs))
+        # Path-to-group map so _drain_ready can re-read the full group
+        # for a stuck-promoted version row (whose path is just the
+        # group's first ref).
+        path_to_group: dict[str, list[SaveRef]] = {}
+        for group_refs in groups.values():
+            for ref in group_refs:
+                path_to_group[ref.path] = group_refs
+        for group_key, group_refs in groups.items():
+            await self._poll_one_group(group_key, group_refs, ctx,
+                                       refresh_targets)
 
         # Mark files that vanished from the source.
         gone = self._deps.state.tombstone_missing(self._source.id, present_paths)
@@ -196,7 +215,7 @@ class BackupOrchestrator:
         self._promote_stable()
 
         # Drain ready queue.
-        await self._drain_ready(ctx, refresh_targets)
+        await self._drain_ready(ctx, refresh_targets, path_to_group)
 
         # Final manifest refresh per affected game — once per pass.
         for game_id, save_path, paths in refresh_targets.values():
@@ -207,13 +226,30 @@ class BackupOrchestrator:
                 log.warning("manifest refresh failed for %s; next pass "
                             "will retry: %s", save_path, exc)
 
-    async def _poll_one(self, ref: SaveRef, ctx: SyncContext,
-                        refresh_targets: dict[str, tuple[str, str, object]]
-                        ) -> None:
+    async def _poll_one_group(self, group_key: str,
+                              group_refs: list[SaveRef],
+                              ctx: SyncContext,
+                              refresh_targets: dict[str, tuple[str, str, object]]
+                              ) -> None:
+        """Process one logical save (one or more device-side files).
+
+        Group_key is opaque (the source's `group_refs` key, default
+        ref.path). The first ref of the group is the conventional
+        state.db tracking key — for single-file sources that's the
+        only ref; for multi-file sources it's whichever per-format
+        file came first when the source listed them.
+        """
+        if not group_refs:
+            return
+        ref = group_refs[0]
         try:
-            data = await self._source.read_save(ref)
+            reader = getattr(self._source, "read_canonical_bytes", None)
+            if reader is not None:
+                data = await reader(group_refs)
+            else:
+                data = await default_read_canonical_bytes(self._source, group_refs)
         except SourceError as exc:
-            log.warning("read_save failed (%s): %s", ref.path, exc)
+            log.warning("read_canonical_bytes failed (%s): %s", ref.path, exc)
             return
 
         h = sha256_bytes(data)
@@ -295,7 +331,8 @@ class BackupOrchestrator:
             log.info("promoted version %d to READY", r["id"])
 
     async def _drain_ready(self, ctx: SyncContext,
-                           refresh_targets: dict[str, tuple[str, str, object]]
+                           refresh_targets: dict[str, tuple[str, str, object]],
+                           path_to_group: dict[str, list[SaveRef]] | None = None,
                            ) -> None:
         # Funnel each ready version through the shared sync engine. The
         # per-game manifest refresh is batched at the pass level so Drive's
@@ -303,7 +340,8 @@ class BackupOrchestrator:
         ready = [v for v in self._deps.state.ready_versions()
                  if v.source_id == self._source.id]
         for i, v in enumerate(ready):
-            outcome = await self._sync_promoted(v, ctx)
+            outcome = await self._sync_promoted(v, ctx,
+                                                path_to_group=path_to_group)
             self._record_refresh(outcome, refresh_targets)
             # Inter-upload pacing — small sleep between rclone invocations
             # to spread API calls across the per-minute rate-limit window.
@@ -327,11 +365,28 @@ class BackupOrchestrator:
                                 outcome.paths)
 
     async def _sync_promoted(self, v: VersionRow,
-                             ctx: SyncContext) -> SyncOutcome | None:
-        """Re-read the device, drift-check, hand off to the sync engine."""
+                             ctx: SyncContext,
+                             path_to_group: dict[str, list[SaveRef]] | None = None,
+                             ) -> SyncOutcome | None:
+        """Re-read the device, drift-check, hand off to the sync engine.
+
+        For multi-file sources, re-reads all per-format files in the
+        version row's group via `read_canonical_bytes`. For single-file
+        sources, re-reads the one file. Either way, `data` is the
+        canonical byte representation that gets hashed.
+        """
         ref = SaveRef(path=v.path, size_bytes=v.size_bytes)
+        # Find the group this version's path belongs to (multi-file
+        # sources). If no group is provided (e.g. tests), fall back to
+        # treating the version's path as its own one-element group.
+        group_refs = (path_to_group or {}).get(v.path, [ref])
         try:
-            data = await self._source.read_save(ref)
+            reader = getattr(self._source, "read_canonical_bytes", None)
+            if reader is not None:
+                data = await reader(group_refs)
+            else:
+                data = await default_read_canonical_bytes(self._source,
+                                                          group_refs)
         except SourceError as exc:
             log.warning("re-read failed for upload of %s: %s", v.path, exc)
             return None

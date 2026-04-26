@@ -1,0 +1,34 @@
+# RetroSync — poke the daemon for an immediate sync when an
+# EverDrive 64 X7 is connected.
+#
+# Without this, cart-on → first sync latency is bounded by the
+# orchestrator's `unhealthy_recheck_sec` (default 2s). With it, the
+# daemon does an immediate pass on USB attach (sub-second latency).
+#
+# The EverDrive 64 X7 enumerates as FTDI vendor 0x0403:0x6001 (the
+# default FT245R VID/PID) — same as many other FTDI-based devices.
+# We disambiguate by ATTRS{product} matching "EverDrive*", which the
+# X7's FTDI EEPROM is programmed with. The EEPROM string varies
+# slightly between firmware revisions; capture yours with:
+#
+#     udevadm info -q property -n /dev/bus/usb/<bus>/<dev>
+#
+# (or just `lsusb -v` and look for iProduct on the FTDI device).
+#
+# The rule signals the running retrosync daemon via SIGUSR1, which
+# pokes every orchestrator into running an immediate pass — the same
+# mechanism the FXPak rule uses.
+
+ACTION=="add", SUBSYSTEM=="usb", \
+  ATTR{idVendor}=="0403", ATTR{idProduct}=="6001", \
+  ATTRS{product}=="EverDrive*", \
+  RUN+="/bin/systemctl kill --signal=SIGUSR1 retrosync.service", \
+  TAG+="retrosync-everdrive"
+
+# Fallback for older udev that doesn't recurse to ATTRS{product} on
+# the USB device level. Match VID/PID alone — slightly noisier
+# (other FTDI devices may also fire) but the daemon's poke handler
+# is idempotent so spurious signals are harmless.
+ACTION=="add", SUBSYSTEM=="usb", \
+  ATTR{idVendor}=="0403", ATTR{idProduct}=="6001", \
+  RUN+="/bin/systemctl kill --signal=SIGUSR1 retrosync.service"

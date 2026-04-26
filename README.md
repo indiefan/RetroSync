@@ -2,7 +2,7 @@
 
 Hands-off save backup from retro flash carts to Google Drive.
 
-Three hardware targets so far:
+Four hardware targets so far:
 
 - **FXPak Pro** (SNES) over USB — continuous, ~30s polling.
 - **Analogue Pocket** (SNES core) over USB mass-storage — on-demand, fired
@@ -10,6 +10,11 @@ Three hardware targets so far:
 - **Steam Deck (EmuDeck)** over WiFi — inotify-driven, sub-10-second
   push from in-game save to cloud + pre-launch pull via a Steam ROM
   Manager-installed shortcut wrapper.
+- **EverDrive 64 X7** (N64) over USB — same model as the FXPak Pro
+  (continuous polling, instant-sync via udev poke). Multi-format
+  saves (.eep / .sra / .fla / .mp1–.mp4) get packed into a combined
+  Mupen64Plus-format `.srm` for cloud-side hash equivalence with the
+  Deck's RetroArch-Mupen64Plus-Next save.
 
 All three feed into the same Google Drive bucket so a save made on any
 device picks up where the others left off. The foundation is built so
@@ -18,10 +23,13 @@ doesn't require redesign.
 
 See [docs/design.pdf](docs/design.pdf) for the full design,
 [docs/pocket-sync-design.md](docs/pocket-sync-design.md) for the
-bidirectional / Pocket Sync extension, and
+bidirectional / Pocket Sync extension,
 [docs/emudeck-sync-design.md](docs/emudeck-sync-design.md) for the
 Steam Deck / EmuDeck extension (lease coordination, inotify push, SRM
-shortcut wrapper).
+shortcut wrapper), and
+[docs/n64-sync-design.md](docs/n64-sync-design.md) for the N64
+extension (EverDrive 64 X7 over USB, multi-format save translator,
+generalized per-system format hooks).
 
 ---
 
@@ -277,6 +285,48 @@ ROM.
 Each plug-in fires a one-shot sync. Watch progress with
 `journalctl -u 'retrosync-pocket-sync@*'`.
 
+### EverDrive 64 X7 setup
+
+Plugs into the same Pi as the FXPak Pro (separate USB port; no
+conflict — different protocols). The udev rule for instant-sync
+ships ready-to-use against stock OS64 v3.x firmware.
+
+1. Install `pyftdi` for the direct-USB transport:
+
+   ```bash
+   sudo apt install -y libusb-1.0-0
+   sudo -u retrosync /opt/retrosync/.venv/bin/pip install pyftdi
+   ```
+
+2. Add a stanza to `/etc/retrosync/config.yaml`:
+
+   ```yaml
+   sources:
+     - id: everdrive64-1
+       adapter: everdrive64
+       options:
+         transport: pyftdi
+         ftdi_url: ftdi://ftdi:0x6001/1
+         sd_saves_root: /ED64/SAVES
+         sd_roms_root: /ED64/ROMS
+         rom_extensions: [.z64, .n64, .v64]
+         system: n64
+   ```
+
+3. Restart and verify:
+
+   ```bash
+   sudo systemctl restart retrosync
+   retrosync test-cart everdrive64-1
+   journalctl -u retrosync.service -f
+   ```
+
+**Heads up:** the pyftdi backend's wire-level USB protocol is still
+pending verification against UNFLoader's source on real hardware.
+Until that pass lands, run with `transport: mock` in dev / use the
+in-memory transport for tests; a follow-up will fill in the byte-
+level details once the cart's been exercised.
+
 ### Steam Deck (EmuDeck) setup
 
 The Deck runs its own user-systemd daemon that watches RetroArch's
@@ -346,7 +396,13 @@ retrosync/
 │   │   ├── fxpak.py       # FXPak Pro adapter
 │   │   ├── pocket.py      # Analogue Pocket adapter (mounted SD)
 │   │   ├── emudeck.py     # EmuDeck (RetroArch saves dir) adapter
+│   │   ├── everdrive64/   # EverDrive 64 X7 (N64 over USB)
 │   │   └── registry.py    # config 'adapter' string -> ctor
+│   ├── transport/         # low-level device transports (USB, etc.)
+│   │   └── krikzz_ftdi.py     # FT245 protocol shared across Krikzz carts
+│   ├── formats/           # multi-file save translators
+│   │   └── n64.py             # N64SaveSet, combine(), split()
+│   ├── system_formats.py  # per-system canonical-format registry
 │   ├── pocket/            # udev-fired one-shot Pocket sync runner
 │   ├── deck/              # Steam Deck / EmuDeck-specific code
 │   │   ├── emudeck_paths.py  # auto-detect EmuDeck root + saves dir
@@ -357,7 +413,8 @@ retrosync/
 │   ├── filename_map.py    # ROM-scan + cache for ROM-stem-named saves
 │   ├── state.py           # SQLite store
 │   ├── cloud.py           # rclone wrapper, path scheme, manifest v3
-│   ├── orchestrator.py    # FXPak poll/diff/debounce loop
+│   ├── promote.py         # `retrosync promote` — force a version to current
+│   ├── orchestrator.py    # FXPak / EverDrive 64 poll/diff/debounce loop
 │   ├── inotify_orchestrator.py  # inotify-driven push (EmuDeck)
 │   ├── inotify_watch.py   # ctypes inotify wrapper + debouncer
 │   ├── sync.py            # bidirectional engine (shared)
@@ -373,17 +430,21 @@ retrosync/
 │   ├── setup-deck.sh              # Steam Deck installer
 │   ├── bin/
 │   │   └── retrosync-wrap         # bash dispatcher for SRM shortcuts
+│   ├── scripts/                   # ES-DE custom event-script hooks
 │   ├── systemd/                   # Pi-side unit files
 │   ├── systemd-user/              # Deck-side user units
 │   ├── networkmanager/            # Deck-side NM dispatcher (reconnect)
-│   └── udev/                      # 99-retrosync-{pocket,fxpak}.rules
+│   └── udev/                      # 99-retrosync-{pocket,fxpak,everdrive64}.rules
 ├── docs/
 │   ├── design.pdf                 # original design
 │   ├── pocket-sync-design.md      # Pocket Sync extension
 │   ├── emudeck-sync-design.md     # EmuDeck / Steam Deck extension
+│   ├── n64-sync-design.md         # N64 / EverDrive 64 extension
 │   ├── architecture.png           # diagram
 │   └── imaging.md
 ├── tests/
+│   ├── formats/                   # per-system translator tests (n64, ...)
+│   └── ...
 └── pyproject.toml
 ```
 

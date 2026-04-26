@@ -356,6 +356,15 @@ install_udev_rules() {
   fi
   install -m 0644 "${src}" "${dst}"
 
+  # EverDrive 64 X7: same instant-sync mechanism. The cart enumerates
+  # as FTDI 0403:6001 disambiguated by ATTRS{product}; rule ships
+  # ready-to-use for stock OS64 v3.x firmware. Operators with an
+  # EEPROM string variation can edit /etc/udev/rules.d/99-retrosync-
+  # everdrive64.rules.
+  src="${RETROSYNC_DIR}/install/udev/99-retrosync-everdrive64.rules"
+  dst="/etc/udev/rules.d/99-retrosync-everdrive64.rules"
+  install -m 0644 "${src}" "${dst}"
+
   udevadm control --reload || true
   udevadm trigger || true
   log "installed udev rules -> /etc/udev/rules.d/99-retrosync-*.rules"
