@@ -421,6 +421,7 @@ async def run_all(config: Config, *,
         cloud_to_device=config.cloud_to_device,
         conflict_winner=config.conflict_winner,
         cloud_wins_on_unknown_device=config.cloud_wins_on_unknown_device,
+        cloud_wins_on_diverged_device=config.cloud_wins_on_diverged_device,
         drift_threshold=dict(config.drift_threshold))
     deps = OrchestratorDeps(state=state, cloud=cloud,
                             cfg=config.orchestrator,

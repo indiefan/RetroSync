@@ -102,6 +102,24 @@ class SyncConfig:
       regress to a stale local copy.
     """
 
+    cloud_wins_on_diverged_device: bool = False
+    """Like `cloud_wins_on_unknown_device` but for case 7 (both sides
+    moved since the last agreed hash). Default False preserves the
+    legacy `conflict_winner=device` auto-resolve, which uploads the
+    device's bytes and effectively overrides cloud — fine when the
+    device's edits are real, terrible when the device's "edits" are
+    just stale SRAM from a power-cycle.
+
+    True is recommended on the Pi/FXPak side: a cart's bytes that
+    diverged from the last agreed hash are usually unrelated session
+    artifacts (prior savestate hot-swap, a different game's autosave
+    leftover, etc.) rather than a deliberate user save. Letting cloud
+    win on case 7 means the cart picks up another device's deliberate
+    save instead of overwriting it with cart-side noise. The device's
+    bytes are still preserved as a versions/* entry for recovery via
+    `retrosync promote <game> <hash>`.
+    """
+
     drift_threshold: dict[str, int] = field(default_factory=dict)
     """Per-device-kind byte-count threshold for the "drift filter".
 
@@ -421,6 +439,45 @@ async def sync_one_game(*, source: SaveSource, ref: SaveRef,
             last_synced_hash=actual, device_seen_path=ref.path)
         return SyncOutcome(SyncResult.DOWNLOADED, game_id, ref.path,
                            paths, "drift filter case 7 → cloud wins")
+
+    # Diverged-device policy: preserve the device's bytes as a
+    # versions/* entry (recoverable via `retrosync promote`) but let
+    # cloud's current win. Mirrors `cloud_wins_on_unknown_device` for
+    # case 7 — typical use case is the FXPak Pro where cart-side
+    # divergence is usually session noise rather than a deliberate
+    # save the operator wants to publish.
+    if (ctx.cfg.cloud_wins_on_diverged_device
+            and manifest is not None
+            and len(manifest.versions) > 0):
+        log.info(
+            "%s on %s: cloud_wins_on_diverged_device set; preserving "
+            "device bytes %s as a versions/* entry (NOT touching "
+            "current.<ext>), then pulling cloud's current %s",
+            game_id, source.id, hash8(h_dev), hash8(h_cloud))
+        await _upload_version_path(
+            source=source, ref=ref, data=data, h=h_dev,
+            paths=paths, game_id=game_id, ctx=ctx,
+            parent_hash=h_last, version_row=version_row,
+            update_current=False,
+        )
+        if ctx.cfg.cloud_to_device:
+            actual = await _pull_to_device(
+                source=source, ref=ref, paths=paths,
+                expected_hash=h_cloud, ctx=ctx)
+            ctx.state.set_sync_state(
+                source_id=source.id, game_id=game_id,
+                last_synced_hash=actual, device_seen_path=ref.path)
+            ctx.invalidate_manifest(paths)
+            return SyncOutcome(SyncResult.DOWNLOADED, game_id,
+                               ref.path, paths,
+                               "device bytes preserved; cloud wins (case 7)")
+        ctx.state.set_sync_state(
+            source_id=source.id, game_id=game_id,
+            last_synced_hash=h_cloud, device_seen_path=ref.path)
+        ctx.invalidate_manifest(paths)
+        return SyncOutcome(SyncResult.SKIPPED, game_id, ref.path, paths,
+                           "device bytes preserved; cloud_to_device off")
+
     return await _handle_divergence(
         source=source, ref=ref, data=data, h_dev=h_dev,
         h_cloud=h_cloud, base=h_last, paths=paths, game_id=game_id,

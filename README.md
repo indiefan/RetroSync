@@ -162,6 +162,14 @@ retrosync conflicts resolve <id> --winner {cloud | device | <hash>}
 #   cloud_wins_on_unknown_device: true
 # This preserves the unknown device's bytes as a versions/* entry
 # (recoverable later) but makes cloud's current the winner.
+#
+# RECOMMENDED on the Pi: set this to flip the case-7 (both moved)
+# default from "device wins" to "cloud wins". A cart's bytes that
+# diverged from h_last are usually session noise (a different game's
+# autosave leftover, a power-cycle artifact), not a deliberate save —
+# letting cloud win means another device's deliberate save survives.
+# Device bytes are still preserved in versions/ for recovery.
+#   cloud_wins_on_diverged_device: true
 
 # Pocket sync (normally fired by udev; manual override):
 sudo retrosync pocket-sync --device /dev/sda1
