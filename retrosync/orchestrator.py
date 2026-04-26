@@ -302,9 +302,11 @@ async def run_all(config: Config) -> None:
     cloud = RcloneCloud(remote=config.cloud.rclone_remote,
                         binary=config.cloud.rclone_binary,
                         config_path=config.cloud.rclone_config_path)
-    sync_cfg = SyncConfig(cloud_to_device=config.cloud_to_device,
-                          conflict_winner=config.conflict_winner,
-                          drift_threshold=dict(config.drift_threshold))
+    sync_cfg = SyncConfig(
+        cloud_to_device=config.cloud_to_device,
+        conflict_winner=config.conflict_winner,
+        cloud_wins_on_unknown_device=config.cloud_wins_on_unknown_device,
+        drift_threshold=dict(config.drift_threshold))
     deps = OrchestratorDeps(state=state, cloud=cloud,
                             cfg=config.orchestrator,
                             sync_cfg=sync_cfg)

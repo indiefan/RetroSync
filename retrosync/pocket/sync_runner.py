@@ -171,9 +171,11 @@ async def run_pocket_sync(*, source: PocketSource, config: Config,
                         config_path=config.cloud.rclone_config_path)
     state.upsert_source(id=source.id, system=source.system,
                         adapter="PocketSource", config_json="{}")
-    sync_cfg = SyncConfig(cloud_to_device=config.cloud_to_device,
-                          conflict_winner=config.conflict_winner,
-                          drift_threshold=dict(config.drift_threshold))
+    sync_cfg = SyncConfig(
+        cloud_to_device=config.cloud_to_device,
+        conflict_winner=config.conflict_winner,
+        cloud_wins_on_unknown_device=config.cloud_wins_on_unknown_device,
+        drift_threshold=dict(config.drift_threshold))
     ctx = SyncContext(state=state, cloud=cloud, cfg=sync_cfg)
     summary = PocketSyncSummary()
     refresh_targets: dict[str, tuple[str, str, object]] = {}

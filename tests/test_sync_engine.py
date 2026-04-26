@@ -132,6 +132,93 @@ async def test_cloud_to_device_pull() -> bool:
     return ok
 
 
+async def test_case_4_stale_device_pulls_cloud() -> bool:
+    """When a "new" source shows up with bytes that match a hash already
+    in versions history, treat as a stale device and pull cloud's
+    current — don't auto-resolve as device-wins."""
+    _, state, cloud = _setup()
+
+    # Set up cloud with one device's bytes — A's hash will be the
+    # historical version we'll later present from a different source.
+    fx_a = MockFXPakSource(id="fx-a", files={"/Mario.srm": b"abc" * 100})
+    state.upsert_source(id=fx_a.id, system=fx_a.system,
+                        adapter="MockFXPakSource", config_json="{}")
+    ctx = SyncContext(state=state, cloud=cloud,
+                      cfg=SyncConfig(cloud_to_device=True))
+    out_a = await sync_one_game(source=fx_a,
+                                ref=SaveRef(path="/Mario.srm"), ctx=ctx)
+    refresh_manifest(source=fx_a, save_path="/Mario.srm",
+                     game_id=out_a.game_id, paths=out_a.paths, ctx=ctx)
+    h_a = sha256_bytes(b"abc" * 100)
+
+    # Cloud advances via fx-a (different bytes).
+    fx_a.files["/Mario.srm"] = b"abc-newer" + b"\x00" * 100
+    ctx.invalidate_manifest(out_a.paths)
+    out_a2 = await sync_one_game(source=fx_a,
+                                 ref=SaveRef(path="/Mario.srm"), ctx=ctx)
+    refresh_manifest(source=fx_a, save_path="/Mario.srm",
+                     game_id=out_a2.game_id, paths=out_a2.paths, ctx=ctx)
+
+    # New device shows up with the OLD bytes (hash h_a). It has no
+    # sync_state, so case 4 fires — but the hash is in our version
+    # history, so we should treat as stale and pull cloud's current.
+    new_files = {"/Mario.srm": b"abc" * 100}
+    new_dev = MockFXPakSource(id="fresh-dev", files=new_files)
+    state.upsert_source(id=new_dev.id, system=new_dev.system,
+                        adapter="MockFXPakSource", config_json="{}")
+    ctx.invalidate_manifest(out_a.paths)
+    out = await sync_one_game(source=new_dev,
+                              ref=SaveRef(path="/Mario.srm"), ctx=ctx)
+    state.close()
+
+    ok = _check(out.result, SyncResult.DOWNLOADED,
+                "stale device with known historical hash → DOWNLOADED")
+    ok &= _check(new_files["/Mario.srm"], b"abc-newer" + b"\x00" * 100,
+                 "device received cloud's current bytes")
+    return ok
+
+
+async def test_case_4_unknown_device_cloud_wins_policy() -> bool:
+    """With cloud_wins_on_unknown_device=true, a device showing up with
+    truly-new bytes (not in history) gets its bytes preserved as a
+    version, but cloud's current wins."""
+    _, state, cloud = _setup()
+    # Establish cloud with one device's bytes.
+    fx_a = MockFXPakSource(id="fx-a", files={"/Mario.srm": b"abc" * 100})
+    state.upsert_source(id=fx_a.id, system=fx_a.system,
+                        adapter="MockFXPakSource", config_json="{}")
+    ctx = SyncContext(state=state, cloud=cloud,
+                      cfg=SyncConfig(cloud_to_device=True,
+                                     cloud_wins_on_unknown_device=True))
+    out_a = await sync_one_game(source=fx_a,
+                                ref=SaveRef(path="/Mario.srm"), ctx=ctx)
+    refresh_manifest(source=fx_a, save_path="/Mario.srm",
+                     game_id=out_a.game_id, paths=out_a.paths, ctx=ctx)
+    cloud_bytes = b"abc" * 100
+
+    # New device with novel bytes (NOT in history).
+    new_files = {"/Mario.srm": b"truly-new-bytes" + b"\x00" * 100}
+    new_dev = MockFXPakSource(id="fresh-dev", files=new_files)
+    state.upsert_source(id=new_dev.id, system=new_dev.system,
+                        adapter="MockFXPakSource", config_json="{}")
+    new_bytes_hash = sha256_bytes(new_files["/Mario.srm"])
+    ctx.invalidate_manifest(out_a.paths)
+    out = await sync_one_game(source=new_dev,
+                              ref=SaveRef(path="/Mario.srm"), ctx=ctx)
+    # After the policy fires, the manifest should still contain BOTH
+    # versions: fx-a's original AND the preserved new-dev version.
+    n_versions = len(state.list_versions(new_dev.id, "/Mario.srm"))
+    state.close()
+
+    ok = _check(out.result, SyncResult.DOWNLOADED,
+                "unknown-device policy → DOWNLOADED, not UPLOADED")
+    ok &= _check(new_files["/Mario.srm"], cloud_bytes,
+                 "device received cloud's current bytes")
+    ok &= _check(n_versions, 1,
+                 "device's own bytes preserved as a versions/* entry")
+    return ok
+
+
 async def test_conflict_no_prior_agreement_preserve() -> bool:
     """conflict_winner='preserve': cloud has X; device has Y; no
     source_sync_state for this device → CONFLICT (left open)."""
@@ -522,6 +609,10 @@ def main() -> int:
         ("test_bootstrap_upload", test_bootstrap_upload),
         ("test_in_sync", test_in_sync),
         ("test_cloud_to_device_pull", test_cloud_to_device_pull),
+        ("test_case_4_stale_device_pulls_cloud",
+         test_case_4_stale_device_pulls_cloud),
+        ("test_case_4_unknown_device_cloud_wins_policy",
+         test_case_4_unknown_device_cloud_wins_policy),
         ("test_conflict_no_prior_agreement_preserve",
          test_conflict_no_prior_agreement_preserve),
         ("test_conflict_device_wins_default",

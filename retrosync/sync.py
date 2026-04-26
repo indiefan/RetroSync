@@ -85,6 +85,23 @@ class SyncConfig:
       `retrosync conflicts resolve` decision. Conservative, more work.
     """
 
+    cloud_wins_on_unknown_device: bool = False
+    """When a device with no prior sync_state shows up with bytes that
+    differ from cloud's current AND don't match any known historical
+    version (case 4), what do we do?
+
+    - False (default): conflict_winner kicks in — typically `device`
+      wins, the device's bytes become the new cloud current. Best when
+      the device is genuinely new and you trust its data.
+    - True: preserve the device's bytes as a versions/* entry (so they
+      can be recovered later) but make cloud's existing current the
+      winner; if cloud_to_device is on, write cloud's bytes onto the
+      device. Best when the device is a reused-but-stale source — e.g.
+      a Pocket whose source_id changed (per-physical-device UUID
+      migration) and you'd rather inherit the cloud-side latest than
+      regress to a stale local copy.
+    """
+
     drift_threshold: dict[str, int] = field(default_factory=dict)
     """Per-device-kind byte-count threshold for the "drift filter".
 
@@ -259,8 +276,70 @@ async def sync_one_game(*, source: SaveSource, ref: SaveRef,
         return SyncOutcome(SyncResult.BOOTSTRAP_DOWNLOADED, game_id,
                            ref.path, paths)
 
-    # 4. Cloud and device disagree, no prior agreement → conflict.
+    # 4. Cloud and device disagree, no prior agreement.
     if h_last is None:
+        # Stale-device check: if h_dev matches a hash we've already
+        # uploaded for this game (any source), the device is presenting
+        # a known-old version, not new content. Treat as case 6 download.
+        if ctx.state.hash_in_versions_for_game(game_id, h_dev):
+            log.info(
+                "%s on %s: device bytes %s match a known historical "
+                "version — treating as stale device, pulling cloud's "
+                "current %s",
+                game_id, source.id, hash8(h_dev), hash8(h_cloud))
+            if not ctx.cfg.cloud_to_device:
+                return SyncOutcome(
+                    SyncResult.SKIPPED, game_id, ref.path, paths,
+                    "stale device but cloud_to_device disabled")
+            await _pull_to_device(source=source, ref=ref, paths=paths,
+                                  expected_hash=h_cloud, ctx=ctx)
+            ctx.state.set_sync_state(
+                source_id=source.id, game_id=game_id,
+                last_synced_hash=h_cloud, device_seen_path=ref.path)
+            return SyncOutcome(SyncResult.DOWNLOADED, game_id,
+                               ref.path, paths,
+                               f"stale device had {hash8(h_dev)}")
+        # Unknown-device policy: when configured, preserve the device's
+        # bytes as a versions/* entry (so they're recoverable) but let
+        # cloud's current win. Useful for Pockets whose source_id has
+        # changed (per-UUID migration) and which now look "unknown" but
+        # actually have stale data.
+        if (ctx.cfg.cloud_wins_on_unknown_device
+                and manifest is not None
+                and len(manifest.versions) > 0):
+            log.info(
+                "%s on %s: cloud_wins_on_unknown_device set; preserving "
+                "device bytes %s as a versions/* entry (NOT touching "
+                "current.srm), then pulling cloud's current %s",
+                game_id, source.id, hash8(h_dev), hash8(h_cloud))
+            await _upload_version_path(
+                source=source, ref=ref, data=data, h=h_dev,
+                paths=paths, game_id=game_id, ctx=ctx,
+                parent_hash=None, version_row=version_row,
+                update_current=False,
+            )
+            if ctx.cfg.cloud_to_device:
+                await _pull_to_device(
+                    source=source, ref=ref, paths=paths,
+                    expected_hash=h_cloud, ctx=ctx)
+                ctx.state.set_sync_state(
+                    source_id=source.id, game_id=game_id,
+                    last_synced_hash=h_cloud, device_seen_path=ref.path)
+                ctx.invalidate_manifest(paths)
+                return SyncOutcome(SyncResult.DOWNLOADED, game_id,
+                                   ref.path, paths,
+                                   "device bytes preserved; cloud wins")
+            # Without cloud_to_device, we preserved the device's bytes
+            # in versions/ but can't write cloud's bytes back to the
+            # device. Mark sync_state pointing to cloud so the next sync
+            # doesn't reupload, and skip.
+            ctx.state.set_sync_state(
+                source_id=source.id, game_id=game_id,
+                last_synced_hash=h_cloud, device_seen_path=ref.path)
+            ctx.invalidate_manifest(paths)
+            return SyncOutcome(SyncResult.SKIPPED, game_id, ref.path,
+                               paths,
+                               "device bytes preserved; cloud_to_device off")
         return await _handle_divergence(
             source=source, ref=ref, data=data, h_dev=h_dev,
             h_cloud=h_cloud, base=None, paths=paths, game_id=game_id,
@@ -337,8 +416,13 @@ async def _upload_version_path(*, source: SaveSource, ref: SaveRef,
                                data: bytes, h: str, paths: CloudPaths,
                                game_id: str, ctx: SyncContext,
                                parent_hash: str | None,
-                               version_row: VersionRow | None) -> None:
-    """Upload <data> as a new versions/* entry and overwrite current."""
+                               version_row: VersionRow | None,
+                               update_current: bool = True) -> None:
+    """Upload <data> as a new versions/* entry. When `update_current` is
+    True (the usual case), also overwrite cloud's `current.<ext>` with
+    these bytes. Set False when you want to preserve the bytes for
+    history but leave cloud's current pointing at something else (used
+    by the cloud_wins_on_unknown_device policy)."""
     # If the orchestrator already inserted a pending version row for this
     # exact hash, reuse it; otherwise create one. Either way we end up with
     # a row marked uploaded with cloud_path set.
@@ -366,8 +450,9 @@ async def _upload_version_path(*, source: SaveSource, ref: SaveRef,
             observed_at=utc_iso(),
             device_kind=getattr(source, "device_kind", source.system),
         )
-        await asyncio.sleep(ctx.cfg.inter_op_sleep_sec)
-        ctx.cloud.overwrite_current(paths=paths, save_data=data)
+        if update_current:
+            await asyncio.sleep(ctx.cfg.inter_op_sleep_sec)
+            ctx.cloud.overwrite_current(paths=paths, save_data=data)
         ctx.state.mark_uploaded(v_id, cloud_path=version_path)
         log.info("sync: uploaded %s for %s → %s",
                  hash8(h), game_id, version_path)
@@ -532,21 +617,32 @@ def refresh_manifest(*, source: SaveSource, save_path: str, game_id: str,
 
     Called by orchestrators after a batch of sync_one_game calls so
     Drive's per-minute write budget isn't burned on per-version writes.
+
+    Cross-source: pulls every uploaded version for this game across all
+    sources, not just `source`. Otherwise each refresh would overwrite
+    the manifest with only the running source's slice and we'd lose
+    other devices' version history every plug-in.
     """
-    rows = ctx.state.list_versions(source.id, save_path)
+    rows = list(ctx.state._conn.execute("""
+        SELECT v.* FROM versions v
+        JOIN files f ON v.source_id = f.source_id AND v.path = f.path
+        WHERE f.game_id = ? AND v.state = 'uploaded'
+          AND v.cloud_path IS NOT NULL AND v.uploaded_at IS NOT NULL
+        ORDER BY v.uploaded_at
+    """, (game_id,)))
     entries = [
         ManifestEntry(
-            cloud_path=r.cloud_path,
-            hash=r.hash,
-            size_bytes=r.size_bytes,
-            observed_at=r.observed_at,
-            uploaded_at=r.uploaded_at or utc_iso(),
-            retention=r.retention,
-            parent_hash=r.parent_hash,
-            uploaded_by=source.id,
+            cloud_path=r["cloud_path"],
+            hash=r["hash"],
+            size_bytes=r["size_bytes"],
+            observed_at=r["observed_at"],
+            uploaded_at=r["uploaded_at"] or utc_iso(),
+            retention=r["retention"],
+            parent_hash=(r["parent_hash"] if "parent_hash" in r.keys()
+                         else None),
+            uploaded_by=r["source_id"],
         )
         for r in rows
-        if r.cloud_path is not None and r.uploaded_at is not None
     ]
     save_filename = save_path.rsplit("/", 1)[-1]
 
