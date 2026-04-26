@@ -145,8 +145,14 @@ class PocketSource:
         ROM won't find.
         """
         if not self.saves_dir.exists():
+            log.warning("existing_save_for: saves dir %s does not exist",
+                        self.saves_dir)
             return None
         ext = self._cfg.file_extension.lower()
+        # Iterate twice: once for visibility, once to find a match. The
+        # first pass logs what we see so a "no match" outcome can be
+        # debugged from the operator's terminal output.
+        candidates: list[tuple[Path, str]] = []
         for entry in self.saves_dir.iterdir():
             if not entry.is_file():
                 continue
@@ -154,10 +160,27 @@ class PocketSource:
                 continue
             if not entry.name.lower().endswith(ext):
                 continue
-            if resolve_game_id(entry.name,
-                               aliases=self._cfg.game_aliases) == game_id:
+            slug = resolve_game_id(entry.name,
+                                   aliases=self._cfg.game_aliases)
+            candidates.append((entry, slug))
+        matches = [(entry, slug) for entry, slug in candidates
+                   if slug == game_id]
+        if not matches:
+            log.warning(
+                "existing_save_for(%r): no match among %d file(s) in %s. "
+                "Saw: %s",
+                game_id, len(candidates), self.saves_dir,
+                [(c.name, s) for c, s in candidates])
+            return None
+        # When multiple files share the same canonical slug — typically
+        # because a previous `load` wrote the slug-named fallback
+        # alongside the original ROM-named save — prefer the ROM-named
+        # one (the only one the Pocket actually loads).
+        canonical_name = f"{game_id}{ext}"
+        for entry, _slug in matches:
+            if entry.name != canonical_name:
                 return entry
-        return None
+        return matches[0][0]
 
 
 def _build(*, id: str, mount_path: str,

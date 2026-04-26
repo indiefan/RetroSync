@@ -148,6 +148,29 @@ def test_existing_save_for_matches_by_slug() -> bool:
     return ok
 
 
+def test_existing_save_for_prefers_decorated_name() -> bool:
+    """When both `final_fantasy_iii.sav` (slug fallback from a previous
+    load) and `Final Fantasy III (U) (v1.1).sav` (ROM-named original)
+    coexist, existing_save_for must return the ROM-named one — that's
+    the file the Pocket actually loads."""
+    workdir, mount, state, cloud = _setup()
+    saves_dir = mount / "Saves" / "agg23.SNES"
+    decorated = saves_dir / "Final Fantasy III (U) (v1.1).sav"
+    slug_named = saves_dir / "final_fantasy_iii.sav"
+    decorated.write_bytes(b"DECORATED")
+    slug_named.write_bytes(b"SLUG")
+
+    source = PocketSource(PocketConfig(
+        id="pocket-1", mount_path=str(mount), core="agg23.SNES",
+        file_extension=".sav", system="snes",
+    ))
+    state.close()
+
+    found = source.existing_save_for("final_fantasy_iii")
+    return _check(found, decorated,
+                  "prefers ROM-decorated name when slug-named also exists")
+
+
 def main() -> int:
     ok = True
     for name, factory in [
@@ -158,6 +181,8 @@ def main() -> int:
         ok &= asyncio.run(factory())
     print("--- test_existing_save_for_matches_by_slug ---")
     ok &= test_existing_save_for_matches_by_slug()
+    print("--- test_existing_save_for_prefers_decorated_name ---")
+    ok &= test_existing_save_for_prefers_decorated_name()
     return 0 if ok else 1
 
 
