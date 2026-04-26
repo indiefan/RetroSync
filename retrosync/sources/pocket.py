@@ -84,8 +84,8 @@ class PocketSource:
         d = self.saves_dir
         if not d.exists():
             return []
-        out: list[SaveRef] = []
         ext = self._cfg.file_extension.lower()
+        candidates: list[SaveRef] = []
         try:
             for entry in sorted(d.iterdir()):
                 if not entry.is_file():
@@ -97,12 +97,41 @@ class PocketSource:
                 if not entry.name.lower().endswith(ext):
                     continue
                 stat = entry.stat()
-                out.append(SaveRef(
+                candidates.append(SaveRef(
                     path=str(entry),
                     size_bytes=stat.st_size,
                 ))
         except OSError as exc:
             raise SourceError(f"listing {d}: {exc}") from exc
+
+        # Dedupe by canonical game_id: when multiple files map to the
+        # same game (e.g. a ROM-decorated original and a slug-named copy
+        # from an earlier `load`), the engine would otherwise upload
+        # both as separate versions on every sync. Pick the ROM-decorated
+        # name if present (the Pocket loads that one at boot anyway);
+        # warn about the others.
+        by_game: dict[str, list[SaveRef]] = {}
+        for ref in candidates:
+            slug = resolve_game_id(Path(ref.path).name,
+                                   aliases=self._cfg.game_aliases)
+            by_game.setdefault(slug, []).append(ref)
+        out: list[SaveRef] = []
+        for slug, refs in by_game.items():
+            if len(refs) == 1:
+                out.append(refs[0])
+                continue
+            canonical_name = f"{slug}{ext}"
+            decorated = [r for r in refs
+                         if Path(r.path).name != canonical_name]
+            chosen = decorated[0] if decorated else refs[0]
+            others = [r for r in refs if r.path != chosen.path]
+            log.warning(
+                "Pocket %s: %d files map to game_id %r — using %s; "
+                "other(s) will be ignored: %s. Delete the unused file(s) "
+                "to silence this warning.",
+                self.id, len(refs), slug, Path(chosen.path).name,
+                [Path(r.path).name for r in others])
+            out.append(chosen)
         return out
 
     async def read_save(self, ref: SaveRef) -> bytes:

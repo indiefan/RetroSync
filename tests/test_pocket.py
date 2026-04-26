@@ -148,6 +148,33 @@ def test_existing_save_for_matches_by_slug() -> bool:
     return ok
 
 
+async def test_list_saves_dedupes_same_game_id() -> bool:
+    """Regression: the Pocket SD ended up with two .sav files mapping to
+    the same canonical game_id (a ROM-named original + a slug-named
+    leftover from an early `load` attempt). Each was processed
+    independently, producing two distinct cloud versions per sync. The
+    fix dedupes in list_saves; the ROM-named file wins."""
+    workdir, mount, state, cloud = _setup()
+    saves_dir = mount / "Saves" / "agg23.SNES"
+    decorated = saves_dir / "Final Fantasy III (U) (v1.1).sav"
+    slug = saves_dir / "final_fantasy_iii.sav"
+    decorated.write_bytes(b"DECORATED" + b"\x00" * 100)
+    slug.write_bytes(b"SLUG-LEFTOVER" + b"\x00" * 100)
+
+    source = PocketSource(PocketConfig(
+        id="pocket-1", mount_path=str(mount), core="agg23.SNES",
+        file_extension=".sav", system="snes",
+    ))
+    saves = await source.list_saves()
+    state.close()
+
+    if not _check(len(saves), 1, "list_saves dedupes to 1 entry per game"):
+        return False
+    chosen = saves[0]
+    return _check(Path(chosen.path).name, decorated.name,
+                  "ROM-decorated file wins over slug-named duplicate")
+
+
 def test_existing_save_for_prefers_decorated_name() -> bool:
     """When both `final_fantasy_iii.sav` (slug fallback from a previous
     load) and `Final Fantasy III (U) (v1.1).sav` (ROM-named original)
@@ -207,6 +234,8 @@ def main() -> int:
     for name, factory in [
         ("test_pocket_upload", test_pocket_upload),
         ("test_pocket_to_fxpak_roundtrip", test_pocket_to_fxpak_roundtrip),
+        ("test_list_saves_dedupes_same_game_id",
+         test_list_saves_dedupes_same_game_id),
     ]:
         print(f"--- {name} ---")
         ok &= asyncio.run(factory())
