@@ -48,6 +48,11 @@ class SaveSource(Protocol):
     `id` is a stable, operator-chosen identifier (e.g. "fxpak-pro-1").
     `system` is the platform identifier used in cloud paths
         (e.g. "snes", "n64", "gb", "retroarch").
+    `device_kind` is a short label for the *kind* of device, used purely
+        for human-readable cloud-folder organization (e.g. cart vs.
+        Pocket vs. emulator). Defaults to `system` for cart-style
+        adapters; `PocketSource` overrides it to `"pocket"` so its
+        uploads land under `versions/pocket/...`.
 
     Every method may raise SourceError on transient failures; the orchestrator
     will treat those as "unhealthy, retry later" and not as a permanent fault.
@@ -55,6 +60,7 @@ class SaveSource(Protocol):
 
     id: str
     system: str
+    device_kind: str
 
     async def health(self) -> HealthStatus: ...
 

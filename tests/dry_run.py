@@ -117,7 +117,10 @@ async def drive() -> int:
         if sm is None:
             failures.append("phase 2: super_metroid dir disappeared")
         else:
-            versions = sorted((sm / "versions").iterdir())
+            # Versions now land under versions/<device_kind>/. Recurse for
+            # an accurate count regardless of layout.
+            versions = sorted(p for p in (sm / "versions").rglob("*")
+                              if p.is_file())
             log.info("super_metroid versions: %s",
                      [v.name for v in versions])
             if len(versions) != 2:
@@ -142,7 +145,8 @@ async def drive() -> int:
         await settle(5)
         sm = next(d for d in (cloud_root / "retro-saves" / "snes").iterdir()
                   if "super_metroid" in d.name)
-        versions = sorted((sm / "versions").iterdir())
+        versions = sorted(p for p in (sm / "versions").rglob("*")
+                          if p.is_file())
         log.info("after churn, versions: %s", [v.name for v in versions])
         # We expect: V1=SAVE-A, V2=SAVE-B, V3=FINAL-D. Torn-1 and Torn-2 should
         # have been superseded before they could promote.
@@ -156,9 +160,11 @@ async def drive() -> int:
 
         # ----- phase 4: idempotency — no save change → no new version -----
         log.info("PHASE 4 — quiescence")
-        before = sorted((sm / "versions").iterdir())
+        before = sorted(p for p in (sm / "versions").rglob("*")
+                        if p.is_file())
         await settle(4)
-        after = sorted((sm / "versions").iterdir())
+        after = sorted(p for p in (sm / "versions").rglob("*")
+                       if p.is_file())
         if [v.name for v in before] != [v.name for v in after]:
             failures.append(
                 f"phase 4: versions changed despite no save change "

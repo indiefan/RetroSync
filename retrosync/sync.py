@@ -319,6 +319,7 @@ async def _upload_version_path(*, source: SaveSource, ref: SaveRef,
         version_path = ctx.cloud.upload_version(
             paths=paths, save_data=data, full_hash=h,
             observed_at=utc_iso(),
+            device_kind=getattr(source, "device_kind", source.system),
         )
         await asyncio.sleep(ctx.cfg.inter_op_sleep_sec)
         ctx.cloud.overwrite_current(paths=paths, save_data=data)
@@ -447,7 +448,10 @@ async def _record_conflict(*, source: SaveSource, ref: SaveRef,
         return
 
     ext = (PurePosixPath(paths.current).suffix or ".bin")
-    conflict_path = paths.conflict(utc_iso(), hash8(h_dev), ext, source.id)
+    conflict_path = paths.conflict(
+        utc_iso(), hash8(h_dev), ext, source.id,
+        device_kind=getattr(source, "device_kind", source.system),
+    )
     ctx.cloud.upload_bytes(data=data, dest=conflict_path)
     cloud_version = _find_cloud_version_path(ctx.manifest_for(paths), h_cloud)
     cid = ctx.state.insert_conflict(

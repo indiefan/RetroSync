@@ -365,6 +365,29 @@ async def test_resolve_with_stale_cloud_path() -> bool:
                   "stale cloud_path → fallback by hash succeeded")
 
 
+async def test_uploads_under_device_kind_subfolder() -> bool:
+    """Versions land under versions/<device_kind>/ — purely cosmetic for
+    cloud-browse organization. Engine behaviour unchanged."""
+    workdir, state, cloud = _setup()
+    cart = MockFXPakSource(id="fx", files={"/Mario.srm": b"abc" * 100})
+    state.upsert_source(id=cart.id, system=cart.system,
+                        adapter="MockFXPakSource", config_json="{}")
+    ctx = SyncContext(state=state, cloud=cloud,
+                      cfg=SyncConfig(cloud_to_device=True))
+    out = await sync_one_game(source=cart,
+                              ref=SaveRef(path="/Mario.srm"), ctx=ctx)
+    state.close()
+    ok = _check(out.result, SyncResult.BOOTSTRAP_UPLOADED,
+                "upload outcome unchanged")
+    # The version cloud_path now contains "/versions/snes/" because
+    # MockFXPakSource.device_kind == "snes".
+    expected_seg = "/versions/snes/"
+    actual_path = workdir / "cloud" / "retro-saves" / "snes" / "mario" / "versions" / "snes"
+    ok &= _check(actual_path.is_dir(), True,
+                 f"new uploads land under {expected_seg}")
+    return ok
+
+
 async def test_no_duplicate_upload_on_transient_manifest_failure() -> bool:
     """Regression: a transient `rclone lsjson` failure (rate limit, network
     blip) made `exists()` return False, which made `read_manifest()` return
@@ -433,6 +456,8 @@ def main() -> int:
         ("test_resolve_conflict_to_device", test_resolve_conflict_to_device),
         ("test_resolve_with_stale_cloud_path",
          test_resolve_with_stale_cloud_path),
+        ("test_uploads_under_device_kind_subfolder",
+         test_uploads_under_device_kind_subfolder),
         ("test_no_duplicate_upload_on_transient_manifest_failure",
          test_no_duplicate_upload_on_transient_manifest_failure),
     ]:
