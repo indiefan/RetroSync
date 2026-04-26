@@ -214,6 +214,26 @@ def cmd_test_cloud(ctx: click.Context) -> None:
         sys.exit(1)
 
 
+@main.command("upgrade", context_settings={"ignore_unknown_options": True,
+                                           "allow_extra_args": True})
+@click.pass_context
+def cmd_upgrade(ctx: click.Context) -> None:
+    """Pull the latest source from GitHub and re-run the installer.
+
+    This is normally intercepted by the /usr/local/bin/retrosync wrapper
+    and dispatched to /usr/local/bin/retrosync-upgrade. The Click command
+    is here so `retrosync --help` advertises it and so direct invocations
+    of the binary inside the venv still work.
+    """
+    import os
+    if os.path.exists("/usr/local/bin/retrosync-upgrade"):
+        os.execvp("/usr/local/bin/retrosync-upgrade", ["retrosync-upgrade"])
+    click.echo("error: /usr/local/bin/retrosync-upgrade not found. "
+               "Run setup.sh from the repo to (re)install the upgrade entry "
+               "point.", err=True)
+    ctx.exit(1)
+
+
 @main.command("dump-config")
 @click.pass_context
 def cmd_dump_config(ctx: click.Context) -> None:

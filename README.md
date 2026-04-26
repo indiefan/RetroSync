@@ -112,6 +112,9 @@ matter how many times it loses power.
 
 ## Operator commands
 
+The `retrosync` command is a wrapper that auto-elevates to the
+`retrosync` system user, so you don't need `sudo` for any of these:
+
 ```bash
 retrosync status                          # daemon-wide summary
 retrosync list                            # every (source, save) on record
@@ -122,6 +125,10 @@ retrosync test-cloud                      # smoke-test rclone remote
 # Restore a save:
 retrosync pull <cloud-path-from-show> /tmp/restored.srm
 retrosync push fxpak-pro-1 /Mario.srm /tmp/restored.srm --confirm
+
+# Get the latest source + re-apply the installer in one step.
+# Prompts for sudo password once.
+retrosync upgrade
 ```
 
 Configuration: `/etc/retrosync/config.yaml`. Restart with
