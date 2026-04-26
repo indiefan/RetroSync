@@ -236,11 +236,23 @@ async def _bootstrap_pull(*, source: PocketSource, game_id: str,
             outcome.game_id, outcome.save_path, outcome.paths)
 
 
+# Path of the auto-sync skip flag (mirrored from retrosync.load).
+# When this file exists, the udev-fired pocket-sync exits without
+# touching the device — so a manual `retrosync load <game> pocket`
+# can do the mount/write/unmount itself without racing the daemon.
+_SKIP_AUTO_SYNC_FLAG = Path("/run/retrosync/skip-auto-sync")
+
+
 def cli_pocket_sync(*, device: str, source_id: str,
                     mount_path: str, config: Config,
                     skip_mount: bool = False) -> int:
     """Top-level entry point invoked by `retrosync pocket-sync` (and by
     the systemd unit)."""
+    if _SKIP_AUTO_SYNC_FLAG.exists():
+        log.info("skip-auto-sync flag at %s present; exiting without "
+                 "syncing (a manual `retrosync load` is in progress)",
+                 _SKIP_AUTO_SYNC_FLAG)
+        return 0
     summary = PocketSyncSummary()
     try:
         if not skip_mount:
