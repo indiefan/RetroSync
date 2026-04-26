@@ -131,7 +131,11 @@ retrosync sync-status                     # last-synced hash per (source, game)
 retrosync test-cart fxpak-pro-1           # smoke-test cart connection
 retrosync test-cloud                      # smoke-test rclone remote
 
-# Restore a save:
+# Load the cloud's current save for a game onto a device by game-id:
+retrosync load final_fantasy_iii pocket   # writes to mounted Pocket SD
+retrosync load f_zero snes                # writes to FXPak via usb2snes
+
+# Lower-level restore:
 retrosync pull <cloud-path-from-show> /tmp/restored.srm
 retrosync push fxpak-pro-1 /Mario.srm /tmp/restored.srm --confirm
 
