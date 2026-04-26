@@ -93,26 +93,58 @@ class KrikzzFtdiError(Exception):
 COMMAND_FRAME_SIZE = 16
 RESPONSE_FRAME_SIZE = 16
 
+# Minimum block size for serial reads / writes. Krikzz's Usbio.cs
+# rounds every transfer up to a multiple of 4 bytes (with 0xff
+# padding). We mirror that to avoid the firmware getting stuck mid-
+# read on an odd-length payload.
+MIN_BLOCK_SIZE = 4
 
-def build_command_frame(cmd: int, address: int = 0, size_bytes: int = 0,
+# FatFs file open modes. Lifted directly from Krikzz's Edio.cs.
+FAT_READ            = 0x01
+FAT_WRITE           = 0x02
+FAT_OPEN_EXISTING   = 0x00
+FAT_CREATE_NEW      = 0x04
+FAT_CREATE_ALWAYS   = 0x08
+FAT_OPEN_ALWAYS     = 0x10
+FAT_OPEN_APPEND     = 0x30
+
+# Default chunk size for file I/O. Krikzz's Edio uses 4096; we follow
+# suit. Larger chunks get split inside the firmware.
+DEFAULT_CHUNK = 4096
+
+
+def build_command_frame(cmd: int, address: int = 0, length: int = 0,
                         arg: int = 0) -> bytes:
-    """Construct a 16-byte command frame matching UNFLoader's layout.
+    """Construct a 16-byte command frame matching UNFLoader / Krikzz
+    `Edio.cmdTX`.
 
-    `size_bytes` is the actual byte size of any payload that follows
-    the frame; we encode it in 512-byte blocks per the firmware
-    convention (UNFLoader's `device_sendcmd_everdrive` does
-    `size /= 512` before encoding).
+    `length` semantics differ by command:
+      - ROM commands ('c', 'W', 'R', 'f'): the firmware expects the
+        size field in 512-byte blocks. Callers divide before passing.
+      - File commands ('0', '1', '2', '4'): the firmware expects the
+        actual byte count.
+    The helper does NOT auto-divide; passing the right value is the
+    caller's job (per Krikzz's `cmdTX`, where `len /= 512;` is
+    explicitly commented out).
     """
     if not 0 <= cmd <= 0xff:
         raise ValueError(f"cmd byte out of range: {cmd}")
-    blocks = size_bytes // 512
     frame = bytearray(COMMAND_FRAME_SIZE)
     frame[0:3] = b"cmd"
     frame[3] = cmd
     frame[4:8] = address.to_bytes(4, "big", signed=False)
-    frame[8:12] = blocks.to_bytes(4, "big", signed=False)
+    frame[8:12] = length.to_bytes(4, "big", signed=False)
     frame[12:16] = arg.to_bytes(4, "big", signed=False)
     return bytes(frame)
+
+
+def pad_to_min_block(data: bytes) -> bytes:
+    """Round payload up to a multiple of MIN_BLOCK_SIZE with 0xff
+    padding. Mirrors Krikzz's `Usbio.fixDataSize`."""
+    if len(data) % MIN_BLOCK_SIZE == 0:
+        return data
+    pad = MIN_BLOCK_SIZE - (len(data) % MIN_BLOCK_SIZE)
+    return data + b"\xff" * pad
 
 
 @dataclass(frozen=True)
@@ -226,33 +258,29 @@ class SerialKrikzzTransport(KrikzzFtdiTransport):
     async def health(self) -> tuple[bool, str]:
         if self._port is None:
             return False, "transport not open"
-        # CMD_TEST: send 'cmdt' + 12 zero-bytes, expect 16 bytes back.
-        # Per UNFLoader: recv[3] == 'r' identifies an EverDrive.
+        # CMD_TEST: send 'cmdt' + 12 zero-bytes, expect 16 bytes back
+        # with header 'cmdr'. Krikzz's Edio.getStatus reads the byte at
+        # offset 4 as the cart's current status (0 = idle/OK).
         try:
-            resp = await self._send_recv(ord("t"))
+            resp = await self._cmd_rx_with_send(ord("t"), expect=ord("r"))
         except KrikzzFtdiError as exc:
             return False, str(exc)
-        if len(resp) < 4 or resp[3:4] != b"r":
-            return False, (
-                f"unexpected handshake response: {resp[:8]!r} "
-                "(expected b'cmdr...')")
-        # The trailing 12 bytes encode firmware version + status. We
-        # surface them in the detail string so `retrosync test-cart`
-        # output is informative; format may evolve.
-        status = resp[4:].hex()
-        return True, f"EverDrive 64 (handshake ok, status={status})"
+        status_byte = resp[4]
+        # Trailing bytes encode firmware metadata; surface them for
+        # debugging — exact format not documented in Krikzz's source.
+        rest = resp[5:].hex()
+        return (True,
+                f"EverDrive 64 (status=0x{status_byte:02x}, meta={rest})")
 
-    # ----- 16-byte framing helper -----
+    # ----- low-level framing primitives -----
 
-    async def _send_recv(self, cmd: int, *, address: int = 0,
-                         size_bytes: int = 0, arg: int = 0,
-                         response_size: int = RESPONSE_FRAME_SIZE,
-                         ) -> bytes:
-        """Send a 16-byte command frame and read the response."""
+    async def _cmd_tx(self, cmd: int, *, address: int = 0,
+                      length: int = 0, arg: int = 0) -> None:
+        """Send a 16-byte command frame; do NOT read any response."""
         if self._port is None:
             raise KrikzzFtdiError("transport not open")
         frame = build_command_frame(cmd, address=address,
-                                    size_bytes=size_bytes, arg=arg)
+                                    length=length, arg=arg)
         try:
             self._port.reset_input_buffer()
             written = self._port.write(frame)
@@ -262,37 +290,199 @@ class SerialKrikzzTransport(KrikzzFtdiTransport):
         if written != COMMAND_FRAME_SIZE:
             raise KrikzzFtdiError(
                 f"short write: {written}/{COMMAND_FRAME_SIZE} bytes")
+
+    async def _cmd_rx(self, expected_cmd: int) -> bytes:
+        """Read a 16-byte response and validate the 'cmd<X>' header.
+
+        Mirrors Krikzz's `Edio.cmdRX`. Raises on header mismatch
+        (corrupted response) or on cmd-byte mismatch (unexpected
+        response — usually a sign of a previous command not draining
+        cleanly, or the cart in a bad state).
+        """
+        if self._port is None:
+            raise KrikzzFtdiError("transport not open")
         try:
-            resp = self._port.read(response_size)
+            resp = self._port.read(RESPONSE_FRAME_SIZE)
         except Exception as exc:  # noqa: BLE001
             raise KrikzzFtdiError(f"read failed: {exc}") from exc
-        if len(resp) < response_size:
+        if len(resp) < RESPONSE_FRAME_SIZE:
             raise KrikzzFtdiError(
-                f"short read: {len(resp)}/{response_size} bytes "
+                f"short read: {len(resp)}/{RESPONSE_FRAME_SIZE} bytes "
                 f"(timeout? cart in wrong state?)")
+        if resp[:3] != b"cmd":
+            raise KrikzzFtdiError(
+                f"corrupted response header: {resp[:4]!r}")
+        if resp[3] != expected_cmd:
+            raise KrikzzFtdiError(
+                f"unexpected response cmd 0x{resp[3]:02x} "
+                f"(expected 0x{expected_cmd:02x})")
         return resp
 
-    # ----- SD operations: stubbed pending Krikzz USB tool review ------
+    async def _cmd_rx_with_send(self, cmd: int, *,
+                                expect: int | None = None,
+                                **kwargs) -> bytes:
+        """Send a command frame and read its response in one go."""
+        await self._cmd_tx(cmd, **kwargs)
+        return await self._cmd_rx(expect if expect is not None else cmd)
+
+    async def _check_status(self) -> None:
+        """Send the 't' command, read the 'r' response, raise if the
+        status byte at offset 4 is non-zero. Mirrors `Edio.checkStatus`.
+        """
+        resp = await self._cmd_rx_with_send(ord("t"), expect=ord("r"))
+        if resp[4] != 0:
+            raise KrikzzFtdiError(
+                f"cart reported error status 0x{resp[4]:02x}")
+
+    async def _write_payload(self, data: bytes) -> None:
+        """Write data after a cmdTX. Krikzz pads to a 4-byte minimum
+        block size, then chunks at 32 KB. We mirror that."""
+        if self._port is None:
+            raise KrikzzFtdiError("transport not open")
+        padded = pad_to_min_block(data)
+        try:
+            n = self._port.write(padded)
+            self._port.flush()
+        except Exception as exc:  # noqa: BLE001
+            raise KrikzzFtdiError(f"payload write failed: {exc}") from exc
+        if n != len(padded):
+            raise KrikzzFtdiError(
+                f"short payload write: {n}/{len(padded)} bytes")
+
+    async def _read_payload(self, length: int) -> bytes:
+        """Read `length` bytes (post-cmdTX). Pads up to 4-byte minimum
+        block then trims to the requested length, matching Krikzz's
+        `Usbio.read_block`."""
+        if self._port is None:
+            raise KrikzzFtdiError("transport not open")
+        block_len = length
+        if block_len % MIN_BLOCK_SIZE != 0:
+            block_len = (
+                block_len // MIN_BLOCK_SIZE * MIN_BLOCK_SIZE
+                + MIN_BLOCK_SIZE)
+        try:
+            data = self._port.read(block_len)
+        except Exception as exc:  # noqa: BLE001
+            raise KrikzzFtdiError(f"payload read failed: {exc}") from exc
+        if len(data) < block_len:
+            raise KrikzzFtdiError(
+                f"short payload read: {len(data)}/{block_len} bytes")
+        return bytes(data[:length])
+
+    # ----- SD file operations (Krikzz Edio.cs) -----
+
+    async def _file_open(self, path: str, mode: int) -> None:
+        """File opens send the 16-byte command followed by the path
+        bytes (NOT zero-terminated; length encoded in the cmd frame).
+        Status checked after."""
+        path_bytes = path.encode("ascii")
+        await self._cmd_tx(ord("0"), length=len(path_bytes), arg=mode)
+        await self._write_payload(path_bytes)
+        await self._check_status()
+
+    async def _file_close(self) -> None:
+        await self._cmd_tx(ord("3"))
+        await self._check_status()
+
+    async def _file_read_chunk(self, length: int) -> bytes:
+        await self._cmd_tx(ord("1"), length=length)
+        out = bytearray()
+        remaining = length
+        while remaining > 0:
+            block = min(DEFAULT_CHUNK, remaining)
+            out.extend(await self._read_payload(block))
+            remaining -= block
+        await self._check_status()
+        return bytes(out)
+
+    async def _file_write_chunk(self, data: bytes) -> None:
+        await self._cmd_tx(ord("2"), length=len(data))
+        offset = 0
+        remaining = len(data)
+        while remaining > 0:
+            block = min(DEFAULT_CHUNK, remaining)
+            await self._write_payload(data[offset:offset + block])
+            offset += block
+            remaining -= block
+        await self._check_status()
+
+    async def _file_info(self, path: str) -> dict | None:
+        """Return file metadata or None if the file doesn't exist.
+
+        cmdTX('4', length=path.length); write path; read 16-byte
+        response with header 'cmd4'. resp[4] is a FatFs error code
+        — 0 = OK, anything else = error (typically 4 = FR_NO_FILE).
+        """
+        path_bytes = path.encode("ascii")
+        await self._cmd_tx(ord("4"), length=len(path_bytes))
+        await self._write_payload(path_bytes)
+        resp = await self._cmd_rx(ord("4"))
+        status = resp[4]
+        if status != 0:
+            # Not necessarily an error — FR_NO_FILE just means the
+            # file's missing.
+            return None
+        return {
+            "attrib": resp[5],
+            "size":   int.from_bytes(resp[8:12], "big"),
+            "date":   int.from_bytes(resp[12:14], "big"),
+            "time":   int.from_bytes(resp[14:16], "big"),
+        }
+
+    # ----- KrikzzFtdiTransport interface -----
 
     async def dir_list(self, path: str) -> list[FileEntry]:
+        # Krikzz's tool doesn't expose a directory listing. The OS64
+        # firmware presumably has one (the on-cart menu shows files)
+        # but the protocol byte for it isn't documented in the source
+        # we have. Until that's reverse-engineered, the EverDrive 64
+        # adapter has to enumerate by guessing names (e.g. derive
+        # save filenames from a configured ROM list).
         raise NotImplementedError(
-            "SerialKrikzzTransport.dir_list: SD-file ops are not in "
-            "UNFLoader's source. Need to derive from Krikzz's USB tool "
-            "(krikzz.com/pub/support/everdrive-64/x-series/dev/) or a "
-            "ROM-side debug print of the OS64 protocol. Handshake "
-            "works; this is the next byte-level work.")
+            "SerialKrikzzTransport.dir_list: not in Krikzz's USB tool "
+            "source (only file_open/read/write/close/info are exposed). "
+            "Either probe for an undocumented OS64 dir-list command, "
+            "or use file_exists/file_info against expected save names "
+            "derived from a known ROM list.")
 
     async def file_read(self, path: str) -> bytes:
-        raise NotImplementedError("see SerialKrikzzTransport.dir_list")
+        info = await self._file_info(path)
+        if info is None:
+            raise KrikzzFtdiError(f"file not found: {path}")
+        size = info["size"]
+        await self._file_open(path, FAT_READ)
+        try:
+            return await self._file_read_chunk(size)
+        finally:
+            try:
+                await self._file_close()
+            except KrikzzFtdiError:
+                pass  # close-after-error best-effort
 
     async def file_write(self, path: str, data: bytes) -> None:
-        raise NotImplementedError("see SerialKrikzzTransport.dir_list")
+        await self._file_open(path, FAT_CREATE_ALWAYS | FAT_WRITE)
+        try:
+            await self._file_write_chunk(data)
+        finally:
+            try:
+                await self._file_close()
+            except KrikzzFtdiError:
+                pass
 
     async def file_delete(self, path: str) -> None:
-        raise NotImplementedError("see SerialKrikzzTransport.dir_list")
+        # Not in Krikzz's source. The firmware likely has a delete
+        # command (FAT-level), but the byte isn't documented. Mark
+        # NotImplementedError; EverDrive64Source's empty-region delete
+        # logic should fall back to overwriting with zero bytes or
+        # logging a warning.
+        raise NotImplementedError(
+            "SerialKrikzzTransport.file_delete: not exposed by "
+            "Krikzz's USB tool. Probe for an undocumented OS64 cmd "
+            "byte, or fall back to overwrite-with-zero on the caller "
+            "side.")
 
     async def file_exists(self, path: str) -> bool:
-        raise NotImplementedError("see SerialKrikzzTransport.dir_list")
+        return (await self._file_info(path)) is not None
 
 
 # -------------------------------------------------------------------- #
