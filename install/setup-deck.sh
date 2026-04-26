@@ -368,13 +368,38 @@ install_es_de_hooks() {
   # game launch and after game exit — same role as the SRM wrapper
   # but for low-integration setups. Idempotent: scripts are owned by
   # us (`00-retrosync-*.sh`), safe to overwrite.
-  local es_root="${HOME}/.emulationstation"
-  if [[ ! -d "${es_root}" ]]; then
-    log "EmulationStation not detected at ${es_root}; skipping ES-DE hooks."
-    log "  (Re-run setup-deck.sh after first ES-DE launch to install them.)"
+  #
+  # Detect across the known ES-DE layouts:
+  #   - ES-DE 3.0+ native:     ~/ES-DE/
+  #   - Legacy ES / older ES-DE: ~/.emulationstation/
+  #   - Flatpak (modern):      ~/.var/app/org.es_de.frontend/config/ES-DE/
+  #   - Flatpak (older slug):  ~/.var/app/com.gitlab.es-de.EmulationStation-DE/.emulationstation/
+  #   - ES_DE_HOME env override for everything else.
+  local candidates=()
+  [[ -n "${ES_DE_HOME:-}" ]] && candidates+=("${ES_DE_HOME}")
+  candidates+=(
+    "${HOME}/ES-DE"
+    "${HOME}/.emulationstation"
+    "${HOME}/.var/app/org.es_de.frontend/config/ES-DE"
+    "${HOME}/.var/app/com.gitlab.es-de.EmulationStation-DE/.emulationstation"
+  )
+  local es_root=""
+  for c in "${candidates[@]}"; do
+    if [[ -d "${c}" ]]; then
+      es_root="${c}"
+      break
+    fi
+  done
+  if [[ -z "${es_root}" ]]; then
+    log "EmulationStation/ES-DE not detected. Looked in:"
+    for c in "${candidates[@]}"; do
+      log "  ${c}"
+    done
+    log "  Skipping ES-DE hooks. If your install is elsewhere, re-run with"
+    log "  ES_DE_HOME=/path/to/es-de bash install/setup-deck.sh"
     return 0
   fi
-  log "installing ES-DE pre/post hooks"
+  log "installing ES-DE pre/post hooks under ${es_root}"
   local start_dir="${es_root}/scripts/game-start"
   local end_dir="${es_root}/scripts/game-end"
   mkdir -p "${start_dir}" "${end_dir}"
@@ -385,12 +410,19 @@ install_es_de_hooks() {
   log "  -> ${start_dir}/00-retrosync-pre.sh"
   log "  -> ${end_dir}/00-retrosync-post.sh"
   # Detect whether custom-event-scripts is enabled in es_settings.xml.
-  # We don't toggle it ourselves (XML editing is fiddly and the
-  # operator may have unrelated tweaks in the file); just print what
-  # to do.
-  local settings="${es_root}/es_settings.xml"
-  if [[ -f "${settings}" ]] && grep -q 'CustomEventScripts.*"true"' "${settings}"; then
-    log "  (custom event scripts already enabled in ES-DE settings)"
+  # 3.0+ stores settings under <root>/settings/es_settings.xml; older
+  # installs put it at <root>/es_settings.xml. Check both.
+  local settings=""
+  for s in "${es_root}/settings/es_settings.xml" \
+           "${es_root}/es_settings.xml"; do
+    if [[ -f "${s}" ]]; then
+      settings="${s}"
+      break
+    fi
+  done
+  if [[ -n "${settings}" ]] \
+        && grep -q 'CustomEventScripts.*"true"' "${settings}"; then
+    log "  (custom event scripts already enabled in ${settings})"
   else
     cat <<EOF
 
