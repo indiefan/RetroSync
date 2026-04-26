@@ -182,7 +182,9 @@ Configuration: `/etc/retrosync/config.yaml`. Restart with
      - id: pocket-1
        adapter: pocket
        options:
-         core: agg23.SNES
+         # The openFPGA SNES core writes saves under Saves/snes/common/
+         # rather than its own per-core folder.
+         core: snes/common
          file_extension: .sav
    ```
 

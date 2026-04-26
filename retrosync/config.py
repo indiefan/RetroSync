@@ -158,7 +158,9 @@ sources:
   # - id: pocket-1
   #   adapter: pocket
   #   options:
-  #     core: agg23.SNES
+  #     # Path under <mount>/Saves/ where SNES saves live. The openFPGA
+  #     # SNES core (agg23.SNES) writes to the shared snes/common/ dir.
+  #     core: snes/common
   #     file_extension: .sav
 """
 

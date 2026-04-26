@@ -70,18 +70,14 @@ def _run(cmd: list[str], *, check: bool = True,
 
 def mount_pocket(*, device: str, mount_path: str,
                  settle_seconds: float = 1.0) -> None:
-    """Mount /dev/sdX1 at <mount_path>. Uses `mount` with FAT32-friendly
-    flags. The mount path is created if missing.
+    """Mount /dev/sdX1 at <mount_path>. Lets the kernel auto-detect the
+    filesystem so vfat (small SDs) and exfat (>32 GB SDs, the default
+    above the FAT32 size limit) both work.
     """
     Path(mount_path).mkdir(parents=True, exist_ok=True)
     if settle_seconds > 0:
         time.sleep(settle_seconds)
-    # uid/gid 0 means root owns the mount. We then read/write as the
-    # systemd unit's User= (typically the retrosync user); the unit needs
-    # CAP_DAC_OVERRIDE or matching ownership.
-    _run(["mount", "-t", "vfat", "-o",
-          "rw,noatime,uid=0,gid=0,umask=000",
-          device, mount_path])
+    _run(["mount", "-o", "rw,noatime", device, mount_path])
 
 
 def unmount_pocket(*, mount_path: str, device: str | None = None) -> None:
