@@ -120,6 +120,12 @@ sources:
       sd_root: /
       save_extensions: [".srm"]
       cache_dir: /var/lib/retrosync/fxpak-cache
+      # Where to look for ROMs when the .srm doesn't sit next to one.
+      # The FXPak firmware's "Saves Directory" option puts every save
+      # under a single folder (e.g. /sd2snes/saves), divorced from the
+      # ROM tree; in that case point this at the top of your ROM tree
+      # and we'll walk it once at startup to map stems → paths.
+      rom_root: /
 
   # Future:
   # - id: retroarch-deck
