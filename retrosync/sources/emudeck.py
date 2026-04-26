@@ -171,6 +171,18 @@ class EmuDeckSource:
             aliases=self._cfg.game_aliases,
         )
 
+    def target_save_paths_for(self, *, state,
+                              game_id: str) -> dict[str, str]:
+        """Generalized per-format target paths. Single-entry dict for
+        single-file systems (SNES, GBA, Genesis on EmuDeck — all use
+        RetroArch's combined `.srm`); same shape as Pocket and (later)
+        EverDrive 64 so engine code consumes a uniform API."""
+        filename = self.filename_for(state=state, game_id=game_id)
+        if filename is None:
+            return {}
+        ext = self._cfg.save_extension.lstrip(".") or "srm"
+        return {ext: str(self.saves_root / filename)}
+
     def remember_filename(self, *, state, game_id: str,
                           filename: str) -> None:
         """Cache the (game_id → filename) mapping after observing a save

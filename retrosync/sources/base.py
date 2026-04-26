@@ -82,5 +82,43 @@ class SaveSource(Protocol):
         ...
 
 
+def default_group_refs(source: "SaveSource",
+                       refs: list[SaveRef]) -> dict[str, list[SaveRef]]:
+    """Default `group_refs` for single-file sources: one group per ref.
+
+    Multi-file sources (N64 EverDrive: per-format `.eep` / `.sra` /
+    `.fla` / `.mpk`) override this to group refs by `game_id` so the
+    engine can hand a coherent saveset to the per-system translator.
+    The key is opaque — engine treats it as a stable handle for
+    "this conceptual save" and passes it to subsequent calls."""
+    return {ref.path: [ref] for ref in refs}
+
+
+async def default_read_canonical_bytes(source: "SaveSource",
+                                       refs: list[SaveRef]) -> bytes:
+    """Default `read_canonical_bytes`: read the first (and only) ref.
+
+    Single-file sources are happy with this — there's exactly one
+    file per game and its bytes ARE the canonical bytes. Multi-file
+    sources override to read every ref in the group, pack into a
+    saveset, and run through the per-system `combine()`."""
+    if not refs:
+        raise ValueError("read_canonical_bytes called with empty refs")
+    return await source.read_save(refs[0])
+
+
+async def default_write_canonical_bytes(source: "SaveSource",
+                                        refs: list[SaveRef],
+                                        data: bytes) -> None:
+    """Default `write_canonical_bytes`: write to the first (and only)
+    ref. Single-file sources only. Multi-file sources override to
+    `split()` the canonical bytes into a saveset and write each
+    populated region to the matching per-format file (and delete
+    files for regions that became empty)."""
+    if not refs:
+        raise ValueError("write_canonical_bytes called with empty refs")
+    await source.write_save(refs[0], data)
+
+
 class SourceError(Exception):
     """Raised by source adapters on transient failures (cart unplugged, etc.)."""

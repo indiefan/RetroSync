@@ -1,0 +1,367 @@
+"""EverDrive 64 X7 SaveSource adapter.
+
+The EverDrive's SD card stores N64 saves as one file per format
+(`.eep`, `.sra`, `.fla`, `.mp1`–`.mp4`) under `/ED64/SAVES/`. The
+adapter:
+
+  - Lists every per-format file as a separate `SaveRef`.
+  - `group_refs` groups refs by canonical game-id (so all of
+    `Foo.eep` + `Foo.mp1` for one game land in one group).
+  - `read_canonical_bytes` aggregates a group's per-format files
+    into an `N64SaveSet`, then `n64.combine()`s into a 296,960-byte
+    cloud-form blob.
+  - `write_canonical_bytes` does the inverse — `n64.split()`, then
+    writes each populated region to its per-format file (and deletes
+    files for regions that have become empty).
+  - `target_save_paths_for(game_id)` walks `/ED64/ROMS/` to find a
+    matching ROM stem, returns one entry per save extension.
+
+The wire-level USB transport lives in
+`retrosync.transport.krikzz_ftdi`. The adapter consumes it as a
+service — no protocol bytes appear in this file.
+"""
+from __future__ import annotations
+
+import logging
+from collections import defaultdict
+from dataclasses import dataclass, field
+from pathlib import PurePosixPath
+
+from ...formats import n64
+from ...game_id import resolve_game_id
+from ...transport.krikzz_ftdi import (
+    KrikzzFtdiTransport, MockKrikzzTransport, build_transport,
+)
+from ..base import HealthStatus, SaveRef, SourceError
+from ..registry import register
+
+log = logging.getLogger(__name__)
+
+
+@dataclass
+class EverDrive64Config:
+    id: str
+    transport: str = "pyftdi"  # | unfloader | mock
+    ftdi_url: str = "ftdi://ftdi:0x6001/1"
+    sd_saves_root: str = "/ED64/SAVES"
+    sd_roms_root: str = "/ED64/ROMS"
+    rom_extensions: tuple[str, ...] = (".z64", ".n64", ".v64")
+    region_preference: tuple[str, ...] = (
+        "usa", "world", "europe", "japan")
+    game_aliases: dict[str, list[str]] = field(default_factory=dict)
+    system: str = "n64"
+    # When transport=mock, callers can pass an already-constructed
+    # MockKrikzzTransport via dependency injection rather than via
+    # the registry. Used by tests.
+    transport_instance: KrikzzFtdiTransport | None = None
+    unfloader_path: str = "/usr/local/bin/UNFLoader"
+
+
+class EverDrive64Source:
+    """SaveSource for the EverDrive 64 X7 over its USB port.
+
+    Public attributes per the SaveSource protocol. `device_kind =
+    "n64-everdrive"` so cloud versions land under
+    `versions/n64-everdrive/...` and stay distinguishable from
+    Deck-authored N64 saves (`versions/deck/...`).
+    """
+
+    device_kind = "n64-everdrive"
+
+    def __init__(self, config: EverDrive64Config):
+        self._cfg = config
+        self.id = config.id
+        self.system = config.system
+        self._transport: KrikzzFtdiTransport | None = config.transport_instance
+        self._opened = False
+        # Per-pass cache of resolved game_ids per save filename.
+        # Cleared at health-check time; a new pass repopulates.
+        self._game_id_cache: dict[str, str] = {}
+        # Per-pass cache of ROM stems for bootstrap-pull file naming.
+        # game_id → ROM stem (without extension).
+        self._rom_stem_cache: dict[str, str] = {}
+
+    # ----------- internals -----------
+
+    def _ensure_transport(self) -> KrikzzFtdiTransport:
+        if self._transport is None:
+            opts: dict = {}
+            if self._cfg.transport == "pyftdi":
+                opts["ftdi_url"] = self._cfg.ftdi_url
+            elif self._cfg.transport == "unfloader":
+                opts["unfloader_path"] = self._cfg.unfloader_path
+            self._transport = build_transport(
+                kind=self._cfg.transport, **opts)
+        return self._transport
+
+    async def _open(self) -> KrikzzFtdiTransport:
+        t = self._ensure_transport()
+        if not self._opened:
+            try:
+                await t.open()
+                self._opened = True
+            except Exception as exc:  # noqa: BLE001
+                raise SourceError(f"opening EverDrive 64 USB: {exc}") from exc
+        return t
+
+    # ----------- SaveSource methods -----------
+
+    async def health(self) -> HealthStatus:
+        try:
+            t = await self._open()
+            ok, detail = await t.health()
+        except SourceError as exc:
+            return HealthStatus(False, str(exc))
+        except Exception as exc:  # noqa: BLE001
+            return HealthStatus(False, f"transport error: {exc}")
+        # New pass; flush the per-pass caches so a re-scan picks up
+        # any new ROMs / saves the operator added.
+        self._game_id_cache.clear()
+        self._rom_stem_cache.clear()
+        return HealthStatus(ok, detail)
+
+    async def list_saves(self) -> list[SaveRef]:
+        t = await self._open()
+        try:
+            entries = await t.dir_list(self._cfg.sd_saves_root)
+        except Exception as exc:  # noqa: BLE001
+            raise SourceError(f"listing {self._cfg.sd_saves_root}: {exc}") from exc
+        out: list[SaveRef] = []
+        for e in entries:
+            if e.is_dir:
+                continue
+            ext = "." + e.name.rsplit(".", 1)[-1].lower() if "." in e.name else ""
+            if ext not in n64.ALL_N64_SAVE_EXTENSIONS:
+                continue
+            out.append(SaveRef(
+                path=f"{self._cfg.sd_saves_root}/{e.name}",
+                size_bytes=e.size,
+            ))
+        return out
+
+    async def read_save(self, ref: SaveRef) -> bytes:
+        """Read a single per-format file. The engine never calls this
+        directly for EverDrive groups (it calls read_canonical_bytes
+        instead), but `retrosync push`/`pull` and other CLI tools
+        operate on individual files."""
+        t = await self._open()
+        try:
+            return await t.file_read(ref.path)
+        except Exception as exc:  # noqa: BLE001
+            raise SourceError(f"reading {ref.path}: {exc}") from exc
+
+    async def write_save(self, ref: SaveRef, data: bytes) -> None:
+        """Write a single per-format file. Same caveat as `read_save`
+        — engine uses `write_canonical_bytes` for grouped saves."""
+        t = await self._open()
+        try:
+            await t.file_write(ref.path, data)
+        except Exception as exc:  # noqa: BLE001
+            raise SourceError(f"writing {ref.path}: {exc}") from exc
+
+    def resolve_game_id(self, ref: SaveRef) -> str:
+        cached = self._game_id_cache.get(ref.path)
+        if cached is not None:
+            return cached
+        slug = resolve_game_id(PurePosixPath(ref.path).stem,
+                               aliases=self._cfg.game_aliases)
+        self._game_id_cache[ref.path] = slug
+        return slug
+
+    # ----------- multi-file group hooks -----------
+
+    def group_refs(self, refs: list[SaveRef]) -> dict[str, list[SaveRef]]:
+        """Group per-format files by canonical game-id.
+
+        For SuperMario64.eep + SuperMario64.mp1, both refs share
+        canonical_slug `super_mario_64` and end up in the same group.
+        """
+        out: dict[str, list[SaveRef]] = defaultdict(list)
+        for ref in refs:
+            out[self.resolve_game_id(ref)].append(ref)
+        # Sort inside each group for stable state.db tracking
+        # (orchestrator uses the first ref's path as the conventional
+        # state.db key).
+        return {k: sorted(v, key=lambda r: r.path) for k, v in out.items()}
+
+    async def read_canonical_bytes(self, refs: list[SaveRef]) -> bytes:
+        """Read every per-format file in `refs`, pack into a saveset,
+        return the combined 296,960-byte mupen64plus-format blob."""
+        if not refs:
+            return n64.combine(n64.empty_set())
+        ss = await self._read_saveset(refs)
+        return n64.combine(ss)
+
+    async def write_canonical_bytes(self, refs: list[SaveRef],
+                                    data: bytes) -> None:
+        """Split the combined blob into a saveset, write each populated
+        region to its per-format file. Existing files for now-empty
+        regions are deleted (cleaner than writing zero-length files —
+        the EverDrive firmware prefers the absent-file representation).
+
+        `refs` is the current group; we use its first ref to derive
+        the ROM stem for filename construction. New per-format files
+        are written under that stem.
+        """
+        ss = n64.split(data)
+        if not refs:
+            return  # no anchor for filename; bootstrap path uses a
+                    # different code path that supplies target paths
+                    # explicitly.
+        anchor = refs[0]
+        stem = PurePosixPath(anchor.path).stem
+        await self._write_saveset(stem, ss, current_refs=refs)
+
+    # ----------- adapter-specific (used by orchestrator + tests) -----------
+
+    async def _read_saveset(self, refs: list[SaveRef]) -> n64.N64SaveSet:
+        eeprom = sram = flashram = None
+        cpak: list[bytes | None] = [None, None, None, None]
+        t = await self._open()
+        for ref in refs:
+            ext = ("." + ref.path.rsplit(".", 1)[-1].lower()
+                   if "." in ref.path else "")
+            try:
+                data = await t.file_read(ref.path)
+            except Exception as exc:  # noqa: BLE001
+                raise SourceError(
+                    f"reading {ref.path}: {exc}") from exc
+            if ext == n64.EXT_EEPROM:
+                eeprom = data
+            elif ext == n64.EXT_SRAM:
+                sram = data
+            elif ext == n64.EXT_FLASHRAM:
+                flashram = data
+            elif ext in n64.EXT_CPAK_PER_PORT:
+                idx = n64.EXT_CPAK_PER_PORT.index(ext)
+                cpak[idx] = data
+            elif ext == n64.EXT_CPAK_GENERIC:
+                # Older firmware uses a single .mpk for port 1.
+                cpak[0] = data
+            else:
+                log.debug("EverDrive 64: unknown save extension on %s",
+                          ref.path)
+        return n64.N64SaveSet(
+            eeprom=eeprom, sram=sram, flashram=flashram,
+            cpak=(cpak[0], cpak[1], cpak[2], cpak[3]),
+        )
+
+    async def _write_saveset(self, stem: str, ss: n64.N64SaveSet,
+                              *, current_refs: list[SaveRef]) -> None:
+        """Write each populated region; delete files for empty regions
+        that currently exist on the SD."""
+        t = await self._open()
+        present = {ref.path for ref in current_refs}
+
+        async def write_or_delete(ext: str, payload: bytes | None) -> None:
+            path = f"{self._cfg.sd_saves_root}/{stem}{ext}"
+            if payload is None:
+                if path in present:
+                    try:
+                        await t.file_delete(path)
+                        log.info("EverDrive 64: deleted empty %s", path)
+                    except Exception as exc:  # noqa: BLE001
+                        log.warning("delete %s failed: %s", path, exc)
+                return
+            try:
+                await t.file_write(path, payload)
+            except Exception as exc:  # noqa: BLE001
+                raise SourceError(f"writing {path}: {exc}") from exc
+
+        await write_or_delete(n64.EXT_EEPROM, ss.eeprom)
+        await write_or_delete(n64.EXT_SRAM, ss.sram)
+        await write_or_delete(n64.EXT_FLASHRAM, ss.flashram)
+        for idx, cpak_bytes in enumerate(ss.cpak):
+            await write_or_delete(n64.EXT_CPAK_PER_PORT[idx], cpak_bytes)
+
+    async def target_save_paths_for(self,
+                                    game_id: str) -> dict[str, str | list[str]]:
+        """Per the design's generalized API. Walks `/ED64/ROMS/` to
+        find a ROM whose canonical slug matches `game_id`, returns
+        the per-format save paths under the matched stem.
+
+        Returns an empty dict when no matching ROM is found — caller
+        skips the bootstrap-pull and logs a warning.
+        """
+        t = await self._open()
+        try:
+            entries = await t.dir_list(self._cfg.sd_roms_root)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("listing %s for game-id lookup failed: %s",
+                        self._cfg.sd_roms_root, exc)
+            return {}
+        matches: list[str] = []
+        rom_exts = tuple(e.lower() for e in self._cfg.rom_extensions)
+        for e in entries:
+            if e.is_dir:
+                continue
+            if not e.name.lower().endswith(rom_exts):
+                continue
+            slug = resolve_game_id(PurePosixPath(e.name).stem,
+                                   aliases=self._cfg.game_aliases)
+            if slug == game_id:
+                matches.append(e.name)
+        if not matches:
+            return {}
+        # Pick by region preference — same logic as filename_map / Pocket.
+        chosen = _pick_by_region(matches, self._cfg.region_preference)
+        stem = PurePosixPath(chosen).stem
+        self._rom_stem_cache[game_id] = stem
+        # The dict returned covers EVERY possible save format —
+        # write_saveset will only actually write the ones the saveset
+        # has bytes for. Including the empty slots gives the caller
+        # full visibility.
+        out: dict[str, str | list[str]] = {
+            "eep":  f"{self._cfg.sd_saves_root}/{stem}{n64.EXT_EEPROM}",
+            "sra":  f"{self._cfg.sd_saves_root}/{stem}{n64.EXT_SRAM}",
+            "fla":  f"{self._cfg.sd_saves_root}/{stem}{n64.EXT_FLASHRAM}",
+            "mpk": [f"{self._cfg.sd_saves_root}/{stem}{ext}"
+                    for ext in n64.EXT_CPAK_PER_PORT],
+        }
+        return out
+
+
+_SINGLE_LETTER_REGIONS = {"u": "usa", "e": "europe", "j": "japan",
+                          "w": "world"}
+
+
+def _pick_by_region(names: list[str],
+                    preference: tuple[str, ...]) -> str:
+    """Same shape as the Pocket / filename_map region preference logic."""
+    def rank(name: str) -> int:
+        lname = name.lower()
+        for i, want in enumerate(preference):
+            if want in lname:
+                return i
+            for letter, full in _SINGLE_LETTER_REGIONS.items():
+                if full == want and (
+                        f"({letter})" in lname or f"({letter}," in lname):
+                    return i
+        return len(preference)
+    return sorted(names, key=lambda n: (rank(n), n))[0]
+
+
+def _build(*, id: str, transport: str = "pyftdi",
+           ftdi_url: str = "ftdi://ftdi:0x6001/1",
+           sd_saves_root: str = "/ED64/SAVES",
+           sd_roms_root: str = "/ED64/ROMS",
+           rom_extensions: list[str] | None = None,
+           region_preference: list[str] | None = None,
+           game_aliases: dict[str, list[str]] | None = None,
+           system: str = "n64",
+           unfloader_path: str = "/usr/local/bin/UNFLoader",
+           ) -> EverDrive64Source:
+    cfg = EverDrive64Config(
+        id=id, transport=transport, ftdi_url=ftdi_url,
+        sd_saves_root=sd_saves_root, sd_roms_root=sd_roms_root,
+        game_aliases=dict(game_aliases or {}),
+        system=system, unfloader_path=unfloader_path,
+    )
+    if rom_extensions:
+        cfg.rom_extensions = tuple(rom_extensions)
+    if region_preference:
+        cfg.region_preference = tuple(region_preference)
+    return EverDrive64Source(cfg)
+
+
+register("everdrive64", _build)

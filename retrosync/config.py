@@ -261,6 +261,11 @@ cloud_wins_on_diverged_device: false
 # first-byte HP/MP/inventory change.
 drift_threshold:
   pocket: 4
+  # N64 EverDrive 64 X7. Controller Pak data ticks counters across
+  # power cycles even when the operator doesn't think they're
+  # "playing"; a small threshold lets us ignore that drift the same
+  # way Pocket does.
+  n64-everdrive: 4
 
 # Active-device lease (EmuDeck sync design §9). When a device starts
 # playing a game, it acquires a per-game lease in the cloud manifest
@@ -317,6 +322,41 @@ sources:
   #     save_extension: .srm
   #     rom_extensions: [".sfc", ".smc", ".swc", ".fig"]
   #     system: snes
+
+  # EverDrive 64 X7 (N64 flash cart over USB). Plugs into the same
+  # Pi as the FXPak Pro; same usb-while-running model: continuous
+  # polling, instant-sync via udev poke, lease-aware. Per-format
+  # save files (.eep/.sra/.fla/.mp1..mp4) are aggregated into a
+  # combined Mupen64Plus-format .srm before upload, and split back
+  # on download — see `retrosync/formats/n64.py`.
+  # - id: everdrive64-1
+  #   adapter: everdrive64
+  #   options:
+  #     # Transport backends:
+  #     #   pyftdi    — direct USB via libusb (preferred, no kernel
+  #     #               driver needed). Wire-byte verification still
+  #     #               pending against UNFLoader source on real
+  #     #               hardware — see retrosync/transport/krikzz_ftdi.py
+  #     #   unfloader — subprocess wrapper (stub; UNFLoader CLI does
+  #     #               not natively expose SD ops; needs a wrapper).
+  #     #   mock      — in-memory virtual SD; tests only.
+  #     transport: pyftdi
+  #     ftdi_url: ftdi://ftdi:0x6001/1
+  #     sd_saves_root: /ED64/SAVES
+  #     sd_roms_root: /ED64/ROMS
+  #     rom_extensions: [".z64", ".n64", ".v64"]
+  #     system: n64
+  #
+  # And a corresponding Deck-side EmuDeck source for N64 (separate
+  # from the SNES one above):
+  # - id: deck-1-n64
+  #   adapter: emudeck
+  #   options:
+  #     system: n64
+  #     saves_root: /home/deck/Emulation/saves/retroarch/saves
+  #     roms_root:  /home/deck/Emulation/roms/n64
+  #     save_extension: .srm
+  #     rom_extensions: [".z64", ".n64", ".v64"]
 """
 
     def write_example_to(self, path: str | os.PathLike) -> None:
