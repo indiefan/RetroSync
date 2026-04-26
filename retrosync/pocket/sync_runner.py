@@ -80,6 +80,9 @@ def mount_pocket(*, device: str, mount_path: str,
     Path(mount_path).mkdir(parents=True, exist_ok=True)
     if settle_seconds > 0:
         time.sleep(settle_seconds)
+    # Re-mkdir after the settle: a parallel systemd unit's RuntimeDirectory
+    # cleanup can race us between the initial mkdir and the mount call.
+    Path(mount_path).mkdir(parents=True, exist_ok=True)
     _run(["mount", "-o", "rw,noatime", device, mount_path])
 
 

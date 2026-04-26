@@ -19,6 +19,11 @@ Group=root
 Environment=RETROSYNC_CONFIG=/etc/retrosync/config.yaml
 Environment=RCLONE_CONFIG=/var/lib/retrosync/rclone.conf
 RuntimeDirectory=retrosync
+# Without Preserve=yes, systemd removes /run/retrosync the moment this
+# (Type=oneshot) unit exits — racing any concurrent `retrosync load
+# <game> pocket` whose mount point is also under /run/retrosync. Keeping
+# the directory alive between runs costs nothing and removes the race.
+RuntimeDirectoryPreserve=yes
 ExecStart=/opt/retrosync/.venv/bin/retrosync --config ${RETROSYNC_CONFIG} \
           pocket-sync --device /dev/%i \
           --mount-path /run/retrosync/pocket-mount-%i
