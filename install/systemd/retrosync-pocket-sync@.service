@@ -1,0 +1,32 @@
+[Unit]
+Description=RetroSync — Pocket sync (%i)
+Documentation=https://github.com/indiefan/RetroSync
+After=systemd-udevd.service
+# %i is the kernel name of the partition device (e.g. sda1). The ConditionPathExists
+# guards against firing twice on hotplug edge cases where udev re-emits the rule.
+ConditionPathExists=/dev/%i
+
+[Service]
+# Type=oneshot so systemd treats this as a finite job and doesn't try to
+# restart it after the Pocket goes away.
+Type=oneshot
+# Run as root: we need to mount/umount and to power off the USB device after.
+# The actual Python process drops to no special user — its writes inside
+# /run/retrosync/pocket-mount are root-owned mount-time artifacts, and
+# state.db / rclone.conf live under /var/lib/retrosync (root-readable).
+User=root
+Group=root
+Environment=RETROSYNC_CONFIG=/etc/retrosync/config.yaml
+Environment=RCLONE_CONFIG=/var/lib/retrosync/rclone.conf
+RuntimeDirectory=retrosync
+ExecStart=/opt/retrosync/.venv/bin/retrosync --config ${RETROSYNC_CONFIG} \
+          pocket-sync --device /dev/%i \
+          --mount-path /run/retrosync/pocket-mount-%i
+TimeoutStartSec=300
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+# Templated units don't get enabled directly; udev triggers them via
+# SYSTEMD_WANTS. Listed for documentation.
+WantedBy=

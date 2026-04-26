@@ -47,6 +47,7 @@ CREATE TABLE IF NOT EXISTS versions (
   state         TEXT NOT NULL,
   retention     TEXT NOT NULL DEFAULT 'keep',
   stable_polls  INTEGER NOT NULL DEFAULT 0,
+  parent_hash   TEXT,
   FOREIGN KEY (source_id, path) REFERENCES files(source_id, path)
 );
 
@@ -54,7 +55,46 @@ CREATE INDEX IF NOT EXISTS versions_by_file
   ON versions(source_id, path, observed_at);
 CREATE INDEX IF NOT EXISTS versions_pending
   ON versions(state) WHERE state IN ('pending','debouncing','ready','uploading');
+
+-- Per-(source, game) pointer to the hash this device and the cloud last
+-- agreed on. Lets the sync engine distinguish a fast-forward (one side
+-- moved past the agreed hash) from a divergence (both moved).
+CREATE TABLE IF NOT EXISTS source_sync_state (
+  source_id          TEXT NOT NULL,
+  game_id            TEXT NOT NULL,
+  last_synced_hash   TEXT NOT NULL,
+  last_synced_at     TEXT NOT NULL,
+  device_seen_path   TEXT,
+  PRIMARY KEY (source_id, game_id)
+);
+
+-- Open or resolved conflicts: a row exists per (game, divergence event).
+-- Resolved rows keep their history for forensics; the engine treats only
+-- those with resolved_at IS NULL as live.
+CREATE TABLE IF NOT EXISTS conflicts (
+  id              INTEGER PRIMARY KEY AUTOINCREMENT,
+  game_id         TEXT NOT NULL,
+  system          TEXT NOT NULL,
+  source_id       TEXT NOT NULL,
+  detected_at     TEXT NOT NULL,
+  base_hash       TEXT,
+  cloud_hash      TEXT NOT NULL,
+  device_hash     TEXT NOT NULL,
+  cloud_path      TEXT,
+  conflict_path   TEXT,
+  resolved_at     TEXT,
+  winner_hash     TEXT
+);
+
+CREATE INDEX IF NOT EXISTS conflicts_open
+  ON conflicts(resolved_at) WHERE resolved_at IS NULL;
 """
+
+# Lightweight migrations applied on every open. SQLite doesn't have an
+# IF NOT EXISTS for ADD COLUMN, so we probe with PRAGMA table_info first.
+_MIGRATIONS = [
+    ("versions", "parent_hash", "ALTER TABLE versions ADD COLUMN parent_hash TEXT"),
+]
 
 # The states a version row passes through.
 ST_PENDING    = "pending"     # Inserted, no debounce evidence yet.
@@ -80,6 +120,32 @@ class VersionRow:
     state: str
     retention: str
     stable_polls: int
+    parent_hash: str | None = None
+
+
+@dataclass
+class SourceSyncState:
+    source_id: str
+    game_id: str
+    last_synced_hash: str
+    last_synced_at: str
+    device_seen_path: str | None
+
+
+@dataclass
+class ConflictRow:
+    id: int
+    game_id: str
+    system: str
+    source_id: str
+    detected_at: str
+    base_hash: str | None
+    cloud_hash: str
+    device_hash: str
+    cloud_path: str | None
+    conflict_path: str | None
+    resolved_at: str | None
+    winner_hash: str | None
 
 
 def _utcnow_iso() -> str:
@@ -98,6 +164,15 @@ class StateStore:
                                  "PRAGMA synchronous=NORMAL;"
                                  "PRAGMA foreign_keys=ON;")
         self._conn.executescript(SCHEMA)
+        self._apply_migrations()
+
+    def _apply_migrations(self) -> None:
+        """Add columns missing from old DBs that predate the v2 schema."""
+        for table, col, sql in _MIGRATIONS:
+            cols = {row["name"] for row in self._conn.execute(
+                f"PRAGMA table_info({table})")}
+            if col not in cols:
+                self._conn.execute(sql)
 
     def close(self) -> None:
         self._conn.close()
@@ -171,13 +246,16 @@ class StateStore:
         return _row_to_version(row) if row else None
 
     def insert_pending(self, *, source_id: str, path: str, h: str,
-                       size_bytes: int) -> int:
+                       size_bytes: int,
+                       parent_hash: str | None = None) -> int:
         with self.tx() as c:
             cur = c.execute("""
                 INSERT INTO versions
-                  (source_id, path, hash, size_bytes, observed_at, state, retention, stable_polls)
-                VALUES (?, ?, ?, ?, ?, ?, 'keep', 0)
-            """, (source_id, path, h, size_bytes, _utcnow_iso(), ST_PENDING))
+                  (source_id, path, hash, size_bytes, observed_at, state,
+                   retention, stable_polls, parent_hash)
+                VALUES (?, ?, ?, ?, ?, ?, 'keep', 0, ?)
+            """, (source_id, path, h, size_bytes, _utcnow_iso(),
+                  ST_PENDING, parent_hash))
             return cur.lastrowid
 
     def bump_debounce(self, version_id: int) -> int:
@@ -243,6 +321,106 @@ class StateStore:
             ORDER BY id DESC
         """, (source_id, path))]
 
+    # ----------- source_sync_state -----------
+
+    def get_sync_state(self, source_id: str,
+                       game_id: str) -> SourceSyncState | None:
+        row = self._conn.execute(
+            "SELECT * FROM source_sync_state "
+            "WHERE source_id=? AND game_id=?",
+            (source_id, game_id),
+        ).fetchone()
+        if not row:
+            return None
+        return SourceSyncState(
+            source_id=row["source_id"],
+            game_id=row["game_id"],
+            last_synced_hash=row["last_synced_hash"],
+            last_synced_at=row["last_synced_at"],
+            device_seen_path=row["device_seen_path"],
+        )
+
+    def set_sync_state(self, *, source_id: str, game_id: str,
+                       last_synced_hash: str,
+                       device_seen_path: str | None = None) -> None:
+        now = _utcnow_iso()
+        with self.tx() as c:
+            c.execute("""
+                INSERT INTO source_sync_state
+                  (source_id, game_id, last_synced_hash, last_synced_at,
+                   device_seen_path)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(source_id, game_id) DO UPDATE SET
+                  last_synced_hash = excluded.last_synced_hash,
+                  last_synced_at   = excluded.last_synced_at,
+                  device_seen_path = COALESCE(excluded.device_seen_path,
+                                              source_sync_state.device_seen_path)
+            """, (source_id, game_id, last_synced_hash, now,
+                  device_seen_path))
+
+    def clear_sync_state_for_game(self, game_id: str) -> int:
+        """After a conflict resolve, drop every source's sync pointer for
+        this game so the next sync re-syncs them all to the new winner.
+        Returns number of rows cleared."""
+        with self.tx() as c:
+            cur = c.execute(
+                "DELETE FROM source_sync_state WHERE game_id=?", (game_id,))
+            return cur.rowcount
+
+    # ----------- conflicts -----------
+
+    def insert_conflict(self, *, game_id: str, system: str, source_id: str,
+                        base_hash: str | None,
+                        cloud_hash: str, device_hash: str,
+                        cloud_path: str | None,
+                        conflict_path: str | None) -> int:
+        with self.tx() as c:
+            cur = c.execute("""
+                INSERT INTO conflicts
+                  (game_id, system, source_id, detected_at, base_hash,
+                   cloud_hash, device_hash, cloud_path, conflict_path)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (game_id, system, source_id, _utcnow_iso(), base_hash,
+                  cloud_hash, device_hash, cloud_path, conflict_path))
+            return cur.lastrowid
+
+    def open_conflict_for(self, *, game_id: str, source_id: str,
+                          device_hash: str) -> ConflictRow | None:
+        """Return an unresolved conflict already on file for this exact
+        (game, source, device-hash) — used to dedupe repeated polls of
+        the same divergence."""
+        row = self._conn.execute("""
+            SELECT * FROM conflicts
+            WHERE game_id=? AND source_id=? AND device_hash=?
+              AND resolved_at IS NULL
+            ORDER BY id DESC LIMIT 1
+        """, (game_id, source_id, device_hash)).fetchone()
+        return _row_to_conflict(row) if row else None
+
+    def list_conflicts(self, *, open_only: bool = True) -> list[ConflictRow]:
+        sql = "SELECT * FROM conflicts"
+        if open_only:
+            sql += " WHERE resolved_at IS NULL"
+        sql += " ORDER BY id DESC"
+        return [_row_to_conflict(r) for r in self._conn.execute(sql)]
+
+    def get_conflict(self, conflict_id: int) -> ConflictRow | None:
+        row = self._conn.execute(
+            "SELECT * FROM conflicts WHERE id=?", (conflict_id,)).fetchone()
+        return _row_to_conflict(row) if row else None
+
+    def resolve_conflict(self, conflict_id: int, *, winner_hash: str) -> None:
+        with self.tx() as c:
+            c.execute(
+                "UPDATE conflicts SET resolved_at=?, winner_hash=? WHERE id=?",
+                (_utcnow_iso(), winner_hash, conflict_id))
+
+    def open_conflicts_for_game(self, game_id: str) -> list[ConflictRow]:
+        return [_row_to_conflict(r) for r in self._conn.execute(
+            "SELECT * FROM conflicts "
+            "WHERE game_id=? AND resolved_at IS NULL "
+            "ORDER BY id", (game_id,))]
+
     def tombstone_missing(self, source_id: str,
                           present_paths: set[str]) -> int:
         """Mark files no longer reported by the source as tombstoned at the file level.
@@ -262,7 +440,25 @@ class StateStore:
         return len(gone)
 
 
+def _row_to_conflict(row: sqlite3.Row) -> ConflictRow:
+    return ConflictRow(
+        id=row["id"],
+        game_id=row["game_id"],
+        system=row["system"],
+        source_id=row["source_id"],
+        detected_at=row["detected_at"],
+        base_hash=row["base_hash"],
+        cloud_hash=row["cloud_hash"],
+        device_hash=row["device_hash"],
+        cloud_path=row["cloud_path"],
+        conflict_path=row["conflict_path"],
+        resolved_at=row["resolved_at"],
+        winner_hash=row["winner_hash"],
+    )
+
+
 def _row_to_version(row: sqlite3.Row) -> VersionRow:
+    keys = row.keys()
     return VersionRow(
         id=row["id"],
         source_id=row["source_id"],
@@ -275,4 +471,5 @@ def _row_to_version(row: sqlite3.Row) -> VersionRow:
         state=row["state"],
         retention=row["retention"],
         stable_polls=row["stable_polls"],
+        parent_hash=row["parent_hash"] if "parent_hash" in keys else None,
     )

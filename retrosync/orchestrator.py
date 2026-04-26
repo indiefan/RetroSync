@@ -36,6 +36,10 @@ from .config import Config, OrchestratorConfig, SourceConfig
 from .sources.base import SaveRef, SaveSource, SourceError
 from .sources.registry import build as build_source
 from .state import (ST_DEBOUNCING, ST_READY, StateStore, VersionRow)
+from .sync import (
+    SyncConfig, SyncContext, SyncOutcome, SyncResult, refresh_manifest,
+    sync_one_game,
+)
 
 log = logging.getLogger(__name__)
 
@@ -45,6 +49,11 @@ class OrchestratorDeps:
     state: StateStore
     cloud: RcloneCloud
     cfg: OrchestratorConfig
+    sync_cfg: SyncConfig = None  # type: ignore[assignment]
+
+    def __post_init__(self):
+        if self.sync_cfg is None:
+            self.sync_cfg = SyncConfig()
 
 
 class BackupOrchestrator:
@@ -88,9 +97,13 @@ class BackupOrchestrator:
             log.warning("list_saves failed for %s: %s", self._source.id, exc)
             return
 
+        ctx = SyncContext(state=self._deps.state, cloud=self._deps.cloud,
+                          cfg=self._deps.sync_cfg)
+        refresh_targets: dict[str, tuple[str, str, object]] = {}
+
         present_paths = {ref.path for ref in refs}
         for ref in refs:
-            await self._poll_one(ref)
+            await self._poll_one(ref, ctx, refresh_targets)
 
         # Mark files that vanished from the source.
         gone = self._deps.state.tombstone_missing(self._source.id, present_paths)
@@ -102,9 +115,20 @@ class BackupOrchestrator:
         self._promote_stable()
 
         # Drain ready queue.
-        await self._drain_ready()
+        await self._drain_ready(ctx, refresh_targets)
 
-    async def _poll_one(self, ref: SaveRef) -> None:
+        # Final manifest refresh per affected game — once per pass.
+        for game_id, save_path, paths in refresh_targets.values():
+            try:
+                refresh_manifest(source=self._source, save_path=save_path,
+                                 game_id=game_id, paths=paths, ctx=ctx)
+            except CloudError as exc:
+                log.warning("manifest refresh failed for %s; next pass "
+                            "will retry: %s", save_path, exc)
+
+    async def _poll_one(self, ref: SaveRef, ctx: SyncContext,
+                        refresh_targets: dict[str, tuple[str, str, object]]
+                        ) -> None:
         try:
             data = await self._source.read_save(ref)
         except SourceError as exc:
@@ -126,6 +150,16 @@ class BackupOrchestrator:
             if latest is not None and latest.hash == h:
                 count = self._deps.state.bump_debounce(latest.id)
                 log.debug("debounce++ for %s: %d", ref.path, count)
+            elif self._deps.sync_cfg.cloud_to_device:
+                # Local save is steady. Run the sync engine to detect cloud-
+                # newer copies and pull them down. Engine returns IN_SYNC
+                # cheaply when nothing's changed, courtesy of the per-pass
+                # manifest cache.
+                outcome = await sync_one_game(
+                    source=self._source, ref=ref, ctx=ctx,
+                    primed_data=data, primed_hash=h,
+                )
+                self._record_refresh(outcome, refresh_targets)
             return
 
         # Hash changed (or first sighting). Supersede any active row, insert pending.
@@ -136,9 +170,12 @@ class BackupOrchestrator:
             log.info("superseded version %d for %s (was %s, now %s)",
                      latest.id, ref.path, latest.hash[:8], h[:8])
 
+        # parent_hash is whatever the device-side hash was the last time we
+        # saw it (or None on first sighting). Used by the sync engine to
+        # reason about lineage during conflict detection.
         vid = self._deps.state.insert_pending(
             source_id=self._source.id, path=ref.path,
-            h=h, size_bytes=size,
+            h=h, size_bytes=size, parent_hash=prev_h,
         )
         self._deps.state.set_current_hash(
             source_id=self._source.id, path=ref.path, h=h)
@@ -162,48 +199,40 @@ class BackupOrchestrator:
             self._deps.state.promote_to_ready(r["id"])
             log.info("promoted version %d to READY", r["id"])
 
-    async def _drain_ready(self) -> None:
-        # Track which (game_id, save_path) tuples need a manifest refresh.
-        # The original design wrote the manifest after every version upload,
-        # which on a first-sync of N saves caused 2N rclone calls in a few
-        # seconds and tripped Drive's per-project rate limiter (the default
-        # rclone OAuth client is shared across all rclone users globally).
-        # Now we upload all version files first and refresh each affected
-        # game's manifest exactly once at the end of the pass.
-        manifests_to_refresh: dict[str, dict] = {}
+    async def _drain_ready(self, ctx: SyncContext,
+                           refresh_targets: dict[str, tuple[str, str, object]]
+                           ) -> None:
+        # Funnel each ready version through the shared sync engine. The
+        # per-game manifest refresh is batched at the pass level so Drive's
+        # per-minute write quota isn't burned on per-upload writes.
         ready = [v for v in self._deps.state.ready_versions()
                  if v.source_id == self._source.id]
         for i, v in enumerate(ready):
-            refreshed = await self._upload_version(v)
-            if refreshed is not None:
-                key = f"{refreshed['game_id']}::{refreshed['save_path']}"
-                manifests_to_refresh[key] = refreshed
+            outcome = await self._sync_promoted(v, ctx)
+            self._record_refresh(outcome, refresh_targets)
             # Inter-upload pacing — small sleep between rclone invocations
             # to spread API calls across the per-minute rate-limit window.
             if i + 1 < len(ready):
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(self._deps.sync_cfg.inter_op_sleep_sec)
 
-        for entry in manifests_to_refresh.values():
-            try:
-                self._refresh_manifest(
-                    paths=entry["paths"],
-                    source_id=self._source.id,
-                    system=self._source.system,
-                    game_id=entry["game_id"],
-                    save_path=entry["save_path"],
-                )
-            except CloudError as exc:
-                log.warning("manifest refresh failed for %s; next pass "
-                            "will retry: %s", entry["save_path"], exc)
+    def _record_refresh(self, outcome: SyncOutcome | None,
+                        refresh_targets: dict[str, tuple[str, str, object]]
+                        ) -> None:
+        if outcome is None or outcome.paths is None:
+            return
+        if outcome.result not in (SyncResult.UPLOADED,
+                                  SyncResult.BOOTSTRAP_UPLOADED,
+                                  SyncResult.DOWNLOADED,
+                                  SyncResult.BOOTSTRAP_DOWNLOADED,
+                                  SyncResult.CONFLICT):
+            return
+        key = f"{outcome.game_id}::{outcome.save_path}"
+        refresh_targets[key] = (outcome.game_id, outcome.save_path,
+                                outcome.paths)
 
-    async def _upload_version(self, v: VersionRow) -> dict | None:
-        """Upload one version's data + current.<ext>. Returns a dict the
-        caller can use to refresh the manifest for this game once the whole
-        ready batch has finished, or None if no upload happened.
-        """
-        # Re-read the current bytes from source so we upload the actual hash.
-        # The save may have changed again since we promoted; if so, the
-        # post-upload hash check will catch it and we'll re-poll.
+    async def _sync_promoted(self, v: VersionRow,
+                             ctx: SyncContext) -> SyncOutcome | None:
+        """Re-read the device, drift-check, hand off to the sync engine."""
         ref = SaveRef(path=v.path, size_bytes=v.size_bytes)
         try:
             data = await self._source.read_save(ref)
@@ -219,63 +248,23 @@ class BackupOrchestrator:
             new_id = self._deps.state.insert_pending(
                 source_id=self._source.id, path=v.path,
                 h=h, size_bytes=len(data),
+                parent_hash=v.hash,
             )
             self._deps.state.set_current_hash(
                 source_id=self._source.id, path=v.path, h=h)
             self._deps.state.bump_debounce(new_id)
-            return None
+            return SyncOutcome(SyncResult.DRIFTED, "", v.path, None,
+                               "source drifted; re-pended")
 
-        game_id = await self._resolve_game_id(ref)
-        save_filename = v.path.rsplit("/", 1)[-1]
-        paths = compose_paths(remote=self._deps.cloud.remote,
-                              system=self._source.system,
-                              game_id=game_id,
-                              save_filename=save_filename)
-        self._deps.state.mark_uploading(v.id)
         try:
-            cloud_version_path = self._deps.cloud.upload_version(
-                paths=paths, save_data=data,
-                full_hash=h, observed_at=v.observed_at,
+            return await sync_one_game(
+                source=self._source, ref=ref, ctx=ctx,
+                primed_data=data, primed_hash=h, version_row=v,
             )
-            self._deps.cloud.overwrite_current(paths=paths, save_data=data)
-            # Mark the row uploaded BEFORE the manifest is rebuilt so that
-            # the rebuild includes this version. The manifest itself is
-            # written by _drain_ready after the whole ready batch finishes.
-            self._deps.state.mark_uploaded(v.id, cloud_path=cloud_version_path)
-            log.info("uploaded %s → %s (%d bytes)",
-                     v.path, cloud_version_path, v.size_bytes)
-            return {"paths": paths, "game_id": game_id, "save_path": v.path}
         except CloudError as exc:
-            log.warning("upload failed for v%d (%s); will retry next pass: %s",
+            log.warning("sync failed for v%d (%s); will retry next pass: %s",
                         v.id, v.path, exc)
-            self._deps.state.revert_to_ready(v.id)
             return None
-            self._deps.state.revert_to_ready(v.id)
-
-    def _refresh_manifest(self, *, paths, source_id, system, game_id, save_path):
-        # Build manifest entries from the SQLite history of uploaded versions
-        # for this file. This is the source of truth — it doesn't matter if
-        # the cloud's previous manifest is missing or stale.
-        rows = self._deps.state.list_versions(source_id, save_path)
-        entries = [
-            ManifestEntry(
-                cloud_path=r.cloud_path,
-                hash=r.hash,
-                size_bytes=r.size_bytes,
-                observed_at=r.observed_at,
-                uploaded_at=r.uploaded_at or utc_iso(),
-                retention=r.retention,
-            )
-            for r in rows
-            if r.cloud_path is not None and r.uploaded_at is not None
-        ]
-        manifest = build_manifest(
-            source_id=source_id, system=system, game_id=game_id,
-            save_path=save_path,
-            current_hash=self._deps.state.get_current_hash(source_id, save_path),
-            versions=entries,
-        )
-        self._deps.cloud.write_manifest(paths=paths, manifest=manifest)
 
     async def _resolve_game_id(self, ref: SaveRef) -> str:
         """Use the source's async resolver if it exposes one (duck-typed)."""
@@ -312,8 +301,10 @@ async def run_all(config: Config) -> None:
     cloud = RcloneCloud(remote=config.cloud.rclone_remote,
                         binary=config.cloud.rclone_binary,
                         config_path=config.cloud.rclone_config_path)
+    sync_cfg = SyncConfig(cloud_to_device=config.cloud_to_device)
     deps = OrchestratorDeps(state=state, cloud=cloud,
-                            cfg=config.orchestrator)
+                            cfg=config.orchestrator,
+                            sync_cfg=sync_cfg)
     sources = build_sources(config.sources)
     if not sources:
         raise SystemExit("config has no sources; nothing to do")

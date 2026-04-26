@@ -4,13 +4,14 @@ Save files on the FXPak Pro live as <ROM-stem>.srm somewhere on the cart's
 SD card. We discover them by listing the cart recursively from `sd_root`
 and filtering on extension.
 
-Game ID strategy: a "title slug" derived from the save filename with
+Game ID strategy: a canonical slug derived from the save filename with
 parenthetical/bracket tags stripped. So `Chrono Trigger (U) [!].srm`
 becomes `chrono_trigger`. The full filename (including the stripped
 tags) is preserved in the manifest's `save_path` field, so version
-provenance isn't lost.
+provenance isn't lost. Slug derivation lives in `retrosync.game_id` so
+the FXPak and Pocket adapters share identical logic.
 
-Collisions — two cart paths resolving to the same title slug — are
+Collisions — two cart paths resolving to the same slug — are
 flagged with a WARN and the alphabetically-first cart path keeps the
 clean slug. The rest fall back to their full filename slug. Subfolder
 promotion (`chrono_trigger/japan/...`) is left for if/when an operator
@@ -19,10 +20,10 @@ actually has multi-region saves to back up.
 from __future__ import annotations
 
 import logging
-import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import PurePosixPath
 
+from ..game_id import canonical_slug, resolve_game_id
 from .base import HealthStatus, SaveRef, SourceError
 from .registry import register
 from .usb2snes import Usb2SnesClient, Usb2SnesError
@@ -31,11 +32,6 @@ log = logging.getLogger(__name__)
 
 SRM_SUFFIX = ".srm"
 
-# Parenthetical or bracketed run, with surrounding whitespace, e.g.
-# " (U)" or " [!]". Non-greedy so consecutive runs collapse cleanly.
-_TAG_RE = re.compile(r"\s*[\(\[].*?[\)\]]\s*")
-_NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
-
 
 @dataclass
 class FXPakConfig:
@@ -43,6 +39,7 @@ class FXPakConfig:
     sni_url: str = "ws://127.0.0.1:23074"
     sd_root: str = "/"
     save_extensions: tuple[str, ...] = (SRM_SUFFIX,)
+    game_aliases: dict[str, list[str]] = field(default_factory=dict)
 
 
 class FXPakSource:
@@ -114,30 +111,34 @@ class FXPakSource:
 
         list_saves populates `_slug_assignments` for the whole pass. For
         callers that arrive without that priming (e.g. an upload of a
-        stuck-version row at startup), fall back to the title slug — it
-        won't have collision-aware fallback, but the orchestrator's
+        stuck-version row at startup), fall back to the canonical slug —
+        it won't have collision-aware fallback, but the orchestrator's
         next list_saves will fix it within a poll.
         """
         return (self._slug_assignments.get(ref.path)
-                or self._title_slug(ref.path))
+                or resolve_game_id(ref.path, aliases=self._cfg.game_aliases))
 
     # ----------- helpers -----------
 
-    @staticmethod
-    def _title_slug(save_path: str) -> str:
-        """`Chrono Trigger (U) [!].srm` → `chrono_trigger`."""
-        stem = PurePosixPath(save_path).stem
-        stripped = _TAG_RE.sub(" ", stem)
-        slug = _NON_ALNUM_RE.sub("_", stripped.lower()).strip("_")
-        return slug or "unnamed"
+    def _title_slug(self, save_path: str) -> str:
+        """`Chrono Trigger (U) [!].srm` → `chrono_trigger` (after aliases)."""
+        return resolve_game_id(save_path, aliases=self._cfg.game_aliases)
 
     @staticmethod
     def _full_slug(save_path: str) -> str:
-        """`Chrono Trigger (U) [!].srm` → `chrono_trigger_u`. Used as a
-        collision fallback when two saves share a title slug."""
+        """`Chrono Trigger (U) [!].srm` → `chrono_trigger_u_`-style.
+
+        Collision fallback: keep the parenthesized tags so two regional
+        dumps don't share a slug. We pass the bracket-stripped name through
+        `canonical_slug` after first replacing brackets/parens with spaces
+        so their text survives.
+        """
         stem = PurePosixPath(save_path).stem
-        slug = _NON_ALNUM_RE.sub("_", stem.lower()).strip("_")
-        return slug or "unnamed"
+        # Replace separators inside brackets with spaces so the text becomes
+        # part of the slug instead of being stripped by canonical_slug.
+        spaced = stem.replace("(", " ").replace(")", " ") \
+                     .replace("[", " ").replace("]", " ")
+        return canonical_slug(spaced)
 
     def _compute_slug_assignments(self, paths: list[str]) -> dict[str, str]:
         """Map each cart path to its game-id slug, with deterministic
@@ -168,6 +169,7 @@ class FXPakSource:
 def _build(*, id: str, sni_url: str = "ws://127.0.0.1:23074",
            sd_root: str = "/",
            save_extensions: list[str] | None = None,
+           game_aliases: dict[str, list[str]] | None = None,
            # Accepted but ignored — older config.yaml files may still set
            # these. Kept here so an upgrade doesn't crash on stale options.
            cache_dir: str | None = None,
@@ -175,6 +177,7 @@ def _build(*, id: str, sni_url: str = "ws://127.0.0.1:23074",
     return FXPakSource(FXPakConfig(
         id=id, sni_url=sni_url, sd_root=sd_root,
         save_extensions=tuple(save_extensions or [SRM_SUFFIX]),
+        game_aliases=dict(game_aliases or {}),
     ))
 
 

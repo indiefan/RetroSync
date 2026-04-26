@@ -1,0 +1,433 @@
+"""Bidirectional sync engine.
+
+The same engine drives both the FXPak orchestrator's per-poll path and the
+Pocket trigger's per-plug-in path. Both feed it (source, save-ref, current
+device bytes) and let it decide what to do — upload, download, or record
+a conflict — by comparing three hashes:
+
+  H_dev   : sha256 of the bytes currently on the device.
+  H_cloud : the cloud's `current_hash` for this game.
+  H_last  : the hash this device and the cloud last agreed on, from
+            the per-(source, game_id) `source_sync_state` row.
+
+See `docs/pocket-sync-design.md` §7 for the full decision matrix and the
+why behind each branch.
+
+This module is the only place that writes to `versions/` or `conflicts/`
+in cloud. The FXPak orchestrator and the Pocket runner both go through
+`sync_one_game()`; that's how the conflict logic and lineage tracking
+stay in one place.
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
+from dataclasses import dataclass, field
+from enum import Enum
+from pathlib import PurePosixPath
+
+from .cloud import (
+    CloudError, CloudPaths, ConflictEntry, DeviceState, ManifestEntry,
+    Manifest, RcloneCloud, build_manifest, compose_paths, hash8,
+    sha256_bytes, utc_iso,
+)
+from .sources.base import SaveRef, SaveSource, SourceError
+from .state import (StateStore, VersionRow, ST_PENDING, ST_READY,
+                    ST_UPLOADING)
+
+log = logging.getLogger(__name__)
+
+
+class SyncResult(str, Enum):
+    IN_SYNC = "in_sync"
+    UPLOADED = "uploaded"
+    DOWNLOADED = "downloaded"
+    BOOTSTRAP_UPLOADED = "bootstrap_uploaded"
+    BOOTSTRAP_DOWNLOADED = "bootstrap_downloaded"
+    CONFLICT = "conflict"
+    SKIPPED = "skipped"
+    DRIFTED = "drifted"          # source changed mid-upload; re-pended
+    NO_DEVICE_DATA = "no_data"   # device has no save AND nothing to pull
+
+
+@dataclass
+class SyncOutcome:
+    result: SyncResult
+    game_id: str
+    save_path: str
+    paths: CloudPaths | None = None
+    detail: str = ""
+
+
+@dataclass
+class SyncConfig:
+    """Tunables controlling the engine's writes."""
+    cloud_to_device: bool = False
+    """Whether the engine may overwrite a device's save with a newer cloud copy.
+    Off by default; flip on after byte-compatibility verification (§10)."""
+
+    inter_op_sleep_sec: float = 0.5
+    """Pacing between cloud writes inside one engine pass — protects rclone's
+    per-minute Drive quota when bootstrapping many games at once."""
+
+
+@dataclass
+class SyncContext:
+    state: StateStore
+    cloud: RcloneCloud
+    cfg: SyncConfig = field(default_factory=SyncConfig)
+    # In-memory manifest cache, scoped to one engine pass. Keyed by
+    # CloudPaths.base. None means "we looked and the manifest doesn't exist
+    # in cloud yet" — distinguish from "cache miss".
+    _manifest_cache: dict[str, Manifest | None] = field(default_factory=dict)
+    _UNCACHED = object()
+
+    def manifest_for(self, paths: CloudPaths) -> Manifest | None:
+        if paths.base in self._manifest_cache:
+            return self._manifest_cache[paths.base]
+        try:
+            m = self.cloud.read_manifest(paths)
+        except CloudError as exc:
+            log.warning("manifest read failed for %s: %s", paths.base, exc)
+            m = None
+        self._manifest_cache[paths.base] = m
+        return m
+
+    def invalidate_manifest(self, paths: CloudPaths) -> None:
+        self._manifest_cache.pop(paths.base, None)
+
+
+# --------------------------------------------------------------------------
+# Resolving game_id and composing paths
+# --------------------------------------------------------------------------
+
+async def _resolve_game_id(source: SaveSource, ref: SaveRef) -> str:
+    async_resolve = getattr(source, "async_resolve_game_id", None)
+    if async_resolve is not None:
+        return await async_resolve(ref)
+    return source.resolve_game_id(ref)
+
+
+def _compose_paths(source: SaveSource, ref: SaveRef, *,
+                   game_id: str, cloud: RcloneCloud) -> CloudPaths:
+    save_filename = ref.path.rsplit("/", 1)[-1]
+    return compose_paths(remote=cloud.remote, system=source.system,
+                         game_id=game_id, save_filename=save_filename)
+
+
+# --------------------------------------------------------------------------
+# The decision matrix
+# --------------------------------------------------------------------------
+
+async def sync_one_game(*, source: SaveSource, ref: SaveRef,
+                        ctx: SyncContext,
+                        primed_data: bytes | None = None,
+                        primed_hash: str | None = None,
+                        version_row: VersionRow | None = None,
+                        ) -> SyncOutcome:
+    """Reconcile a single (source, save) with the cloud.
+
+    `primed_data` / `primed_hash` are an optimization: the orchestrator
+    already read+hashed the bytes, so it can hand them in instead of
+    making us re-read. If only `primed_hash` is given (e.g. just to
+    decide intent), bytes are re-read on demand.
+    """
+    game_id = await _resolve_game_id(source, ref)
+    paths = _compose_paths(source, ref, game_id=game_id, cloud=ctx.cloud)
+    manifest = ctx.manifest_for(paths)
+    h_cloud = manifest.current_hash if manifest else None
+    sync_state = ctx.state.get_sync_state(source.id, game_id)
+    h_last = sync_state.last_synced_hash if sync_state else None
+
+    # Read or use primed bytes / hash. We always need a hash to run the
+    # decision matrix, so if neither was primed, read now. Bytes are
+    # deferred only if we already have a hash (rare — usually they come
+    # together).
+    h_dev = primed_hash
+    data = primed_data
+    if h_dev is None and primed_data is not None:
+        h_dev = sha256_bytes(primed_data)
+    if h_dev is None:
+        try:
+            data = await source.read_save(ref)
+            h_dev = sha256_bytes(data)
+        except (SourceError, FileNotFoundError, KeyError) as exc:
+            log.debug("sync: no save bytes for %s on %s (%s)",
+                      ref.path, source.id, exc)
+            data = None
+            h_dev = None
+
+    async def _ensure_device_bytes() -> bytes | None:
+        nonlocal data, h_dev
+        if data is not None:
+            return data
+        try:
+            data = await source.read_save(ref)
+        except (SourceError, FileNotFoundError, KeyError) as exc:
+            log.warning("sync: read_save failed for %s on %s: %s",
+                        ref.path, source.id, exc)
+            data = None
+            h_dev = None
+            return None
+        h_dev = sha256_bytes(data)
+        return data
+
+    # --------- decision matrix per design §7.1 ---------
+
+    # 1. Already in sync.
+    if h_dev is not None and h_dev == h_cloud:
+        ctx.state.set_sync_state(
+            source_id=source.id, game_id=game_id,
+            last_synced_hash=h_dev, device_seen_path=ref.path)
+        return SyncOutcome(SyncResult.IN_SYNC, game_id, ref.path, paths)
+
+    # 2. No cloud version yet → bootstrap upload from device.
+    if h_cloud is None:
+        if await _ensure_device_bytes() is None:
+            return SyncOutcome(SyncResult.NO_DEVICE_DATA, game_id, ref.path,
+                               paths, "no device bytes to bootstrap")
+        await _upload_version_path(
+            source=source, ref=ref, data=data, h=h_dev,
+            paths=paths, game_id=game_id, ctx=ctx,
+            parent_hash=None, version_row=version_row,
+        )
+        ctx.state.set_sync_state(
+            source_id=source.id, game_id=game_id,
+            last_synced_hash=h_dev, device_seen_path=ref.path)
+        ctx.invalidate_manifest(paths)
+        return SyncOutcome(SyncResult.BOOTSTRAP_UPLOADED, game_id,
+                           ref.path, paths)
+
+    # 3. Device has nothing for this game → bootstrap-pull (§7.2).
+    if h_dev is None or data is None:
+        if not ctx.cfg.cloud_to_device:
+            return SyncOutcome(
+                SyncResult.SKIPPED, game_id, ref.path, paths,
+                "cloud_to_device disabled — not pulling missing save")
+        await _pull_to_device(source=source, ref=ref, paths=paths,
+                              expected_hash=h_cloud, ctx=ctx)
+        ctx.state.set_sync_state(
+            source_id=source.id, game_id=game_id,
+            last_synced_hash=h_cloud, device_seen_path=ref.path)
+        return SyncOutcome(SyncResult.BOOTSTRAP_DOWNLOADED, game_id,
+                           ref.path, paths)
+
+    # 4. Cloud and device disagree, no prior agreement → conflict.
+    if h_last is None:
+        await _record_conflict(
+            source=source, ref=ref, data=data, h_dev=h_dev,
+            h_cloud=h_cloud, base=None, paths=paths, game_id=game_id,
+            ctx=ctx)
+        return SyncOutcome(SyncResult.CONFLICT, game_id, ref.path, paths,
+                           "no prior agreement between source and cloud")
+
+    # 5. Cloud unchanged since last sync, device advanced → upload.
+    if h_last == h_cloud and h_dev != h_cloud:
+        await _upload_version_path(
+            source=source, ref=ref, data=data, h=h_dev,
+            paths=paths, game_id=game_id, ctx=ctx,
+            parent_hash=h_cloud, version_row=version_row,
+        )
+        ctx.state.set_sync_state(
+            source_id=source.id, game_id=game_id,
+            last_synced_hash=h_dev, device_seen_path=ref.path)
+        ctx.invalidate_manifest(paths)
+        return SyncOutcome(SyncResult.UPLOADED, game_id, ref.path, paths)
+
+    # 6. Device unchanged since last sync, cloud advanced → download.
+    if h_last == h_dev and h_cloud != h_dev:
+        if not ctx.cfg.cloud_to_device:
+            return SyncOutcome(
+                SyncResult.SKIPPED, game_id, ref.path, paths,
+                "cloud_to_device disabled — not pulling cloud-newer save")
+        await _pull_to_device(source=source, ref=ref, paths=paths,
+                              expected_hash=h_cloud, ctx=ctx)
+        ctx.state.set_sync_state(
+            source_id=source.id, game_id=game_id,
+            last_synced_hash=h_cloud, device_seen_path=ref.path)
+        return SyncOutcome(SyncResult.DOWNLOADED, game_id, ref.path, paths)
+
+    # 7. Both moved since last sync → conflict.
+    await _record_conflict(
+        source=source, ref=ref, data=data, h_dev=h_dev,
+        h_cloud=h_cloud, base=h_last, paths=paths, game_id=game_id,
+        ctx=ctx)
+    return SyncOutcome(SyncResult.CONFLICT, game_id, ref.path, paths,
+                       f"divergence from common base {hash8(h_last)}")
+
+
+# --------------------------------------------------------------------------
+# Action helpers — the only places that touch cloud writes.
+# --------------------------------------------------------------------------
+
+async def _upload_version_path(*, source: SaveSource, ref: SaveRef,
+                               data: bytes, h: str, paths: CloudPaths,
+                               game_id: str, ctx: SyncContext,
+                               parent_hash: str | None,
+                               version_row: VersionRow | None) -> None:
+    """Upload <data> as a new versions/* entry and overwrite current."""
+    # If the orchestrator already inserted a pending version row for this
+    # exact hash, reuse it; otherwise create one. Either way we end up with
+    # a row marked uploaded with cloud_path set.
+    if version_row is not None and version_row.hash == h:
+        v_id = version_row.id
+    else:
+        # The versions(source_id, path) FK requires a files row. The
+        # orchestrator's _poll_one already touches; for callers that
+        # arrive here directly (Pocket trigger, tests) we touch here too.
+        ctx.state.touch_file(source_id=source.id, path=ref.path,
+                             game_id=game_id)
+        v_id = ctx.state.insert_pending(
+            source_id=source.id, path=ref.path, h=h,
+            size_bytes=len(data), parent_hash=parent_hash,
+        )
+        ctx.state.set_current_hash(
+            source_id=source.id, path=ref.path, h=h)
+        ctx.state.bump_debounce(v_id)
+        ctx.state.promote_to_ready(v_id)
+
+    ctx.state.mark_uploading(v_id)
+    try:
+        version_path = ctx.cloud.upload_version(
+            paths=paths, save_data=data, full_hash=h,
+            observed_at=utc_iso(),
+        )
+        await asyncio.sleep(ctx.cfg.inter_op_sleep_sec)
+        ctx.cloud.overwrite_current(paths=paths, save_data=data)
+        ctx.state.mark_uploaded(v_id, cloud_path=version_path)
+        log.info("sync: uploaded %s for %s → %s",
+                 hash8(h), game_id, version_path)
+    except CloudError as exc:
+        ctx.state.revert_to_ready(v_id)
+        raise
+
+
+async def _pull_to_device(*, source: SaveSource, ref: SaveRef,
+                          paths: CloudPaths, expected_hash: str,
+                          ctx: SyncContext) -> None:
+    """Download cloud's current.* and write to the device.
+
+    Also keeps state.db in step so the next poll sees the new hash as
+    "current" instead of treating it as a fresh local edit.
+    """
+    data = ctx.cloud.download_bytes(src=paths.current)
+    got = sha256_bytes(data)
+    if got != expected_hash:
+        raise CloudError(
+            f"download hash mismatch for {paths.current}: "
+            f"manifest says {hash8(expected_hash)}, got {hash8(got)}")
+    await source.write_save(ref, data)
+    game_id = paths.base.rsplit("/", 1)[-1]
+    ctx.state.touch_file(source_id=source.id, path=ref.path,
+                         game_id=game_id)
+    ctx.state.set_current_hash(source_id=source.id, path=ref.path,
+                               h=expected_hash)
+    log.info("sync: pulled %s for %s → device %s",
+             hash8(expected_hash), game_id, ref.path)
+
+
+async def _record_conflict(*, source: SaveSource, ref: SaveRef,
+                           data: bytes, h_dev: str, h_cloud: str,
+                           base: str | None, paths: CloudPaths,
+                           game_id: str, ctx: SyncContext) -> None:
+    """Preserve the device's divergent bytes in cloud `conflicts/` and
+    record a conflicts row. Cloud's current is left untouched."""
+    # Dedupe: if there's already an open conflict for this exact device
+    # hash, don't re-upload or insert another row.
+    existing = ctx.state.open_conflict_for(
+        game_id=game_id, source_id=source.id, device_hash=h_dev)
+    if existing is not None:
+        log.info("sync: conflict already on file (#%d) for %s on %s — "
+                 "leaving alone", existing.id, game_id, source.id)
+        return
+
+    ext = (PurePosixPath(paths.current).suffix or ".bin")
+    conflict_path = paths.conflict(utc_iso(), hash8(h_dev), ext, source.id)
+    ctx.cloud.upload_bytes(data=data, dest=conflict_path)
+    cloud_version = _find_cloud_version_path(ctx.manifest_for(paths), h_cloud)
+    cid = ctx.state.insert_conflict(
+        game_id=game_id, system=source.system, source_id=source.id,
+        base_hash=base, cloud_hash=h_cloud, device_hash=h_dev,
+        cloud_path=cloud_version, conflict_path=conflict_path,
+    )
+    log.warning(
+        "CONFLICT #%d: %s diverged on %s — device %s vs cloud %s "
+        "(base=%s). Device bytes preserved at %s. Use "
+        "`retrosync conflicts resolve %d` to fix.",
+        cid, game_id, source.id, hash8(h_dev), hash8(h_cloud),
+        hash8(base) if base else "n/a", conflict_path, cid)
+
+
+def _find_cloud_version_path(manifest: Manifest | None,
+                             h: str) -> str | None:
+    if manifest is None:
+        return None
+    for v in manifest.versions:
+        if v.hash == h:
+            return v.cloud_path
+    return None
+
+
+# --------------------------------------------------------------------------
+# Manifest refresh — orchestrator calls this after a batch of sync ops.
+# --------------------------------------------------------------------------
+
+def refresh_manifest(*, source: SaveSource, save_path: str, game_id: str,
+                     paths: CloudPaths, ctx: SyncContext) -> None:
+    """Rebuild manifest.json for one game from SQLite + sync state.
+
+    Called by orchestrators after a batch of sync_one_game calls so
+    Drive's per-minute write budget isn't burned on per-version writes.
+    """
+    rows = ctx.state.list_versions(source.id, save_path)
+    entries = [
+        ManifestEntry(
+            cloud_path=r.cloud_path,
+            hash=r.hash,
+            size_bytes=r.size_bytes,
+            observed_at=r.observed_at,
+            uploaded_at=r.uploaded_at or utc_iso(),
+            retention=r.retention,
+            parent_hash=r.parent_hash,
+            uploaded_by=source.id,
+        )
+        for r in rows
+        if r.cloud_path is not None and r.uploaded_at is not None
+    ]
+    save_filename = save_path.rsplit("/", 1)[-1]
+
+    # Aggregate device_state across all sources we've ever synced this game
+    # with. Avoids dropping other devices' pointers when one device writes.
+    device_state: dict[str, DeviceState] = {}
+    for row in ctx.state._conn.execute(
+            "SELECT * FROM source_sync_state WHERE game_id=?", (game_id,)):
+        device_state[row["source_id"]] = DeviceState(
+            last_synced_hash=row["last_synced_hash"],
+            last_synced_at=row["last_synced_at"],
+        )
+
+    conflicts_db = ctx.state._conn.execute(
+        "SELECT * FROM conflicts WHERE game_id=? ORDER BY id", (game_id,)
+    ).fetchall()
+    conflicts: list[ConflictEntry] = []
+    for c in conflicts_db:
+        conflicts.append(ConflictEntry(
+            id=c["id"],
+            detected_at=c["detected_at"],
+            base_hash=c["base_hash"],
+            cloud={"hash": c["cloud_hash"], "path": c["cloud_path"]},
+            device={"hash": c["device_hash"], "path": c["conflict_path"],
+                    "from": c["source_id"]},
+            resolved_at=c["resolved_at"],
+            winner_hash=c["winner_hash"],
+        ))
+
+    current_hash = ctx.state.get_current_hash(source.id, save_path)
+    manifest = build_manifest(
+        source_id=source.id, system=source.system, game_id=game_id,
+        save_path=save_path, save_filename=save_filename,
+        current_hash=current_hash, versions=entries,
+        device_state=device_state, conflicts=conflicts,
+    )
+    ctx.cloud.write_manifest(paths=paths, manifest=manifest)
+    ctx.invalidate_manifest(paths)
