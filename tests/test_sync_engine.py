@@ -178,6 +178,51 @@ async def test_case_4_stale_device_pulls_cloud() -> bool:
     return ok
 
 
+async def test_case_4_drift_from_known_pulls_cloud() -> bool:
+    """Case 4 (no sync_state) with bytes that drift-match a known
+    historical version should pull cloud's current rather than
+    treating the device's bytes as new content."""
+    _, state, cloud = _setup()
+
+    # Cart A uploads h_a, then advances cloud to h_a2.
+    fx_a = MockFXPakSource(id="fx-a", files={"/Mario.srm": b"abc" * 100})
+    state.upsert_source(id=fx_a.id, system=fx_a.system,
+                        adapter="MockFXPakSource", config_json="{}")
+    ctx = SyncContext(state=state, cloud=cloud,
+                      cfg=SyncConfig(cloud_to_device=True,
+                                     drift_threshold={"snes": 4}))
+    out_a = await sync_one_game(source=fx_a,
+                                ref=SaveRef(path="/Mario.srm"), ctx=ctx)
+    refresh_manifest(source=fx_a, save_path="/Mario.srm",
+                     game_id=out_a.game_id, paths=out_a.paths, ctx=ctx)
+    fx_a.files["/Mario.srm"] = b"newer-bytes" + b"\x00" * 100
+    ctx.invalidate_manifest(out_a.paths)
+    out_a2 = await sync_one_game(source=fx_a,
+                                 ref=SaveRef(path="/Mario.srm"), ctx=ctx)
+    refresh_manifest(source=fx_a, save_path="/Mario.srm",
+                     game_id=out_a2.game_id, paths=out_a2.paths, ctx=ctx)
+
+    # New device (no sync_state) shows up with bytes that are h_a + 1
+    # byte drift. NOT an exact match for any history hash, but very
+    # close to h_a.
+    drifted = bytearray(b"abc" * 100)
+    drifted[10] = (drifted[10] + 1) & 0xFF
+    new_files = {"/Mario.srm": bytes(drifted)}
+    new_dev = MockFXPakSource(id="fresh-dev", files=new_files)
+    state.upsert_source(id=new_dev.id, system=new_dev.system,
+                        adapter="MockFXPakSource", config_json="{}")
+    ctx.invalidate_manifest(out_a.paths)
+    out = await sync_one_game(source=new_dev,
+                              ref=SaveRef(path="/Mario.srm"), ctx=ctx)
+    state.close()
+
+    ok = _check(out.result, SyncResult.DOWNLOADED,
+                "case 4 drift from known → DOWNLOADED")
+    ok &= _check(new_files["/Mario.srm"], b"newer-bytes" + b"\x00" * 100,
+                 "device received cloud's newer bytes")
+    return ok
+
+
 async def test_case_4_unknown_device_cloud_wins_policy() -> bool:
     """With cloud_wins_on_unknown_device=true, a device showing up with
     truly-new bytes (not in history) gets its bytes preserved as a
@@ -527,6 +572,68 @@ async def test_drift_filter_passes_large_changes() -> bool:
     return ok
 
 
+async def test_drift_filter_case_7_pulls_cloud() -> bool:
+    """Regression: when both 'sides' moved since last sync (case 7) but
+    the device's change is just SRAM counter drift, the engine should
+    treat as case 6 (cloud advanced, pull) rather than uploading the
+    drifted bytes."""
+    workdir, state, cloud = _setup()
+    files = {"/Mario.srm": b"abc" * 100}
+
+    # Cart A: original sync.
+    fx_a = MockFXPakSource(id="fx-a", files=files)
+    state.upsert_source(id=fx_a.id, system=fx_a.system,
+                        adapter="MockFXPakSource", config_json="{}")
+    ctx = SyncContext(state=state, cloud=cloud,
+                      cfg=SyncConfig(cloud_to_device=True,
+                                     drift_threshold={"snes": 4}))
+    out_a = await sync_one_game(source=fx_a,
+                                ref=SaveRef(path="/Mario.srm"), ctx=ctx)
+    refresh_manifest(source=fx_a, save_path="/Mario.srm",
+                     game_id=out_a.game_id, paths=out_a.paths, ctx=ctx)
+
+    # Cart B (different source) syncs and gets the same bytes.
+    fx_b_files = {"/Mario.srm": b"abc" * 100}
+    fx_b = MockFXPakSource(id="fx-b", files=fx_b_files)
+    state.upsert_source(id=fx_b.id, system=fx_b.system,
+                        adapter="MockFXPakSource", config_json="{}")
+    ctx.invalidate_manifest(out_a.paths)
+    out_b = await sync_one_game(source=fx_b,
+                                ref=SaveRef(path="/Mario.srm"), ctx=ctx)
+    # Cart B is now in_sync. sync_state[fx-b] = h_a.
+    refresh_manifest(source=fx_b, save_path="/Mario.srm",
+                     game_id=out_b.game_id, paths=out_b.paths, ctx=ctx)
+
+    # Cart A advances cloud with new bytes (real save).
+    fx_a.files["/Mario.srm"] = b"new-real-save" + b"\x00" * 100
+    ctx.invalidate_manifest(out_a.paths)
+    out_a2 = await sync_one_game(source=fx_a,
+                                 ref=SaveRef(path="/Mario.srm"), ctx=ctx)
+    refresh_manifest(source=fx_a, save_path="/Mario.srm",
+                     game_id=out_a2.game_id, paths=out_a2.paths, ctx=ctx)
+
+    # Cart B comes back with bytes that drifted by 1 byte from h_last.
+    drifted = bytearray(b"abc" * 100)
+    drifted[42] = (drifted[42] + 1) & 0xFF
+    fx_b_files["/Mario.srm"] = bytes(drifted)
+    n_versions_before = len(state.list_versions(fx_b.id, "/Mario.srm"))
+
+    ctx.invalidate_manifest(out_a.paths)
+    out_b2 = await sync_one_game(source=fx_b,
+                                 ref=SaveRef(path="/Mario.srm"), ctx=ctx)
+    n_versions_after = len(state.list_versions(fx_b.id, "/Mario.srm"))
+    state.close()
+
+    ok = _check(out_b2.result, SyncResult.DOWNLOADED,
+                "case 7 drift → DOWNLOADED (no spurious upload)")
+    ok &= _check(fx_b_files["/Mario.srm"],
+                 b"new-real-save" + b"\x00" * 100,
+                 "device received cloud's current (Cart A's real save)")
+    ok &= _check(n_versions_after, n_versions_before,
+                 "no extra version row inserted from drift")
+    return ok
+
+
 async def test_uploads_under_device_kind_subfolder() -> bool:
     """Versions land under versions/<device_kind>/ — purely cosmetic for
     cloud-browse organization. Engine behaviour unchanged."""
@@ -611,6 +718,8 @@ def main() -> int:
         ("test_cloud_to_device_pull", test_cloud_to_device_pull),
         ("test_case_4_stale_device_pulls_cloud",
          test_case_4_stale_device_pulls_cloud),
+        ("test_case_4_drift_from_known_pulls_cloud",
+         test_case_4_drift_from_known_pulls_cloud),
         ("test_case_4_unknown_device_cloud_wins_policy",
          test_case_4_unknown_device_cloud_wins_policy),
         ("test_conflict_no_prior_agreement_preserve",
@@ -628,6 +737,8 @@ def main() -> int:
          test_drift_filter_skips_small_byte_changes),
         ("test_drift_filter_passes_large_changes",
          test_drift_filter_passes_large_changes),
+        ("test_drift_filter_case_7_pulls_cloud",
+         test_drift_filter_case_7_pulls_cloud),
         ("test_no_duplicate_upload_on_transient_manifest_failure",
          test_no_duplicate_upload_on_transient_manifest_failure),
     ]:
