@@ -83,6 +83,15 @@ class Config:
     #     `conflicts/`, leave cloud current alone, require an operator
     #     `retrosync conflicts resolve` decision.
     conflict_winner: str = "device"
+    # Per-device-kind byte-count threshold for the "drift filter" — when
+    # the engine sees a fast-forward upload AND the device's bytes differ
+    # from cloud by ≤ this many bytes, treat as in-sync rather than
+    # uploading. Default empty (no filtering). Suggested for Pocket
+    # because its openFPGA cores tick in-game counters in SRAM even
+    # when the operator isn't actively playing.
+    #   drift_threshold:
+    #     pocket: 4
+    drift_threshold: dict[str, int] = field(default_factory=dict)
 
     # ----------- loading -----------
 
@@ -110,11 +119,14 @@ class Config:
             sources.append(SourceConfig(
                 id=s["id"], adapter=s["adapter"], options=opts,
             ))
+        drift = {str(k): int(v)
+                 for k, v in (raw.get("drift_threshold") or {}).items()}
         return cls(
             cloud=cloud, orchestrator=orch, state=state, sources=sources,
             game_aliases=aliases,
             cloud_to_device=bool(raw.get("cloud_to_device", False)),
             conflict_winner=str(raw.get("conflict_winner", "device")),
+            drift_threshold=drift,
         )
 
     @staticmethod
@@ -151,6 +163,18 @@ cloud_to_device: false
 #   "preserve": park device bytes in conflicts/, leave cloud current
 #               alone, require operator `retrosync conflicts resolve`.
 conflict_winner: device
+
+# Per-device-kind byte-count threshold for the "drift filter". When the
+# engine sees a fast-forward upload (cloud unchanged since last sync,
+# device advanced) AND the device's bytes differ from cloud's current
+# by ≤ this many bytes, treat as in-sync rather than uploading. The
+# Analogue Pocket's openFPGA cores tick in-game counters in SRAM even
+# when you're not actively playing, so leaving the default of 0
+# produces a fresh cloud version on every plug-in. 4 is a good Pocket
+# value — covers most counter ticks but still catches a real save's
+# first-byte HP/MP/inventory change.
+drift_threshold:
+  pocket: 4
 
 # Optional manual alias table for cases where slug normalization can't
 # collapse two filenames on its own. Each entry maps a canonical id to
