@@ -7,12 +7,22 @@ After=network.target
 Type=simple
 User=retrosync
 Group=retrosync
-ExecStart=/usr/local/bin/sni
+# SNI's binary unconditionally initializes a system-tray icon during startup
+# (see cmd/sni/tray/tray.go and cmd/sni/main.go). On a headless Pi there is
+# no graphical session and no per-user DBus bus, so the systray code panics
+# trying to clean up a nil DBus connection. dbus-run-session creates an
+# ephemeral session bus just for SNI; the systray init succeeds silently and
+# the WebSocket server runs normally. Provided by the dbus-x11 package.
+ExecStart=/usr/bin/dbus-run-session -- /usr/local/bin/sni
 Restart=always
 RestartSec=3
 # SNI binds to 127.0.0.1 by default. We do not expose it on the LAN.
 # /dev/cu.* is macOS; on Linux the cart appears as /dev/ttyACM*.
 SupplementaryGroups=dialout
+# SNI writes its lock file and logs to ~/.sni/. Redirect HOME to a writable
+# spot under /var/lib so we can keep ProtectHome=true on (which would
+# otherwise hide /home/retrosync from this process).
+Environment=HOME=/var/lib/retrosync/sni-home
 StandardOutput=journal
 StandardError=journal
 

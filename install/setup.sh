@@ -64,10 +64,14 @@ install_apt_deps() {
   log "installing system dependencies (apt)..."
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -qq
+  # dbus-x11 provides /usr/bin/dbus-run-session, used to wrap SNI so its
+  # systray code has a session bus to attach to on a headless box (without
+  # this, SNI segfaults at startup).
   apt-get install -yq \
     ca-certificates curl jq git \
     python3 python3-venv python3-pip \
     sqlite3 \
+    dbus-x11 \
     unzip
 }
 
@@ -85,6 +89,7 @@ ensure_user_and_dirs() {
   install -d -o "${RETROSYNC_USER}" -g "${RETROSYNC_USER}" -m 0755 \
     "${RETROSYNC_DATA}" \
     "${RETROSYNC_DATA}/fxpak-cache" \
+    "${RETROSYNC_DATA}/sni-home" \
     "${RETROSYNC_HOME}/.config" \
     "${RETROSYNC_HOME}/.config/rclone"
   install -d -m 0755 "${RETROSYNC_ETC}"
@@ -206,6 +211,32 @@ ensure_rclone_remote() {
        listremotes 2>/dev/null | grep -q "^${remote_name}:$"; then
     log "rclone remote '${remote_name}' already configured"
     return
+  fi
+
+  # `rclone config` is interactive. If we were piped in via curl|bash, our
+  # stdin is the pipe (now empty) — every prompt would loop forever printing
+  # "This value is required and it has no default." Detect that and bail
+  # with instructions, rather than spam the operator.
+  if [[ ! -t 0 ]]; then
+    cat <<EOF >&2
+
+================================================================
+  rclone config needs an interactive terminal but stdin is a pipe.
+
+  Re-run the installer from a real shell:
+
+      cd /opt/retrosync || git clone https://github.com/indiefan/RetroSync.git /tmp/RetroSync
+      sudo bash /opt/retrosync/install/setup.sh
+      # or, if cloned to /tmp:
+      sudo bash /tmp/RetroSync/install/setup.sh
+
+  Or finish just the rclone step manually:
+
+      sudo -u ${RETROSYNC_USER} rclone --config ${conf} config
+      sudo systemctl restart retrosync
+================================================================
+EOF
+    return 1
   fi
 
   cat <<EOF
