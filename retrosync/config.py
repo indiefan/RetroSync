@@ -44,6 +44,14 @@ class OrchestratorConfig:
     debounce_polls: int = 3       # consecutive identical polls before upload
     upload_retry_max: int = 6     # attempts; backoff is 30s * 2**attempt
     upload_retry_max_age_sec: int = 6 * 3600
+    # When a source's health check fails (e.g. the FXPak Pro is powered
+    # off / unplugged), wait only this many seconds before re-checking
+    # rather than the full poll_interval_sec. Lets the daemon notice
+    # "cart just turned on" within ~2s so a sync fires before the
+    # operator has a chance to launch a ROM. SNI's health check is
+    # cheap (a websocket connect attempt) so the extra polling is
+    # negligible while disconnected.
+    unhealthy_recheck_sec: int = 2
 
 
 @dataclass

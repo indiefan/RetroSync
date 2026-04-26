@@ -32,14 +32,34 @@ def main(argv: list[str] | None = None) -> int:
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    main_task = loop.create_task(run_all(config))
+
+    # Set by run_all once the orchestrators exist; used by SIGUSR1 to
+    # poke every orchestrator into an immediate pass (typically fired
+    # by udev when an FXPak Pro USB device appears, so cart-on → first
+    # sync latency is sub-second).
+    orchestrators: list = []
+
+    def _on_started(orcs: list) -> None:
+        orchestrators[:] = orcs
+
+    main_task = loop.create_task(run_all(config, on_started=_on_started))
 
     def _shutdown() -> None:
         if not main_task.done():
             main_task.cancel()
 
+    def _poke_all() -> None:
+        if not orchestrators:
+            return
+        logging.getLogger(__name__).info(
+            "SIGUSR1 received → poking %d orchestrator(s) for an "
+            "immediate pass", len(orchestrators))
+        for o in orchestrators:
+            o.poke()
+
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, _shutdown)
+    loop.add_signal_handler(signal.SIGUSR1, _poke_all)
 
     try:
         loop.run_until_complete(main_task)

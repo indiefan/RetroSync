@@ -1125,7 +1125,46 @@ sources:
       region_preference: [usa, world, europe, japan]   # §16.8
 ```
 
-### 16.16. Recovery cookbook
+### 16.16. FXPak instant-sync (poke + fast unhealthy recheck)
+
+The design's 30s poll loop (§4) means cart-on → first sync latency
+is up to 30s — long enough that an operator who plugs in and
+launches a ROM might miss a cloud-newer save. Two layers of
+mitigation, both shipped:
+
+1. **Fast unhealthy recheck** (`OrchestratorConfig.unhealthy_recheck_sec`,
+   default 2). When `source.health()` reports unhealthy (cart off /
+   SNI unreachable), the inter-pass wait drops from 30s to this
+   value. So cart-off → cart-on transitions are noticed within ~2s
+   without any extra plumbing. Health-check log spam during the
+   off period is suppressed (only the "went unhealthy" /
+   "came back healthy" transitions log at INFO; staying-unhealthy
+   stays at DEBUG).
+
+2. **udev poke** (`install/udev/99-retrosync-fxpak.rules`). When
+   the FXPak's USB device appears, udev runs
+   `systemctl kill --signal=SIGUSR1 retrosync.service`. The daemon's
+   SIGUSR1 handler calls `BackupOrchestrator.poke()` on every
+   orchestrator, which sets an internal `_poke` event interrupting
+   the inter-pass wait. The next pass runs immediately — sub-second
+   cart-on → sync latency. Vendor:product IDs are firmware-specific,
+   so the rule ships with `XXXX:YYYY` placeholders and a setup-time
+   warning telling the operator to capture them via `lsusb`.
+
+The two layers compose: even without the udev rule (or while the
+operator hasn't yet captured the USB IDs), the fast-recheck path
+keeps cart-on detection at ~2s. The udev rule just shrinks that to
+near-zero.
+
+`run_all` accepts an `on_started=callback` so the daemon can grab
+the orchestrator list at startup time and route SIGUSR1 to all of
+them. The poke is per-orchestrator (each gets its own `asyncio.Event`)
+but pokes-fan-out at the signal level — no way to target a specific
+source from a Unix signal, so all orchestrators wake up. Idle ones
+just re-do their health check and go back to waiting; cost is
+negligible.
+
+### 16.17. Recovery cookbook
 
 Common operator scenarios that came up during real-world testing:
 
