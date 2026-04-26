@@ -139,6 +139,61 @@ def cmd_pull(ctx: click.Context, cloud_path: str, local_path: str) -> None:
                f"(sha256={sha256_bytes(data)[:8]})")
 
 
+@main.command("load")
+@click.argument("game_id")
+@click.argument("target")
+@click.option("--device", help="Block device for pocket (e.g. /dev/sda1). "
+              "Auto-detected via /dev/disk/by-id when omitted.")
+@click.option("--mount-path", default=None,
+              help="Where to mount the Pocket SD when target=pocket.")
+@click.option("--system", default=None,
+              help="Override the system namespace for the cloud lookup.")
+@click.option("-y", "--yes", is_flag=True,
+              help="Skip the confirmation prompt.")
+@click.pass_context
+def cmd_load(ctx: click.Context, game_id: str, target: str,
+             device: str | None, mount_path: str | None,
+             system: str | None, yes: bool) -> None:
+    """Load cloud's current save for GAME_ID onto TARGET device.
+
+    GAME_ID is the canonical game slug (see `retrosync sync-status` or
+    `retrosync conflicts list --all` for examples).
+
+    TARGET is one of:
+
+      pocket    : the Analogue Pocket. The Pocket must be plugged in via
+                  Tools → USB → Mount as USB Drive. Auto-detects the
+                  block device unless --device is given.
+
+      <system>  : a console name like "snes" — written to whichever cart
+                  source is configured for that system.
+
+    Examples:
+
+      retrosync load final_fantasy_iii pocket
+      retrosync load f_zero snes
+    """
+    from . import load as load_mod
+    cfg: Config = ctx.obj["config"]
+    if not yes:
+        click.echo(f"about to load {game_id} → {target} "
+                   f"(this overwrites the device's save).")
+        if not click.confirm("proceed?", default=True):
+            return
+    try:
+        result = load_mod.load(
+            cfg=cfg, game_id=game_id, target=target,
+            device=device,
+            mount_path=mount_path or load_mod.DEFAULT_POCKET_MOUNT,
+            system=system,
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        raise click.ClickException(str(exc))
+    click.echo(
+        f"wrote {result.bytes_written} bytes (sha256={result.sha256[:8]}) "
+        f"to {result.target} at {result.written_path}")
+
+
 @main.command("push")
 @click.argument("source_id")
 @click.argument("cart_path")
