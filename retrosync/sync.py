@@ -85,6 +85,23 @@ class SyncConfig:
       `retrosync conflicts resolve` decision. Conservative, more work.
     """
 
+    drift_threshold: dict[str, int] = field(default_factory=dict)
+    """Per-device-kind byte-count threshold for the "drift filter".
+
+    When the engine detects a fast-forward upload (case 5: cloud unchanged
+    since last sync, device advanced) AND the device's new bytes differ
+    from the cloud's current by ≤ this many bytes, treat as in-sync
+    instead of uploading a new version. Useful for the Analogue Pocket,
+    whose openFPGA cores tick in-game counters in SRAM even when the
+    operator doesn't think they're "playing" — single-byte drift
+    produces a fresh cloud version on every plug-in otherwise.
+
+    Default: empty (no filtering — every byte change uploads). Suggested
+    Pocket value: 4 — covers most counter ticks; small enough to still
+    catch a real save's first-byte HP/MP/inventory change.
+    Example: drift_threshold = {"pocket": 4}
+    """
+
     inter_op_sleep_sec: float = 0.5
     """Pacing between cloud writes inside one engine pass — protects rclone's
     per-minute Drive quota when bootstrapping many games at once."""
@@ -252,6 +269,34 @@ async def sync_one_game(*, source: SaveSource, ref: SaveRef,
 
     # 5. Cloud unchanged since last sync, device advanced → upload.
     if h_last == h_cloud and h_dev != h_cloud:
+        # Drift filter: when configured for this source's device_kind,
+        # check whether the new bytes differ from cloud's current by
+        # only a small number of bytes. If so, this is almost certainly
+        # an in-place SRAM counter tick from the device's emulator
+        # core, not a real save — silently move sync_state forward and
+        # skip the upload.
+        threshold = ctx.cfg.drift_threshold.get(
+            getattr(source, "device_kind", source.system), 0)
+        if threshold > 0:
+            try:
+                cloud_bytes = ctx.cloud.download_bytes(src=paths.current)
+            except CloudError as exc:
+                log.warning("drift filter: skipping check for %s "
+                            "(download failed: %s)", game_id, exc)
+                cloud_bytes = None
+            if cloud_bytes is not None and len(cloud_bytes) == len(data):
+                n_diff = sum(1 for a, b in zip(cloud_bytes, data)
+                             if a != b)
+                if n_diff <= threshold:
+                    log.info("drift filter: %s on %s differs from cloud "
+                             "by %d byte(s) (≤ %d) — treating as in-sync",
+                             game_id, source.id, n_diff, threshold)
+                    ctx.state.set_sync_state(
+                        source_id=source.id, game_id=game_id,
+                        last_synced_hash=h_dev, device_seen_path=ref.path)
+                    return SyncOutcome(SyncResult.IN_SYNC, game_id,
+                                       ref.path, paths,
+                                       f"drift filter: {n_diff} byte(s)")
         await _upload_version_path(
             source=source, ref=ref, data=data, h=h_dev,
             paths=paths, game_id=game_id, ctx=ctx,

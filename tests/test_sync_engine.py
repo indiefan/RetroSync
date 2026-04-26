@@ -365,6 +365,81 @@ async def test_resolve_with_stale_cloud_path() -> bool:
                   "stale cloud_path → fallback by hash succeeded")
 
 
+async def test_drift_filter_skips_small_byte_changes() -> bool:
+    """Regression: Pocket's openFPGA cores tick in-game counters in SRAM
+    even when the operator isn't actively playing, producing 1-byte
+    differences across plug-ins that previously generated a fresh cloud
+    version on every sync. With drift_threshold[device_kind] > 0, the
+    engine treats sub-threshold drift as in-sync."""
+    workdir, state, cloud = _setup()
+    files = {"/Mario.srm": b"abc" * 100}
+    cart = MockFXPakSource(id="fx", files=files)
+    state.upsert_source(id=cart.id, system=cart.system,
+                        adapter="MockFXPakSource", config_json="{}")
+    ctx = SyncContext(state=state, cloud=cloud,
+                      cfg=SyncConfig(drift_threshold={"snes": 4}))
+
+    # Initial bootstrap upload.
+    out1 = await sync_one_game(source=cart,
+                               ref=SaveRef(path="/Mario.srm"), ctx=ctx)
+    refresh_manifest(source=cart, save_path="/Mario.srm",
+                     game_id=out1.game_id, paths=out1.paths, ctx=ctx)
+
+    # Mutate a single byte — within threshold (4).
+    bytes_a = files["/Mario.srm"]
+    bytes_b = bytearray(bytes_a)
+    bytes_b[10] = (bytes_b[10] + 1) & 0xFF
+    files["/Mario.srm"] = bytes(bytes_b)
+
+    ctx.invalidate_manifest(out1.paths)
+    out2 = await sync_one_game(source=cart,
+                               ref=SaveRef(path="/Mario.srm"), ctx=ctx)
+
+    n_versions = len(state.list_versions(cart.id, "/Mario.srm"))
+    sync_state = state.get_sync_state(cart.id, out1.game_id)
+    state.close()
+
+    ok = _check(out2.result, SyncResult.IN_SYNC,
+                "1-byte drift below threshold → IN_SYNC")
+    ok &= _check(n_versions, 1,
+                 "no extra version row uploaded under threshold")
+    ok &= _check(
+        sync_state.last_synced_hash if sync_state else None,
+        sha256_bytes(bytes(bytes_b)),
+        "sync_state advances to new bytes so we don't re-check next time")
+    return ok
+
+
+async def test_drift_filter_passes_large_changes() -> bool:
+    """Drift filter must NOT swallow real saves: if the change exceeds the
+    threshold, treat as a normal fast-forward upload."""
+    workdir, state, cloud = _setup()
+    files = {"/Mario.srm": b"abc" * 100}
+    cart = MockFXPakSource(id="fx", files=files)
+    state.upsert_source(id=cart.id, system=cart.system,
+                        adapter="MockFXPakSource", config_json="{}")
+    ctx = SyncContext(state=state, cloud=cloud,
+                      cfg=SyncConfig(drift_threshold={"snes": 4}))
+
+    out1 = await sync_one_game(source=cart,
+                               ref=SaveRef(path="/Mario.srm"), ctx=ctx)
+    refresh_manifest(source=cart, save_path="/Mario.srm",
+                     game_id=out1.game_id, paths=out1.paths, ctx=ctx)
+
+    files["/Mario.srm"] = b"xyz" * 100  # 300 bytes all different
+
+    ctx.invalidate_manifest(out1.paths)
+    out2 = await sync_one_game(source=cart,
+                               ref=SaveRef(path="/Mario.srm"), ctx=ctx)
+    n_versions = len(state.list_versions(cart.id, "/Mario.srm"))
+    state.close()
+
+    ok = _check(out2.result, SyncResult.UPLOADED,
+                "above threshold → UPLOADED (real save detected)")
+    ok &= _check(n_versions, 2, "two version rows after real change")
+    return ok
+
+
 async def test_uploads_under_device_kind_subfolder() -> bool:
     """Versions land under versions/<device_kind>/ — purely cosmetic for
     cloud-browse organization. Engine behaviour unchanged."""
@@ -458,6 +533,10 @@ def main() -> int:
          test_resolve_with_stale_cloud_path),
         ("test_uploads_under_device_kind_subfolder",
          test_uploads_under_device_kind_subfolder),
+        ("test_drift_filter_skips_small_byte_changes",
+         test_drift_filter_skips_small_byte_changes),
+        ("test_drift_filter_passes_large_changes",
+         test_drift_filter_passes_large_changes),
         ("test_no_duplicate_upload_on_transient_manifest_failure",
          test_no_duplicate_upload_on_transient_manifest_failure),
     ]:
