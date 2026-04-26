@@ -1,0 +1,27 @@
+[Unit]
+Description=SNI - Super Nintendo Interface (usb2snes server)
+Documentation=https://github.com/alttpo/sni
+After=network.target
+
+[Service]
+Type=simple
+User=retrosync
+Group=retrosync
+ExecStart=/usr/local/bin/sni
+Restart=always
+RestartSec=3
+# SNI binds to 127.0.0.1 by default. We do not expose it on the LAN.
+# /dev/cu.* is macOS; on Linux the cart appears as /dev/ttyACM*.
+SupplementaryGroups=dialout
+StandardOutput=journal
+StandardError=journal
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/retrosync
+
+[Install]
+WantedBy=multi-user.target

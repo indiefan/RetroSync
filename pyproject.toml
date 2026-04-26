@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "retrosync"
+version = "0.1.0"
+description = "Hands-off save backup from retro flash carts to Google Drive"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Marke" }]
+dependencies = [
+    "click>=8.1",
+    "PyYAML>=6.0",
+    "websockets>=12.0",
+    "structlog>=24.1",
+]
+
+[project.scripts]
+retrosync = "retrosync.cli:main"
+retrosyncd = "retrosync.daemon:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["retrosync*"]

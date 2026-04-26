@@ -1,0 +1,278 @@
+#!/usr/bin/env bash
+# RetroSync installer.
+#
+# Usage on the Pi (after SSHing in):
+#
+#   curl -fsSL https://raw.githubusercontent.com/REPLACE_ME/retrosync/main/install/setup.sh | sudo bash
+#
+# Or, if you've cloned the repo yourself:
+#
+#   sudo bash install/setup.sh
+#
+# What it does:
+#   1. Apt-installs the small set of system deps.
+#   2. Creates a dedicated 'retrosync' system user.
+#   3. Fetches the latest SNI release for the Pi's architecture.
+#   4. Installs rclone via the official installer.
+#   5. Clones (or updates) the RetroSync repo to /opt/retrosync and
+#      creates a Python venv with the daemon installed.
+#   6. Lays down /etc/retrosync/config.yaml from the example.
+#   7. Installs the systemd units, enables them, and starts SNI.
+#   8. Walks you through `rclone config` for Google Drive (interactive).
+#   9. Starts the daemon.
+#
+# Re-running the script is safe: it's idempotent. If you change config,
+# just `sudo systemctl restart retrosync`.
+
+set -euo pipefail
+
+# -------- knobs ----------------------------------------------------------
+RETROSYNC_REPO="${RETROSYNC_REPO:-https://github.com/REPLACE_ME/retrosync.git}"
+RETROSYNC_REF="${RETROSYNC_REF:-main}"
+RETROSYNC_DIR="${RETROSYNC_DIR:-/opt/retrosync}"
+RETROSYNC_USER="${RETROSYNC_USER:-retrosync}"
+RETROSYNC_HOME="/home/${RETROSYNC_USER}"
+RETROSYNC_DATA="/var/lib/retrosync"
+RETROSYNC_ETC="/etc/retrosync"
+RETROSYNC_LOCAL_SOURCE="${RETROSYNC_LOCAL_SOURCE:-}"   # optional: path to local checkout
+
+SNI_VERSION="${SNI_VERSION:-latest}"
+SNI_BINARY="/usr/local/bin/sni"
+
+# -------- helpers --------------------------------------------------------
+log()  { printf '\033[1;36m[retrosync]\033[0m %s\n' "$*"; }
+warn() { printf '\033[1;33m[retrosync]\033[0m %s\n' "$*" >&2; }
+die()  { printf '\033[1;31m[retrosync]\033[0m %s\n' "$*" >&2; exit 1; }
+
+require_root() {
+  [[ ${EUID} -eq 0 ]] || die "must run as root (use sudo)"
+}
+
+detect_arch() {
+  local m
+  m="$(uname -m)"
+  case "${m}" in
+    aarch64|arm64) echo "linux-arm64" ;;
+    armv7l|armv6l) echo "linux-arm32v7" ;;
+    x86_64)        echo "linux-amd64" ;;
+    *) die "unsupported architecture: ${m}" ;;
+  esac
+}
+
+# -------- step 1: apt deps -----------------------------------------------
+install_apt_deps() {
+  log "installing system dependencies (apt)..."
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -qq
+  apt-get install -yq \
+    ca-certificates curl jq git \
+    python3 python3-venv python3-pip \
+    sqlite3 \
+    unzip
+}
+
+# -------- step 2: user, dirs ---------------------------------------------
+ensure_user_and_dirs() {
+  if ! id -u "${RETROSYNC_USER}" >/dev/null 2>&1; then
+    log "creating system user ${RETROSYNC_USER}"
+    useradd --system --create-home --home-dir "${RETROSYNC_HOME}" \
+            --shell /usr/sbin/nologin "${RETROSYNC_USER}"
+  fi
+  # The cart will appear as /dev/ttyACM*; dialout group grants access on
+  # Raspberry Pi OS / Debian.
+  usermod -aG dialout "${RETROSYNC_USER}" || true
+
+  install -d -o "${RETROSYNC_USER}" -g "${RETROSYNC_USER}" -m 0755 \
+    "${RETROSYNC_DATA}" \
+    "${RETROSYNC_DATA}/fxpak-cache" \
+    "${RETROSYNC_HOME}/.config" \
+    "${RETROSYNC_HOME}/.config/rclone"
+  install -d -m 0755 "${RETROSYNC_ETC}"
+}
+
+# -------- step 3: SNI ----------------------------------------------------
+install_sni() {
+  if [[ -x "${SNI_BINARY}" && "${SNI_FORCE:-0}" != "1" ]]; then
+    log "SNI already at ${SNI_BINARY}; skipping (set SNI_FORCE=1 to reinstall)"
+    return
+  fi
+  local arch tag asset_url tmpdir
+  arch="$(detect_arch)"
+  log "fetching SNI release info (${SNI_VERSION}, ${arch})..."
+
+  if [[ "${SNI_VERSION}" == "latest" ]]; then
+    tag="$(curl -fsSL https://api.github.com/repos/alttpo/sni/releases/latest \
+            | jq -r '.tag_name')"
+  else
+    tag="${SNI_VERSION}"
+  fi
+  log "  -> SNI tag = ${tag}"
+
+  # SNI release assets are named like: sni-v0.0.96-linux-arm64.tar.xz
+  asset_url="$(curl -fsSL "https://api.github.com/repos/alttpo/sni/releases/tags/${tag}" \
+    | jq -r --arg arch "${arch}" '.assets[] | select(.name | endswith("-" + $arch + ".tar.xz")) | .browser_download_url' \
+    | head -n1)"
+
+  if [[ -z "${asset_url}" || "${asset_url}" == "null" ]]; then
+    die "no SNI asset for ${arch} at tag ${tag}; see https://github.com/alttpo/sni/releases"
+  fi
+
+  log "  -> downloading ${asset_url}"
+  tmpdir="$(mktemp -d)"
+  trap 'rm -rf "${tmpdir}"' RETURN
+  curl -fsSL "${asset_url}" -o "${tmpdir}/sni.tar.xz"
+  tar -xJf "${tmpdir}/sni.tar.xz" -C "${tmpdir}"
+  local extracted
+  extracted="$(find "${tmpdir}" -maxdepth 2 -type f -name sni | head -n1)"
+  [[ -n "${extracted}" ]] || die "SNI binary not found inside archive"
+  install -m 0755 "${extracted}" "${SNI_BINARY}"
+  log "installed SNI -> ${SNI_BINARY}"
+}
+
+# -------- step 4: rclone -------------------------------------------------
+install_rclone() {
+  if command -v rclone >/dev/null 2>&1; then
+    log "rclone already installed: $(rclone --version | head -n1)"
+    return
+  fi
+  log "installing rclone via official installer..."
+  curl -fsSL https://rclone.org/install.sh | bash
+}
+
+# -------- step 5: app code + venv ----------------------------------------
+install_retrosync_app() {
+  if [[ -n "${RETROSYNC_LOCAL_SOURCE}" ]]; then
+    log "copying local source from ${RETROSYNC_LOCAL_SOURCE} -> ${RETROSYNC_DIR}"
+    rm -rf "${RETROSYNC_DIR}"
+    cp -a "${RETROSYNC_LOCAL_SOURCE}" "${RETROSYNC_DIR}"
+  elif [[ -d "${RETROSYNC_DIR}/.git" ]]; then
+    log "updating existing checkout at ${RETROSYNC_DIR}"
+    git -C "${RETROSYNC_DIR}" fetch --quiet origin
+    git -C "${RETROSYNC_DIR}" checkout --quiet "${RETROSYNC_REF}"
+    git -C "${RETROSYNC_DIR}" pull --quiet --ff-only origin "${RETROSYNC_REF}"
+  else
+    log "cloning ${RETROSYNC_REPO} (${RETROSYNC_REF}) -> ${RETROSYNC_DIR}"
+    git clone --quiet --branch "${RETROSYNC_REF}" \
+              "${RETROSYNC_REPO}" "${RETROSYNC_DIR}"
+  fi
+  chown -R "${RETROSYNC_USER}:${RETROSYNC_USER}" "${RETROSYNC_DIR}"
+
+  log "building venv at ${RETROSYNC_DIR}/.venv"
+  sudo -u "${RETROSYNC_USER}" python3 -m venv "${RETROSYNC_DIR}/.venv"
+  sudo -u "${RETROSYNC_USER}" "${RETROSYNC_DIR}/.venv/bin/pip" \
+       install --quiet --upgrade pip
+  sudo -u "${RETROSYNC_USER}" "${RETROSYNC_DIR}/.venv/bin/pip" \
+       install --quiet "${RETROSYNC_DIR}"
+
+  # Make `retrosync` available on PATH for any user.
+  ln -sf "${RETROSYNC_DIR}/.venv/bin/retrosync" /usr/local/bin/retrosync
+  ln -sf "${RETROSYNC_DIR}/.venv/bin/retrosyncd" /usr/local/bin/retrosyncd
+}
+
+# -------- step 6: config -------------------------------------------------
+write_config() {
+  local cfg="${RETROSYNC_ETC}/config.yaml"
+  if [[ -f "${cfg}" ]]; then
+    log "config exists at ${cfg}; leaving it alone"
+    return
+  fi
+  log "writing default config to ${cfg}"
+  "${RETROSYNC_DIR}/.venv/bin/python" -c "
+from retrosync.config import Config
+print(Config.example_yaml())
+" > "${cfg}"
+  chown root:"${RETROSYNC_USER}" "${cfg}"
+  chmod 0640 "${cfg}"
+}
+
+# -------- step 7: systemd ------------------------------------------------
+install_systemd_units() {
+  log "installing systemd units"
+  install -m 0644 "${RETROSYNC_DIR}/install/systemd/sni.service" \
+                  /etc/systemd/system/sni.service
+  install -m 0644 "${RETROSYNC_DIR}/install/systemd/retrosync.service" \
+                  /etc/systemd/system/retrosync.service
+  systemctl daemon-reload
+  systemctl enable sni.service retrosync.service
+  systemctl restart sni.service
+}
+
+# -------- step 8: rclone OAuth ------------------------------------------
+ensure_rclone_remote() {
+  local remote_name="gdrive"
+  local conf="${RETROSYNC_HOME}/.config/rclone/rclone.conf"
+
+  if sudo -u "${RETROSYNC_USER}" rclone --config "${conf}" \
+       listremotes 2>/dev/null | grep -q "^${remote_name}:$"; then
+    log "rclone remote '${remote_name}' already configured"
+    return
+  fi
+
+  cat <<EOF
+
+================================================================
+  Google Drive needs to be authorized.
+  rclone will open a browser-based OAuth flow.
+
+  When prompted:
+    Storage:    drive
+    client_id:  (leave blank — uses rclone's shared default)
+    scope:      drive.file        (option 4 or 5; check the menu)
+    Authorize:  on a machine with a browser, run the URL it shows.
+                If you SSH'd from your Mac, copy the URL into the Mac's
+                browser, complete sign-in, and paste the verification
+                token back into the Pi.
+================================================================
+EOF
+  sudo -u "${RETROSYNC_USER}" rclone --config "${conf}" config
+  log "rclone configured. listing remotes:"
+  sudo -u "${RETROSYNC_USER}" rclone --config "${conf}" listremotes
+}
+
+# -------- step 9: start daemon ------------------------------------------
+start_daemon() {
+  log "starting retrosync.service"
+  systemctl restart retrosync.service
+  sleep 1
+  systemctl --no-pager --full status retrosync.service || true
+}
+
+# -------- main -----------------------------------------------------------
+main() {
+  require_root
+
+  log "RetroSync installer starting on $(uname -srm)"
+  install_apt_deps
+  ensure_user_and_dirs
+  install_sni
+  install_rclone
+  install_retrosync_app
+  write_config
+  install_systemd_units
+  if [[ "${SKIP_RCLONE_CONFIG:-0}" != "1" ]]; then
+    ensure_rclone_remote
+  else
+    warn "SKIP_RCLONE_CONFIG=1 set — skipping OAuth setup"
+  fi
+  if [[ "${SKIP_DAEMON_START:-0}" != "1" ]]; then
+    start_daemon
+  else
+    warn "SKIP_DAEMON_START=1 set — daemon not started"
+  fi
+
+  cat <<EOF
+
+================================================================
+  RetroSync is installed.
+
+  Edit config:    sudo nano ${RETROSYNC_ETC}/config.yaml
+  Test cart:      retrosync test-cart fxpak-pro-1
+  Test cloud:     retrosync test-cloud
+  Daemon logs:    journalctl -u retrosync.service -f
+  Restart:        sudo systemctl restart retrosync
+  Status:         retrosync status
+================================================================
+EOF
+}
+
+main "$@"

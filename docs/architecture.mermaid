@@ -1,0 +1,52 @@
+%% Save Sync System — Architecture Diagram
+%% Foundation focuses on FXPak Pro on SNES, with extension points for
+%% other flash carts (EverDrives) and handheld emulators.
+%% Render with: mmdc -i save-sync-architecture.mermaid -o save-sync-architecture.png
+
+flowchart LR
+    %% =============== Sources (current + future) ===============
+    subgraph SRC["Save Sources"]
+        direction TB
+        FX["FXPak Pro<br/>(SNES, USB)<br/>via usb2snes protocol"]:::current
+        ED["EverDrives<br/>(N64, GB, MD…)<br/>USB or SD-swap"]:::future
+        EM["Handheld Emulators<br/>(RetroArch, etc.)<br/>local save dirs"]:::future
+    end
+
+    %% =============== Pi (the hub) ===============
+    subgraph PI["Raspberry Pi (sync hub)"]
+        direction TB
+        SNI["SNI / QUsb2snes<br/>(systemd service)"]
+        ADAPTERS["Source Adapters<br/>FXPakSource · EverDriveSource · EmulatorSource"]
+        ORCH["BackupOrchestrator<br/>poll → diff → debounce → upload"]
+        STATE[("State Store<br/>SQLite: hashes, versions,<br/>last-seen timestamps")]
+        RCLONE["rclone<br/>(Google Drive remote)"]
+        SNI --> ADAPTERS
+        ADAPTERS --> ORCH
+        ORCH <--> STATE
+        ORCH --> RCLONE
+    end
+
+    %% =============== Cloud destination ===============
+    subgraph GD["Google Drive (versioned)"]
+        direction TB
+        CUR["/saves/&lt;system&gt;/&lt;game&gt;/current.srm"]
+        VER["/saves/&lt;system&gt;/&lt;game&gt;/versions/<br/>YYYY-MM-DDTHH-MM-SSZ--&lt;hash8&gt;.srm"]
+        MAN["/saves/&lt;system&gt;/&lt;game&gt;/manifest.json"]
+    end
+
+    %% =============== Connections ===============
+    FX  -- "USB cable" --> SNI
+    ED  -. "future" .-> ADAPTERS
+    EM  -. "future, LAN sync" .-> ADAPTERS
+    RCLONE -- "HTTPS / OAuth" --> CUR
+    RCLONE --> VER
+    RCLONE --> MAN
+
+    %% =============== Operator paths ===============
+    OP["Operator<br/>(you)"]:::operator
+    OP -. "logs · health · restore" .-> ORCH
+    OP -. "OAuth bootstrap" .-> RCLONE
+
+    classDef current fill:#1f7a1f,stroke:#0e3,color:#fff,stroke-width:2px
+    classDef future  fill:#444,stroke:#888,color:#ddd,stroke-dasharray:4 3
+    classDef operator fill:#222,stroke:#fff,color:#fff

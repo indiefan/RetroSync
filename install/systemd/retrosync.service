@@ -1,0 +1,26 @@
+[Unit]
+Description=RetroSync save backup daemon
+Documentation=https://github.com/REPLACE_ME/retrosync
+After=network-online.target sni.service
+Wants=network-online.target sni.service
+
+[Service]
+Type=simple
+User=retrosync
+Group=retrosync
+Environment=RETROSYNC_CONFIG=/etc/retrosync/config.yaml
+ExecStart=/opt/retrosync/.venv/bin/retrosyncd --config ${RETROSYNC_CONFIG}
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/retrosync /home/retrosync/.config/rclone
+
+[Install]
+WantedBy=multi-user.target
