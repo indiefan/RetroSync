@@ -346,36 +346,21 @@ async def sync_one_game(*, source: SaveSource, ref: SaveRef,
             ctx=ctx, version_row=version_row,
             detail="no prior agreement between source and cloud")
 
-    # 5. Cloud unchanged since last sync, device advanced → upload.
+    threshold = ctx.cfg.drift_threshold.get(
+        getattr(source, "device_kind", source.system), 0)
+
+    # 5. Cloud unchanged since last sync, device advanced → upload (or
+    #    drift, see below).
     if h_last == h_cloud and h_dev != h_cloud:
-        # Drift filter: when configured for this source's device_kind,
-        # check whether the new bytes differ from cloud's current by
-        # only a small number of bytes. If so, this is almost certainly
-        # an in-place SRAM counter tick from the device's emulator
-        # core, not a real save — silently move sync_state forward and
-        # skip the upload.
-        threshold = ctx.cfg.drift_threshold.get(
-            getattr(source, "device_kind", source.system), 0)
-        if threshold > 0:
-            try:
-                cloud_bytes = ctx.cloud.download_bytes(src=paths.current)
-            except CloudError as exc:
-                log.warning("drift filter: skipping check for %s "
-                            "(download failed: %s)", game_id, exc)
-                cloud_bytes = None
-            if cloud_bytes is not None and len(cloud_bytes) == len(data):
-                n_diff = sum(1 for a, b in zip(cloud_bytes, data)
-                             if a != b)
-                if n_diff <= threshold:
-                    log.info("drift filter: %s on %s differs from cloud "
-                             "by %d byte(s) (≤ %d) — treating as in-sync",
-                             game_id, source.id, n_diff, threshold)
-                    ctx.state.set_sync_state(
-                        source_id=source.id, game_id=game_id,
-                        last_synced_hash=h_dev, device_seen_path=ref.path)
-                    return SyncOutcome(SyncResult.IN_SYNC, game_id,
-                                       ref.path, paths,
-                                       f"drift filter: {n_diff} byte(s)")
+        if threshold > 0 and await _is_drift_from_last(
+                ctx=ctx, manifest=manifest, h_last=h_last,
+                data=data, threshold=threshold,
+                paths=paths, game_id=game_id, source_id=source.id):
+            ctx.state.set_sync_state(
+                source_id=source.id, game_id=game_id,
+                last_synced_hash=h_dev, device_seen_path=ref.path)
+            return SyncOutcome(SyncResult.IN_SYNC, game_id, ref.path,
+                               paths, "drift filter (case 5)")
         await _upload_version_path(
             source=source, ref=ref, data=data, h=h_dev,
             paths=paths, game_id=game_id, ctx=ctx,
@@ -400,7 +385,27 @@ async def sync_one_game(*, source: SaveSource, ref: SaveRef,
             last_synced_hash=h_cloud, device_seen_path=ref.path)
         return SyncOutcome(SyncResult.DOWNLOADED, game_id, ref.path, paths)
 
-    # 7. Both moved since last sync → conflict.
+    # 7. Both moved since last sync. May actually be drift on the
+    #    device's side (an SRAM counter ticked) plus a real cloud
+    #    advance from another device — in which case treat as case 6.
+    if threshold > 0 and await _is_drift_from_last(
+            ctx=ctx, manifest=manifest, h_last=h_last,
+            data=data, threshold=threshold,
+            paths=paths, game_id=game_id, source_id=source.id):
+        log.info("drift filter (case 7): %s on %s drifted from h_last "
+                 "but cloud genuinely advanced — pulling cloud current",
+                 game_id, source.id)
+        if not ctx.cfg.cloud_to_device:
+            return SyncOutcome(
+                SyncResult.SKIPPED, game_id, ref.path, paths,
+                "drift but cloud_to_device disabled")
+        await _pull_to_device(source=source, ref=ref, paths=paths,
+                              expected_hash=h_cloud, ctx=ctx)
+        ctx.state.set_sync_state(
+            source_id=source.id, game_id=game_id,
+            last_synced_hash=h_cloud, device_seen_path=ref.path)
+        return SyncOutcome(SyncResult.DOWNLOADED, game_id, ref.path,
+                           paths, "drift filter case 7 → cloud wins")
     return await _handle_divergence(
         source=source, ref=ref, data=data, h_dev=h_dev,
         h_cloud=h_cloud, base=h_last, paths=paths, game_id=game_id,
@@ -459,6 +464,43 @@ async def _upload_version_path(*, source: SaveSource, ref: SaveRef,
     except CloudError as exc:
         ctx.state.revert_to_ready(v_id)
         raise
+
+
+async def _is_drift_from_last(*, ctx: SyncContext,
+                              manifest: Manifest | None,
+                              h_last: str | None, data: bytes | None,
+                              threshold: int, paths: CloudPaths,
+                              game_id: str, source_id: str) -> bool:
+    """Return True iff the device's bytes are within `threshold` byte
+    differences of what this source uploaded as h_last.
+
+    Used by the drift filter in cases 5 and 7 to recognize "the device's
+    SRAM counter ticked but no real save happened" — the engine
+    otherwise sees a hash change and uploads, even though the user
+    didn't play. Costs one cloud download per check.
+    """
+    if h_last is None or threshold <= 0 or data is None:
+        return False
+    last_path = _find_cloud_version_path(manifest, h_last)
+    if last_path is None:
+        log.debug("drift filter: h_last %s not in manifest for %s; "
+                  "cannot compare", hash8(h_last), game_id)
+        return False
+    try:
+        last_bytes = ctx.cloud.download_bytes(src=last_path)
+    except CloudError as exc:
+        log.warning("drift filter: download of %s failed: %s",
+                    last_path, exc)
+        return False
+    if len(last_bytes) != len(data):
+        return False
+    n_diff = sum(1 for a, b in zip(last_bytes, data) if a != b)
+    if n_diff <= threshold:
+        log.info("drift filter: %s on %s differs from h_last %s by "
+                 "%d byte(s) (≤ %d)",
+                 game_id, source_id, hash8(h_last), n_diff, threshold)
+        return True
+    return False
 
 
 async def _pull_to_device(*, source: SaveSource, ref: SaveRef,
