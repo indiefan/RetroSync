@@ -12,7 +12,8 @@ import click
 
 from . import conflicts as conflicts_mod
 from . import leases as leases_mod
-from .cloud import RcloneCloud, compose_paths, hash8, sha256_bytes
+from . import promote as promote_mod
+from .cloud import CloudError, RcloneCloud, compose_paths, hash8, sha256_bytes
 from .config import DEFAULT_CONFIG_PATH, Config
 from .sources.base import SaveRef
 from .sources.registry import build as build_source
@@ -577,6 +578,62 @@ def cmd_lease_release(ctx: click.Context, spec: str, system: str,
     else:
         click.echo(f"no change to {system}/{game_id} lease (held by other "
                    f"source — re-run with --force to override)")
+
+
+# ---------------- promote ----------------
+
+@main.command("promote")
+@click.argument("game_id")
+@click.argument("selector")
+@click.option("--system", default="snes", show_default=True,
+              help="System namespace under the cloud remote.")
+@click.option("-y", "--yes", is_flag=True,
+              help="Skip the confirmation prompt.")
+@click.pass_context
+def cmd_promote(ctx: click.Context, game_id: str, selector: str,
+                system: str, yes: bool) -> None:
+    """Force a historical version to be cloud's `current` save.
+
+    SELECTOR is one of:
+
+    \b
+      <hash8>          first 8 hex chars (matches `retrosync versions`)
+      <full-sha256>    full hash (unambiguous)
+      <cloud-path>     a versions/... path from `retrosync versions`
+
+    \b
+    Examples:
+      retrosync promote final_fantasy_iii 7def5901
+      retrosync promote final_fantasy_iii \\
+        gdrive:retro-saves/snes/final_fantasy_iii/versions/snes/2026-...srm
+
+    On the next sync each device sees case 6 (cloud advanced;
+    device unchanged) and pulls the promoted bytes down — provided
+    `cloud_to_device: true` is set in their config.
+    """
+    cfg: Config = ctx.obj["config"]
+    if not yes:
+        click.echo(f"about to promote {selector!r} → cloud current "
+                   f"for {system}/{game_id}.")
+        if not click.confirm("proceed?", default=True):
+            return
+    state = StateStore(cfg.state.db_path)
+    cloud = RcloneCloud(remote=cfg.cloud.rclone_remote,
+                        binary=cfg.cloud.rclone_binary,
+                        config_path=cfg.cloud.rclone_config_path)
+    try:
+        result = promote_mod.promote(
+            state=state, cloud=cloud, game_id=game_id,
+            selector=selector, system=system)
+    except (ValueError, CloudError) as exc:
+        state.close()
+        raise click.ClickException(str(exc))
+    state.close()
+    click.echo(f"promoted {hash8(result.promoted_hash)} for "
+               f"{game_id} → {result.new_current_path}")
+    click.echo(f"  source bytes: {result.promoted_path}")
+    click.echo("  next sync on each device pulls these bytes "
+               "(case 6: cloud advanced).")
 
 
 # ---------------- sync-status ----------------
