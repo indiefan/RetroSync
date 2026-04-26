@@ -177,6 +177,14 @@ def load(*, cfg: Config, game_id: str, target: str,
 def _load_pocket(*, cfg: Config, game_id: str, data: bytes, h: str,
                  cloud_path: str, device: str | None,
                  mount_path: str) -> LoadResult:
+    # Mounting is a privileged operation. We need to be root by the time
+    # we call _ensure_mounted; the wrapper at /usr/local/bin/retrosync
+    # only stays root for `load <game> pocket` if the caller already has
+    # EUID 0 (i.e. they ran `sudo retrosync ...`).
+    if os.geteuid() != 0:
+        raise PermissionError(
+            "loading to the Pocket needs root for the mount step. "
+            "Re-run as: sudo retrosync load " + game_id + " pocket")
     actual_mount, owned = _ensure_mounted(device=device,
                                           mount_path=mount_path)
     try:

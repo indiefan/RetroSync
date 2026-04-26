@@ -243,10 +243,19 @@ if [[ "${1:-}" == "upgrade" ]]; then
   exec /usr/local/bin/retrosync-upgrade "$@"
 fi
 
-# pocket-sync needs root for mount/umount/udisksctl. Don't drop to the
-# retrosync user when the caller is already root (typical: systemd unit
-# or `sudo retrosync pocket-sync ...`).
-if [[ "${1:-}" == "pocket-sync" && "$(id -u)" == "0" ]]; then
+# Some commands need root for mount/umount/udisksctl (the Pocket SD has
+# to be mounted to read/write saves). If the caller is already root —
+# e.g. via `sudo retrosync ...` or the systemd unit — don't drop to the
+# unprivileged retrosync user.
+needs_root=0
+case "${1:-}" in
+  pocket-sync) needs_root=1 ;;
+  load)
+    # `load <game_id> pocket [...]` needs the mount step.
+    [[ "${3:-}" == "pocket" ]] && needs_root=1
+    ;;
+esac
+if [[ "${needs_root}" == "1" && "$(id -u)" == "0" ]]; then
   exec "$TARGET" "$@"
 fi
 

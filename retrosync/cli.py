@@ -187,7 +187,7 @@ def cmd_load(ctx: click.Context, game_id: str, target: str,
             mount_path=mount_path or load_mod.DEFAULT_POCKET_MOUNT,
             system=system,
         )
-    except (FileNotFoundError, ValueError) as exc:
+    except (FileNotFoundError, ValueError, PermissionError) as exc:
         raise click.ClickException(str(exc))
     click.echo(
         f"wrote {result.bytes_written} bytes (sha256={result.sha256[:8]}) "
