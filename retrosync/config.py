@@ -351,16 +351,17 @@ sources:
   #     # Krikzz's USB tool source doesn't expose a directory-list
   #     # operation, so the adapter can't auto-enumerate saves on
   #     # the SD. Until an OS64 dir-list cmd byte is found, the
-  #     # operator declares ROM filenames here. The adapter walks
-  #     # each ROM's per-format save filenames (Foo.z64 → Foo.eep,
-  #     # Foo.sra, Foo.fla, Foo.mp1..mp4) and uses file_exists to
-  #     # discover which actually exist on the cart's SD. ROM
-  #     # filename — including extension — must match what's on the
-  #     # SD card under sd_roms_root.
-  #     rom_filenames:
-  #       - "Super Mario 64 (USA).z64"
-  #       - "The Legend of Zelda - Ocarina of Time (USA).z64"
-  #       - "Paper Mario (USA).z64"
+  #     # adapter needs to know which ROM filenames to look for.
+  #     # Easiest by far: point local_rom_dir at a directory on the
+  #     # Pi (or wherever the daemon runs) containing copies of your
+  #     # N64 ROMs. The adapter os.listdir()s it once per pass and
+  #     # derives expected save filenames from each. No manual list
+  #     # maintenance.
+  #     local_rom_dir: /var/lib/retrosync/n64-roms
+  #     # Optional explicit list — useful for ROMs that only live
+  #     # on the cart's SD. Merged with local_rom_dir scan results.
+  #     # rom_filenames:
+  #     #   - "Cart-Only Game (USA).z64"
   #
   # And a corresponding Deck-side EmuDeck source for N64 (separate
   # from the SNES one above):
