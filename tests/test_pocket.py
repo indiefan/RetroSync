@@ -171,6 +171,37 @@ def test_existing_save_for_prefers_decorated_name() -> bool:
                   "prefers ROM-decorated name when slug-named also exists")
 
 
+def test_derive_source_id_for_device() -> bool:
+    """Two SDs with different UUIDs map to different source_ids; missing
+    device falls back to the default."""
+    from unittest.mock import patch
+    from retrosync.pocket.sync_runner import (derive_source_id_for_device,
+                                              read_device_uuid)
+    ok = _check(derive_source_id_for_device(device=None), "pocket-1",
+                "no device → fallback")
+
+    with patch("retrosync.pocket.sync_runner.read_device_uuid",
+               return_value="6434-3362"):
+        ok &= _check(
+            derive_source_id_for_device(device="/dev/sda1"),
+            "pocket-6434-3362",
+            "uuid 6434-3362 → pocket-6434-3362")
+    with patch("retrosync.pocket.sync_runner.read_device_uuid",
+               return_value="ABCD-EF01"):
+        ok &= _check(
+            derive_source_id_for_device(device="/dev/sda1"),
+            "pocket-ABCD-EF01",
+            "different uuid → different source_id")
+    with patch("retrosync.pocket.sync_runner.read_device_uuid",
+               return_value=None):
+        ok &= _check(
+            derive_source_id_for_device(device="/dev/sda1",
+                                        fallback="pocket-1"),
+            "pocket-1",
+            "blkid failure → fallback")
+    return ok
+
+
 def main() -> int:
     ok = True
     for name, factory in [
@@ -183,6 +214,8 @@ def main() -> int:
     ok &= test_existing_save_for_matches_by_slug()
     print("--- test_existing_save_for_prefers_decorated_name ---")
     ok &= test_existing_save_for_prefers_decorated_name()
+    print("--- test_derive_source_id_for_device ---")
+    ok &= test_derive_source_id_for_device()
     return 0 if ok else 1
 
 

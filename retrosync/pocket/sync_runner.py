@@ -71,6 +71,39 @@ def _run(cmd: list[str], *, check: bool = True,
                           timeout=120)
 
 
+def read_device_uuid(device: str) -> str | None:
+    """Return the filesystem UUID of <device> via `blkid`, or None on
+    error. Used to give each physical Pocket SD a stable identity so
+    two Pockets don't share a single source_id and clobber each other's
+    last_synced_hash pointer.
+    """
+    try:
+        proc = subprocess.run(
+            ["blkid", "-o", "value", "-s", "UUID", device],
+            capture_output=True, text=True, check=True, timeout=5)
+    except (FileNotFoundError, subprocess.CalledProcessError,
+            subprocess.TimeoutExpired) as exc:
+        log.warning("blkid for %s failed: %s", device, exc)
+        return None
+    uuid = proc.stdout.strip()
+    return uuid or None
+
+
+def derive_source_id_for_device(*, device: str | None,
+                                fallback: str = "pocket-1") -> str:
+    """Auto-derive a per-physical-device source_id from the SD card's
+    filesystem UUID. Multiple Analogue Pockets each get a distinct
+    identity (`pocket-<uuid>`); falls back to <fallback> if blkid
+    isn't available or the device has no UUID."""
+    if device is None:
+        return fallback
+    uuid = read_device_uuid(device)
+    if not uuid:
+        return fallback
+    safe = "".join(c if c.isalnum() else "-" for c in uuid)
+    return f"pocket-{safe}"
+
+
 def mount_pocket(*, device: str, mount_path: str,
                  settle_seconds: float = 1.0) -> None:
     """Mount /dev/sdX1 at <mount_path>. Lets the kernel auto-detect the
@@ -256,6 +289,17 @@ def cli_pocket_sync(*, device: str, source_id: str,
                  "syncing (a manual `retrosync load` is in progress)",
                  _SKIP_AUTO_SYNC_FLAG)
         return 0
+    # If the operator didn't override source_id (the default is the
+    # generic "pocket-1"), derive a per-physical-device id from the SD
+    # card's filesystem UUID so two Pockets each get their own
+    # sync_state row instead of clobbering one another.
+    if source_id == "pocket-1":
+        derived = derive_source_id_for_device(device=device,
+                                              fallback="pocket-1")
+        if derived != source_id:
+            log.info("pocket: using per-device source_id %s "
+                     "(derived from SD UUID of %s)", derived, device)
+            source_id = derived
     summary = PocketSyncSummary()
     try:
         if not skip_mount:
