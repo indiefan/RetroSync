@@ -745,3 +745,420 @@ source + fake rclone harness.
   USB drive mode. Not something we control — Analogue's UI choice.
 - A Mac-side companion that does the same sync when you plug the
   Pocket into the Mac. Same engine, different transport.
+
+---
+
+## 16. Addendum: post-implementation refinements
+
+Sections 1–15 describe the design as drafted. Sections 16+ document
+**what actually shipped** after implementing against real hardware
+(two physical Analogue Pockets + an FXPak Pro) and discovering edge
+cases the design didn't anticipate. Wherever this addendum contradicts
+an earlier section, the addendum is correct for the current code.
+
+The implementation lives on commits beyond §13's Step 10 ("Documentation
++ verification"). Rough chronology: ~17 PRs covering empirical
+hardware discoveries, configurability the design assumed wouldn't
+matter, and one entire mechanism (the drift filter, §16.6) the design
+didn't anticipate at all.
+
+### 16.1. Pocket SD layout — empirical findings
+
+The design (§3) assumed FAT32. **The Pocket actually ships exFAT**
+on stock setups with >32 GB SDs (the FAT32 filesystem-size limit).
+Linux ≥5.4 mounts exFAT natively via the `exfat` kernel driver, so
+no extra packages are required, but two places needed the `vfat`
+assumption removed:
+
+- `mount_pocket()` no longer passes `-t vfat`; the kernel auto-detects.
+- The udev rule matches `ENV{ID_FS_TYPE}=="vfat|exfat"`.
+
+The design also assumed SNES saves live at `/Saves/agg23.SNES/`.
+**Empirically the openFPGA SNES core writes to `Saves/snes/common/`**
+(shared across SNES cores). `PocketConfig.core` defaults to
+`snes/common`; operators with a non-standard core can override.
+
+The Pocket's USB IDs (`04d8:ca19`) are baked into the udev rule —
+no `lsusb` step required for default installs.
+
+macOS leaves `._<filename>` AppleDouble metadata sidecars on SDs
+that have been mounted on a Mac. `PocketSource.list_saves` skips
+them (otherwise they'd be processed as additional saves).
+
+### 16.2. Per-physical-device source IDs (auto-derived from SD UUID)
+
+The design (§14) noted "Multiple Pockets out of scope for v0.2 but the
+schema supports it (each Pocket gets its own source_id like pocket-1,
+pocket-2)". Multi-Pocket support proved **necessary**, not optional —
+running two physical Pockets through the same hardcoded `pocket-1`
+source_id silently corrupted `source_sync_state` (the row got
+overwritten by whichever Pocket synced last, leading to stale-bytes
+re-uploads on the next plug-in of the *other* Pocket).
+
+Fix: at sync time, the runner blkids the mounted partition and
+derives `source_id = pocket-<UUID>` (e.g. `pocket-6434-3362`). Each
+physical Pocket gets a stable, distinct identity. Operators with a
+configured `pocket` source in `config.yaml` can still pin a friendly
+name; auto-derivation is the fallback.
+
+Helpers live in `retrosync.pocket.sync_runner`:
+
+- `read_device_uuid(device)` — blkid wrapper.
+- `derive_source_id_for_device(device, fallback)` — returns
+  `pocket-<UUID>` or the fallback if blkid is unavailable.
+
+`load._pocket_source_id` uses the same logic so manual `retrosync load
+<game> pocket` invocations also write per-device sync state.
+
+### 16.3. Cloud layout — per-device-kind version subfolders
+
+`SaveSource` gained a `device_kind` attribute used purely for
+human-readable cloud organization:
+
+- `FXPakSource.device_kind = "snes"`
+- `PocketSource.device_kind = "pocket"`
+
+Versions and conflicts now land under a per-device subfolder:
+
+```
+gdrive:retro-saves/
+└── snes/
+    └── super_metroid/
+        ├── current.srm
+        ├── manifest.json
+        ├── versions/
+        │   ├── snes/
+        │   │   └── 2026-...--abc.srm    (FXPak upload)
+        │   └── pocket/
+        │       └── 2026-...--def.srm    (Pocket upload)
+        └── conflicts/
+            └── pocket/
+                └── 2026-...--from-pocket-6434-3362.srm
+```
+
+The engine resolves saves by **hash**, not by path — layout is purely
+cosmetic. Existing files at the unprefixed `versions/<file>` path
+(from before this change) still work; `conflicts._find_paths_by_hash`
+recurses one level so old + new layouts both resolve.
+
+### 16.4. System-canonical extension (`current.srm` cross-adapter)
+
+The design's path scheme used the source's own file extension
+(e.g. FXPak's `.srm`, Pocket's `.sav`). That meant FXPak and Pocket
+ended up writing to *different* `current.<ext>` filenames for the
+same game, breaking cross-source resolution.
+
+Fix: `cloud.SYSTEM_CANONICAL_EXTENSION = {"snes": ".srm"}`. Cloud's
+`current.<ext>` is system-canonical, not source-canonical. Both FXPak
+and Pocket SNES writes land at `…/super_metroid/current.srm`. The
+versions directory still preserves whichever extension was originally
+uploaded (so the version files are self-describing), but `current.<ext>`
+is consistent.
+
+### 16.5. Conflict resolution — `conflict_winner: device` is the default
+
+The design (§7.1, §7.3) called for "preserve both, require operator
+decision" on every divergence. The shipped default is **device-wins
+auto-resolve**:
+
+- **`conflict_winner: device`** (new default) — device's bytes become
+  the new `current.<ext>` and a new versions/* entry. The previous
+  cloud bytes stay in `versions/<previous-hash>.<ext>` (where they
+  already lived, so nothing's destroyed). A `conflicts` row is
+  inserted but pre-marked `resolved` for forensic visibility via
+  `retrosync conflicts list --all` / `... show <id>`. **Only the
+  resolving device's `sync_state` is updated** — other devices keep
+  their pointers to avoid ping-pong on the next sync.
+- **`conflict_winner: preserve`** — the original §7.3 behavior. Park
+  device bytes in `conflicts/`, leave cloud's current alone, require
+  manual `retrosync conflicts resolve`.
+
+The design's safety property ("don't silently overwrite") is
+preserved either way: the loser's bytes are always preserved in
+`versions/<loser-hash>.<ext>`. The change is in *who has to act* —
+the operator opts into preserve mode if they want to inspect every
+divergence.
+
+### 16.6. Drift filter — accommodating SRAM counter ticks
+
+**Entirely new mechanism not in the original design.**
+
+The Pocket's openFPGA cores tick in-game counters in SRAM even when
+the operator isn't actively playing — single-byte differences appear
+across plug-ins (e.g. FF3 byte at offset 8178 increments by 1 each
+USB Drive cycle). The design's hash-based comparison treats every
+byte change as "device advanced" → upload, producing a fresh cloud
+version on every plug-in. Annoying clutter that obscures genuine
+saves in the version history.
+
+`SyncConfig.drift_threshold: dict[device_kind, int]` (default empty
+= no filtering). When a fast-forward upload is about to fire AND the
+device's bytes differ from the appropriate reference by ≤ threshold
+bytes, the engine treats as in-sync rather than uploading.
+
+**Reference for comparison: `h_last`'s bytes**, fetched from cloud's
+`versions/...` via the manifest. (The design's case 5 has
+`h_last == h_cloud` so cloud's current works too; case 7 doesn't, so
+we always go via the manifest for consistency.)
+
+Coverage matrix — drift relevance per case from §7.1:
+
+| Case | Description | Drift relevant? |
+|------|-------------|-----------------|
+| 1 | `h_dev == h_cloud` (in sync) | No — exact match |
+| 2 | `h_cloud is None` (bootstrap upload) | No — nothing to compare |
+| 3 | `h_dev is None` (bootstrap pull) | No — no device bytes |
+| 4 | `h_last is None`, cloud disagrees | **Yes** — see §16.7 |
+| 5 | `h_last == h_cloud != h_dev` | **Yes** — drift → IN_SYNC |
+| 6 | `h_last == h_dev != h_cloud` | No — device unchanged |
+| 7 | Both moved | **Yes** — drift → treat as case 6 |
+
+Cost: bounded — case 5/7 each do one cloud download per drift event.
+Case 4's drift scan iterates up to `max_check=5` historical versions
+(see §16.7), worst-case 5 cloud cats on a brand-new genuinely-new
+device. The common in-sync path remains zero cloud calls.
+
+Suggested operator value:
+
+```yaml
+drift_threshold:
+  pocket: 4
+```
+
+Trade-off: real saves smaller than the threshold also get filtered.
+4 bytes is empirically generous enough for SRAM ticks but small
+enough to catch a real save's first HP/MP/inventory delta.
+
+### 16.7. Case 4 (no-prior-agreement) — stale-device detection
+
+The design's case 4 ("device has save, cloud has different save, no
+prior agreement") routed straight to conflict. With
+`conflict_winner=device` that becomes "auto-upload device's bytes",
+which is wrong when the device's bytes are *stale* — e.g. after the
+per-UUID migration in §16.2 created a fresh source_id for a Pocket
+whose actual save data hadn't changed.
+
+Three checks now run before falling through to divergence handling:
+
+1. **Exact-hash match against history.** `state.hash_in_versions_for_game(game_id, h_dev)` — if h_dev was ever uploaded under any source for this game, the device is presenting a known stale version. Pull cloud's current (case 6 semantics).
+2. **Drift match against recent history.** `_is_drift_from_any_known()` — if h_dev's bytes are within `drift_threshold` of any of the last `max_check` (default 5) historical versions, treat the device as stale and pull cloud's current.
+3. **`cloud_wins_on_unknown_device` policy** (opt-in). When set, a truly-novel device with no prior history *and* the manifest has at least one version (i.e. someone has been syncing this game) → preserve the device's bytes as a `versions/*` entry but don't make them current. Cloud's current wins; with `cloud_to_device: true`, cloud's bytes are written to the device. Recovers from the per-UUID-migration scenario when the device's bytes don't match anything in history exactly.
+
+Only after all three checks fail does case 4 proceed to
+`_handle_divergence` (the original conflict path).
+
+### 16.8. ROM-aware save filename derivation
+
+The design assumed Pocket saves were either bootstrap-pulled to a
+slug-named file (`<slug>.sav`) or written to an existing matching
+file. **The Pocket loads saves by ROM-stem matching** — slug-named
+files aren't picked up. Code now does a three-tier lookup:
+
+`PocketSource.target_save_path_for(game_id)`:
+
+1. **Existing matching save on the device** (`existing_save_for`):
+   walk `Saves/<core>/`, find files whose canonical slug matches
+   `game_id`. When multiple exist (e.g. ROM-decorated original + a
+   slug-named leftover from an earlier load), prefer the
+   ROM-decorated one — that's the file the Pocket actually loads.
+2. **Matching ROM in `Assets/<core>/`** (`find_rom_for`): scan ROMs
+   matching `rom_extensions` (default `.smc`/`.sfc`), filter by slug,
+   pick by `region_preference` (default `["usa", "world", "europe",
+   "japan"]`). Use the ROM's stem + save extension as the new save
+   filename.
+3. **Slug fallback** (`canonical_save_path`): only path the Pocket
+   can't load. Caller (`load`, `bootstrap-pull`) emits a WARNING
+   telling the operator to drop the ROM in or rename the file.
+
+`list_saves` also dedupes: when multiple files map to the same
+canonical slug, the ROM-decorated name wins; others are logged at
+WARNING level so the operator can clean them up. Without this,
+each plug-in would produce a separate cloud version per duplicate
+file.
+
+### 16.9. CLI additions
+
+Beyond what §9.2 lists, three new commands:
+
+```bash
+retrosync load <game_id> <target>   # cloud current → device by friendly name
+                                    # target=pocket | snes | <system>
+                                    # `pocket` requires sudo (mount step)
+retrosync versions <game_id>        # cross-source version history with provenance
+retrosync versions <game_id> --from <source_id>
+retrosync migrate-paths             # one-shot legacy <crc32>_*/unknown_* collapse
+```
+
+`load <game> pocket` is the manual override for the udev path. It:
+
+- Auto-detects the Pocket via `/dev/disk/by-id/usb-*Pocket*-part1`.
+- Sets a skip-flag at `/run/retrosync/skip-auto-sync` so the
+  udev-fired sync unit exits early (avoiding mount-race).
+- Waits up to 90s for the operator to plug in + enable USB Drive mode.
+- Mounts, writes via `target_save_path_for`, unmounts, clears the flag.
+
+The wrapper at `/usr/local/bin/retrosync` recognizes
+`pocket-sync` and `load <game> pocket` as needing root and stays
+root if invoked via `sudo retrosync ...` (otherwise it auto-elevates
+to the unprivileged `retrosync` user, who can't mount).
+
+### 16.10. Cross-source manifest writes
+
+The design's `refresh_manifest` (§5.2 / §8.3) was implemented as
+per-source initially, querying `state.list_versions(source_id, path)`.
+That meant each cross-source sync overwrote the manifest with only
+the running source's slice of versions — losing other devices'
+version history every time a different device synced.
+
+Fix: `refresh_manifest` now joins `versions` to `files` on `game_id`
+across **all sources**, so the manifest is a true cross-source
+record. `manifest.versions[].uploaded_by` correctly reflects the
+authoring source of each entry.
+
+### 16.11. Transient cloud errors don't get mistaken for "missing"
+
+The design assumed `cloud.exists()` returned True or False. The
+shipped code distinguishes "definitely missing" from "couldn't tell"
+via rclone's exit codes:
+
+- `0` (with non-empty output) → exists.
+- `0` (with empty output) → doesn't exist.
+- `3` (directory not found), `4` (file not found) → doesn't exist.
+- Anything else (rate-limit, network blip, auth glitch) → raises
+  `CloudError`.
+
+`SyncContext.manifest_for()` propagates `CloudError`; `sync_one_game`
+catches it, logs WARNING, returns `SyncResult.SKIPPED`. Crucial:
+without this, a transient Drive 429 makes the engine think the
+manifest doesn't exist → bootstrap upload (case 2) → fresh cloud
+version of an unchanged save. The bug surfaced as `clock_tower`
+having three identical-hash version entries despite never being
+touched on the cart.
+
+### 16.12. Conflicts resolver — hash-fallback for stale paths
+
+`conflicts.resolve` originally trusted the conflict row's stored
+`cloud_path`. After `migrate-paths` collapses a legacy
+`unknown_<...>` folder, that path no longer exists; resolves crashed
+with "directory not found".
+
+Fix: try the stored path first, then fall back to scanning the
+canonical game folder's `versions/` and `conflicts/` subdirs (and
+their device-kind subfolders, per §16.3) for any file whose name
+encodes the winner's `hash8`. The full hash is verified after
+download.
+
+`migrate-paths` was also updated to rewrite `cloud_path` columns in
+`versions`, `conflicts.cloud_path`, and `conflicts.conflict_path`,
+so future state.db reads land at the new paths directly.
+
+### 16.13. Operational surfaces — sudoers, ownership, file-system races
+
+A handful of installer-side fixes that don't change the design but
+matter for a working deploy:
+
+- **`upgrade.sh` no longer uses `sudo -E`** — strict sudoers policies
+  (default on stock Raspberry Pi OS) reject "preserve the
+  environment". Plain `sudo "$0" "$@"` works everywhere.
+- **`setup.sh` `rm -f /usr/local/bin/retrosync` before `cat >`** —
+  legacy installs left that path as a symlink to the venv-side
+  trampoline, so writing the wrapper there clobbered the trampoline
+  with the wrapper (causing infinite `exec` recursion).
+- **`setup.sh` defensively chowns `rclone.conf` + `state.db` to the
+  retrosync user** — root-owned files in `/var/lib/retrosync` from
+  earlier sudo operations silently broke the daemon and CLI.
+- **`retrosync-pocket-sync@.service`** sets
+  `RuntimeDirectoryPreserve=yes` — without it, systemd cleans up
+  `/run/retrosync` the moment the unit exits (Type=oneshot), racing
+  any in-flight `retrosync load <game> pocket` whose mount point
+  is also under `/run/retrosync`.
+- **`mount_pocket()` re-mkdirs the mount path right before the mount
+  syscall** — belt-and-suspenders against the same class of race.
+
+### 16.14. Custom Google OAuth client for higher API quota
+
+Optional but recommended for active multi-device setups. Documented
+inline in the Pi setup walkthrough; not a code change. Summary:
+rclone's shared default OAuth client splits Drive's per-minute
+quota across every rclone user globally; a custom Desktop OAuth
+client (15-min GCP setup) gets ~1B requests/day per project. After
+switching, change `scope = drive.file` to `scope = drive` in
+`rclone.conf` so the new client can see folders created by the old
+client (drive.file is per-app-scoped, drive isn't).
+
+### 16.15. Configuration reference (current state)
+
+Top-level keys in `/etc/retrosync/config.yaml` introduced in this
+implementation but not in §13:
+
+```yaml
+# Bidirectional sync — daemon writes cloud-newer saves back to the
+# device. Default false until the operator has verified byte-format
+# round-tripping (§10).
+cloud_to_device: true
+
+# Divergence behavior — see §16.5.
+conflict_winner: device     # | preserve
+
+# §16.7 opt-in for multi-device migrations.
+cloud_wins_on_unknown_device: true
+
+# §16.6 drift filter, per device_kind.
+drift_threshold:
+  pocket: 4
+
+# Manual game-id override map (see §6).
+game_aliases: {}
+```
+
+Per-`pocket` source options:
+
+```yaml
+sources:
+  - id: pocket-1            # auto-derived from SD UUID if omitted
+    adapter: pocket
+    options:
+      core: snes/common     # path under Saves/ — empirically right for agg23.SNES
+      file_extension: .sav
+      rom_extensions: [.smc, .sfc]
+      assets_subpath: ""    # default: mirror `core` under Assets/
+      region_preference: [usa, world, europe, japan]   # §16.8
+```
+
+### 16.16. Recovery cookbook
+
+Common operator scenarios that came up during real-world testing:
+
+**Wrong save promoted to current** (e.g. a stale-device upload
+overrode a good one before drift detection landed):
+
+```bash
+retrosync versions <game_id>          # find the desired version's cloud_path
+retrosync pull <cloud_path> /tmp/good.srm
+retrosync push fxpak-pro-1 <cart_path> /tmp/good.srm --confirm
+# next ~30s daemon poll detects the cart-side change and uploads as
+# new current. Other devices then receive it via case 6 download.
+```
+
+**Cleanup of stray slug-named saves** left over from early `load`
+runs (before `existing_save_for` / `target_save_path_for`):
+
+```bash
+sudo mount /dev/sda1 /run/retrosync/probe
+sudo rm "/run/retrosync/probe/Saves/snes/common/<slug>.sav"
+sudo umount /run/retrosync/probe
+```
+
+(`PocketSource.list_saves` dedupes these post-§16.8, so leaving them
+is also harmless — just clutter.)
+
+**Reverting accidental unknown-device uploads** (PR #16's
+`cloud_wins_on_unknown_device` is opt-in; if you missed enabling it
+before plugging in a migrated Pocket, the bytes were uploaded as
+current but ALSO preserved as a versions/ entry — recoverable):
+
+```bash
+retrosync versions <game_id> --from <other_source_id>   # find the wanted version
+retrosync pull <cloud_path> /tmp/good.srm
+# push to whichever device should be authoritative; daemon re-uploads
+```
