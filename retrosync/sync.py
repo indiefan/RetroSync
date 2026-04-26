@@ -268,11 +268,11 @@ async def sync_one_game(*, source: SaveSource, ref: SaveRef,
             return SyncOutcome(
                 SyncResult.SKIPPED, game_id, ref.path, paths,
                 "cloud_to_device disabled — not pulling missing save")
-        await _pull_to_device(source=source, ref=ref, paths=paths,
-                              expected_hash=h_cloud, ctx=ctx)
+        actual = await _pull_to_device(source=source, ref=ref, paths=paths,
+                                       expected_hash=h_cloud, ctx=ctx)
         ctx.state.set_sync_state(
             source_id=source.id, game_id=game_id,
-            last_synced_hash=h_cloud, device_seen_path=ref.path)
+            last_synced_hash=actual, device_seen_path=ref.path)
         return SyncOutcome(SyncResult.BOOTSTRAP_DOWNLOADED, game_id,
                            ref.path, paths)
 
@@ -305,11 +305,12 @@ async def sync_one_game(*, source: SaveSource, ref: SaveRef,
                 return SyncOutcome(
                     SyncResult.SKIPPED, game_id, ref.path, paths,
                     "stale device but cloud_to_device disabled")
-            await _pull_to_device(source=source, ref=ref, paths=paths,
-                                  expected_hash=h_cloud, ctx=ctx)
+            actual = await _pull_to_device(
+                source=source, ref=ref, paths=paths,
+                expected_hash=h_cloud, ctx=ctx)
             ctx.state.set_sync_state(
                 source_id=source.id, game_id=game_id,
-                last_synced_hash=h_cloud, device_seen_path=ref.path)
+                last_synced_hash=actual, device_seen_path=ref.path)
             return SyncOutcome(SyncResult.DOWNLOADED, game_id,
                                ref.path, paths,
                                f"stale device had ~{hash8(h_dev)}")
@@ -333,12 +334,12 @@ async def sync_one_game(*, source: SaveSource, ref: SaveRef,
                 update_current=False,
             )
             if ctx.cfg.cloud_to_device:
-                await _pull_to_device(
+                actual = await _pull_to_device(
                     source=source, ref=ref, paths=paths,
                     expected_hash=h_cloud, ctx=ctx)
                 ctx.state.set_sync_state(
                     source_id=source.id, game_id=game_id,
-                    last_synced_hash=h_cloud, device_seen_path=ref.path)
+                    last_synced_hash=actual, device_seen_path=ref.path)
                 ctx.invalidate_manifest(paths)
                 return SyncOutcome(SyncResult.DOWNLOADED, game_id,
                                    ref.path, paths,
@@ -392,11 +393,11 @@ async def sync_one_game(*, source: SaveSource, ref: SaveRef,
             return SyncOutcome(
                 SyncResult.SKIPPED, game_id, ref.path, paths,
                 "cloud_to_device disabled — not pulling cloud-newer save")
-        await _pull_to_device(source=source, ref=ref, paths=paths,
-                              expected_hash=h_cloud, ctx=ctx)
+        actual = await _pull_to_device(source=source, ref=ref, paths=paths,
+                                       expected_hash=h_cloud, ctx=ctx)
         ctx.state.set_sync_state(
             source_id=source.id, game_id=game_id,
-            last_synced_hash=h_cloud, device_seen_path=ref.path)
+            last_synced_hash=actual, device_seen_path=ref.path)
         return SyncOutcome(SyncResult.DOWNLOADED, game_id, ref.path, paths)
 
     # 7. Both moved since last sync. May actually be drift on the
@@ -413,11 +414,11 @@ async def sync_one_game(*, source: SaveSource, ref: SaveRef,
             return SyncOutcome(
                 SyncResult.SKIPPED, game_id, ref.path, paths,
                 "drift but cloud_to_device disabled")
-        await _pull_to_device(source=source, ref=ref, paths=paths,
-                              expected_hash=h_cloud, ctx=ctx)
+        actual = await _pull_to_device(source=source, ref=ref, paths=paths,
+                                       expected_hash=h_cloud, ctx=ctx)
         ctx.state.set_sync_state(
             source_id=source.id, game_id=game_id,
-            last_synced_hash=h_cloud, device_seen_path=ref.path)
+            last_synced_hash=actual, device_seen_path=ref.path)
         return SyncOutcome(SyncResult.DOWNLOADED, game_id, ref.path,
                            paths, "drift filter case 7 → cloud wins")
     return await _handle_divergence(
@@ -563,26 +564,39 @@ async def _is_drift_from_last(*, ctx: SyncContext,
 
 async def _pull_to_device(*, source: SaveSource, ref: SaveRef,
                           paths: CloudPaths, expected_hash: str,
-                          ctx: SyncContext) -> None:
+                          ctx: SyncContext) -> str:
     """Download cloud's current.* and write to the device.
 
     Also keeps state.db in step so the next poll sees the new hash as
     "current" instead of treating it as a fresh local edit.
+
+    Returns the actual sha256 of the bytes that landed on the device.
+    Usually equals `expected_hash`, but can differ if the manifest is
+    out of sync with current.<ext> (a cross-source manifest write
+    race — each device's refresh_manifest writes its own view of
+    current_hash, and a stale view can overwrite a fresh one). In
+    that case we self-heal: trust the actual bytes, write them to
+    the device, and update state.db with the actual hash. The next
+    refresh_manifest pass will then write a manifest whose
+    current_hash matches reality, repairing the cloud-side desync.
     """
     data = ctx.cloud.download_bytes(src=paths.current)
     got = sha256_bytes(data)
     if got != expected_hash:
-        raise CloudError(
-            f"download hash mismatch for {paths.current}: "
-            f"manifest says {hash8(expected_hash)}, got {hash8(got)}")
+        log.warning(
+            "manifest/current.<ext> desync for %s: manifest says %s, "
+            "actual current.<ext> is %s. Trusting the bytes; manifest "
+            "current_hash will be repaired by the next refresh.",
+            paths.current, hash8(expected_hash), hash8(got))
     await source.write_save(ref, data)
     game_id = paths.base.rsplit("/", 1)[-1]
     ctx.state.touch_file(source_id=source.id, path=ref.path,
                          game_id=game_id)
     ctx.state.set_current_hash(source_id=source.id, path=ref.path,
-                               h=expected_hash)
+                               h=got)
     log.info("sync: pulled %s for %s → device %s",
-             hash8(expected_hash), game_id, ref.path)
+             hash8(got), game_id, ref.path)
+    return got
 
 
 async def _handle_divergence(*, source: SaveSource, ref: SaveRef,
