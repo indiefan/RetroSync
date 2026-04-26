@@ -1,30 +1,29 @@
 # RetroSync — fire a one-shot sync when the Analogue Pocket presents
 # itself as a USB Mass-Storage device.
 #
-# This rule installs to /etc/udev/rules.d/99-retrosync-pocket.rules and
-# is reloaded by `udevadm control --reload && udevadm trigger`.
+# Installed to /etc/udev/rules.d/99-retrosync-pocket.rules and reloaded
+# by `udevadm control --reload && udevadm trigger`.
 #
-# The Pocket's vendor:product IDs must be filled in here. To capture them,
-# enable "Tools → USB → Mount as USB Drive" on the Pocket while plugged
-# into the Pi, then run:
+# Vendor:product 04d8:ca19 is the openFPGA Analogue Pocket — the
+# Microchip Technology USB controller it uses. Confirm yours with
+# `lsusb | grep -i analogue` if the rule doesn't fire.
 #
-#     lsusb | grep -i analogue
-#     # → Bus 001 Device 005: ID XXXX:YYYY Analogue Pocket
+# Filesystem: SD cards >32 GB ship as exfat by default; smaller ones
+# are usually vfat. Match either so the rule fires regardless of how
+# the user formatted theirs.
 #
-# Replace the XXXX:YYYY pair below with what `lsusb` reports.
-#
-# We match SUBSYSTEM=="block" and the partition (PARTN=="1") so we only
-# fire on the first FAT partition, not the whole-disk device.
+# We match SUBSYSTEM=="block" and ID_FS_TYPE so we only fire on the
+# mountable partition, not the whole-disk device.
 
-ACTION=="add", SUBSYSTEM=="block", ENV{ID_FS_TYPE}=="vfat", \
-  ENV{ID_VENDOR_ID}=="XXXX", ENV{ID_MODEL_ID}=="YYYY", \
+ACTION=="add", SUBSYSTEM=="block", ENV{ID_FS_TYPE}=="vfat|exfat", \
+  ENV{ID_VENDOR_ID}=="04d8", ENV{ID_MODEL_ID}=="ca19", \
   ENV{SYSTEMD_WANTS}+="retrosync-pocket-sync@%k.service", \
   TAG+="systemd"
 
 # Fallback for kernels/udev versions that don't populate ID_VENDOR_ID at
 # the partition level. Walks up the device tree to match the parent USB
 # device's IDs.
-ACTION=="add", SUBSYSTEM=="block", ENV{ID_FS_TYPE}=="vfat", \
-  ATTRS{idVendor}=="XXXX", ATTRS{idProduct}=="YYYY", \
+ACTION=="add", SUBSYSTEM=="block", ENV{ID_FS_TYPE}=="vfat|exfat", \
+  ATTRS{idVendor}=="04d8", ATTRS{idProduct}=="ca19", \
   ENV{SYSTEMD_WANTS}+="retrosync-pocket-sync@%k.service", \
   TAG+="systemd"

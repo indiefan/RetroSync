@@ -32,7 +32,11 @@ log = logging.getLogger(__name__)
 class PocketConfig:
     id: str
     mount_path: str
-    core: str = "agg23.SNES"
+    # Path under <mount>/Saves/ where the SNES core writes save files.
+    # Empirically the openFPGA SNES core (agg23.SNES) writes to the shared
+    # `snes/common/` directory rather than its own `agg23.SNES/` folder.
+    # Operators with an unusual core can override.
+    core: str = "snes/common"
     file_extension: str = ".sav"
     system: str = "snes"
     game_aliases: dict[str, list[str]] = field(default_factory=dict)
@@ -51,6 +55,8 @@ class PocketSource:
 
     @property
     def saves_dir(self) -> Path:
+        # `core` may contain slashes ("snes/common") for cores that share
+        # a save directory with the platform's other cores.
         return Path(self._cfg.mount_path) / "Saves" / self._cfg.core
 
     # ----------- SaveSource methods -----------
@@ -78,6 +84,10 @@ class PocketSource:
         try:
             for entry in sorted(d.iterdir()):
                 if not entry.is_file():
+                    continue
+                # Skip macOS metadata sidecars (e.g. `._Final Fantasy.sav`)
+                # that appear when the SD has been mounted on a Mac.
+                if entry.name.startswith("._"):
                     continue
                 if not entry.name.lower().endswith(ext):
                     continue
