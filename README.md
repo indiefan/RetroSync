@@ -196,6 +196,12 @@ Configuration: `/etc/retrosync/config.yaml`. Restart with
          # rather than its own per-core folder.
          core: snes/common
          file_extension: .sav
+         # ROM extensions to scan when picking a filename for a fresh
+         # save (the Pocket loads saves by ROM-stem match).
+         rom_extensions: [".smc", ".sfc"]
+         # Region preference when multiple ROMs match the same game
+         # (e.g. USA + Europe + Japan dumps). USA-first by default.
+         region_preference: [usa, world, europe, japan]
    ```
 
 5. Flip on bidirectional sync once you've verified Pocket and FXPak save

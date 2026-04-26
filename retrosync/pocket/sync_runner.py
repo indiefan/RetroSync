@@ -252,8 +252,15 @@ async def _bootstrap_pull(*, source: PocketSource, game_id: str,
                           summary: PocketSyncSummary,
                           refresh_targets: dict) -> None:
     """For a game the device has no save for, write the cloud's current
-    bytes to a canonical filename under Saves/<core>/."""
-    target = source.canonical_save_path(game_id)
+    bytes to the right filename under Saves/<core>/.
+
+    Uses target_save_path_for which prefers ROM-stem-derived names so
+    the Pocket actually loads the resulting file. Falls back to the
+    slug-based filename only if no matching ROM is in Assets/ — in
+    which case the operator probably needs to drop the ROM in or
+    rename the save manually.
+    """
+    target = source.target_save_path_for(game_id)
     if target.exists():
         # Filename collision but unread by list_saves (different ext, etc.).
         # Skip rather than overwrite.
