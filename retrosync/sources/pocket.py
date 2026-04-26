@@ -136,6 +136,29 @@ class PocketSource:
         # place; for v0.2 we keep this simple.
         return self.saves_dir / f"{game_id}{self._cfg.file_extension}"
 
+    def existing_save_for(self, game_id: str) -> Path | None:
+        """Return the on-device save file whose canonical slug matches
+        `game_id`, if one already exists. The Pocket loads saves by
+        ROM-filename match (e.g. `Final Fantasy III (U) (v1.1).sav`),
+        not by slug, so a `load` operation needs to overwrite the
+        existing file rather than create a new slug-named one that the
+        ROM won't find.
+        """
+        if not self.saves_dir.exists():
+            return None
+        ext = self._cfg.file_extension.lower()
+        for entry in self.saves_dir.iterdir():
+            if not entry.is_file():
+                continue
+            if entry.name.startswith("._"):
+                continue
+            if not entry.name.lower().endswith(ext):
+                continue
+            if resolve_game_id(entry.name,
+                               aliases=self._cfg.game_aliases) == game_id:
+                return entry
+        return None
+
 
 def _build(*, id: str, mount_path: str,
            core: str = "agg23.SNES",

@@ -237,8 +237,22 @@ def _load_pocket(*, cfg: Config, game_id: str, data: bytes, h: str,
         source = build_pocket_source(
             source_id=_pocket_source_id(cfg),
             mount_path=actual_mount, config=cfg)
-        target_path = source.canonical_save_path(game_id)
-        log.info("writing pocket save to %s", target_path)
+        # Prefer overwriting the existing on-device save (its filename
+        # matches the ROM, so the Pocket actually loads it). Fall back to
+        # the slug-based filename only if no existing save is found —
+        # but warn loudly because the Pocket likely won't load it then.
+        existing = source.existing_save_for(game_id)
+        if existing is not None:
+            target_path = existing
+            log.info("writing pocket save to existing file %s", target_path)
+        else:
+            target_path = source.canonical_save_path(game_id)
+            log.warning(
+                "no existing save on the Pocket matches %s; writing to "
+                "%s. The Pocket loads saves by ROM filename — if your "
+                "ROM is e.g. 'Foo (U).smc', rename this file to "
+                "'Foo (U).sav' for the save to be picked up.",
+                game_id, target_path)
         asyncio.run(source.write_save(SaveRef(path=str(target_path)), data))
     finally:
         if owned:
