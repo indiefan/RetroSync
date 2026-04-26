@@ -333,15 +333,17 @@ sources:
   #   adapter: everdrive64
   #   options:
   #     # Transport backends:
-  #     #   pyftdi    — direct USB via libusb (preferred, no kernel
-  #     #               driver needed). Wire-byte verification still
-  #     #               pending against UNFLoader source on real
-  #     #               hardware — see retrosync/transport/krikzz_ftdi.py
-  #     #   unfloader — subprocess wrapper (stub; UNFLoader CLI does
-  #     #               not natively expose SD ops; needs a wrapper).
+  #     #   serial    — pyserial over /dev/ttyUSB* (FT232 carts where
+  #     #               the kernel ftdi_sio driver auto-binds; the
+  #     #               default and the case verified on real X7
+  #     #               hardware so far).
+  #     #   pyftdi    — direct USB via libusb (FT245R variants where
+  #     #               the kernel doesn't claim the device).
+  #     #   unfloader — subprocess wrapper (stub).
   #     #   mock      — in-memory virtual SD; tests only.
-  #     transport: pyftdi
-  #     ftdi_url: ftdi://ftdi:0x6001/1
+  #     transport: serial
+  #     serial_path: /dev/ttyUSB0
+  #     serial_baud: 9600        # FT232 baud is largely cosmetic
   #     sd_saves_root: /ED64/SAVES
   #     sd_roms_root: /ED64/ROMS
   #     rom_extensions: [".z64", ".n64", ".v64"]
