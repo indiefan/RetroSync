@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# RetroSync — re-attempt deferred uploads when the network comes back.
+#
+# NetworkManager-dispatcher hooks. The `up` action fires once an
+# interface gets connectivity; `down` fires when it loses it. We only
+# care about `up` here — the running daemon naturally handles `down`
+# by errorring its rclone calls and re-queueing.
+#
+# Installed to /etc/NetworkManager/dispatcher.d/99-retrosync. The
+# dispatcher runs scripts in alphabetical order; 99- puts us last.
+
+set -e
+
+INTERFACE="$1"
+ACTION="$2"
+
+case "${ACTION}" in
+  up|vpn-up)
+    # The dispatcher runs as root with no $HOME; we want to fire the
+    # CLI as the deck user under their session so the user-systemd
+    # service is reachable. machinectl shell would be cleanest but
+    # SteamOS doesn't have it; the systemd --user --machine= form
+    # works.
+    if id deck >/dev/null 2>&1; then
+      systemctl --user --machine=deck@.host start \
+          retrosync-reconnect.service 2>/dev/null || true
+    fi
+    ;;
+esac

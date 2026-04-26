@@ -1,0 +1,19 @@
+[Unit]
+Description=RetroSync — flush pending uploads before suspend
+# Before=sleep.target makes systemd run this BEFORE handing the system
+# to the kernel for suspend. Without it, an in-flight rclone upload
+# could be silently lost.
+Before=sleep.target
+StopWhenUnneeded=yes
+
+[Service]
+Type=oneshot
+Environment=RETROSYNC_CONFIG=%h/.config/retrosync/config.yaml
+Environment=RCLONE_CONFIG=%h/.config/retrosync/rclone.conf
+ExecStart=%h/.local/share/retrosync/.venv/bin/retrosync --config ${RETROSYNC_CONFIG} flush --timeout 10
+RemainAfterExit=yes
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=sleep.target

@@ -183,8 +183,42 @@ class ConflictEntry:
         }
 
 
-# Manifests written by RetroSync after Pocket Sync lands.
-MANIFEST_SCHEMA = 2
+# Manifests written by RetroSync. Bumped to 3 with the EmuDeck design's
+# active_lease addition. Old daemons reading schema-3 manifests treat
+# the unknown `active_lease` field as a no-op (parse_manifest below
+# accepts both shapes).
+MANIFEST_SCHEMA = 3
+
+
+@dataclass
+class ActiveLease:
+    """Per-game cloud-stored lease — the active-device coordinator.
+
+    Lives inside the manifest. Atomic CAS isn't a primitive for
+    Drive-side JSON, so the lease relies on:
+      - Drive last-writer-wins for the manifest.json upload.
+      - A short TTL (`expires_at`) so a crashed device doesn't lock
+        anyone out forever.
+      - A periodic heartbeat by the holder while the activity is live.
+
+    `current_hash_at_lease` records the manifest's `current_hash` at
+    the moment the lease was grabbed — useful for forensic "did the
+    holder start from the latest cloud state?".
+    """
+    source_id: str
+    started_at: str
+    expires_at: str
+    last_heartbeat: str
+    current_hash_at_lease: str | None = None
+
+    def to_dict(self) -> dict:
+        return {
+            "source_id": self.source_id,
+            "started_at": self.started_at,
+            "expires_at": self.expires_at,
+            "last_heartbeat": self.last_heartbeat,
+            "current_hash_at_lease": self.current_hash_at_lease,
+        }
 
 
 @dataclass
@@ -194,6 +228,9 @@ class Manifest:
     `source_id` is the *primary* uploader (kept for v1 read-back), but
     per-version provenance lives in `entry.uploaded_by` and per-source
     state in `device_state`.
+
+    `active_lease` is the schema-3 active-device lease (see ActiveLease).
+    Absent / None when no device is currently playing this game.
     """
     schema: int
     source_id: str
@@ -206,6 +243,7 @@ class Manifest:
     save_filename: str | None = None
     device_state: dict[str, DeviceState] = None  # type: ignore[assignment]
     conflicts: list[ConflictEntry] = None        # type: ignore[assignment]
+    active_lease: ActiveLease | None = None
 
     def __post_init__(self) -> None:
         if self.device_state is None:
@@ -227,6 +265,8 @@ class Manifest:
                              for sid, ds in self.device_state.items()},
             "versions": [v.to_dict() for v in self.versions],
             "conflicts": [c.to_dict() for c in self.conflicts],
+            "active_lease": (self.active_lease.to_dict()
+                             if self.active_lease else None),
         }, indent=2, sort_keys=True)
 
 
@@ -371,8 +411,51 @@ class RcloneCloud:
     def overwrite_current(self, *, paths: CloudPaths, save_data: bytes) -> None:
         self.upload_bytes(data=save_data, dest=paths.current)
 
-    def write_manifest(self, *, paths: CloudPaths, manifest: Manifest) -> None:
+    def write_manifest(self, *, paths: CloudPaths, manifest: Manifest,
+                       preserve_lease: bool = True) -> None:
+        """Upload `manifest` as the new manifest.json.
+
+        `preserve_lease=True` (the default) reads whatever lease is
+        currently in cloud and substitutes it into the outbound manifest
+        — so a refresh-manifest call from a non-lease-aware code path
+        (e.g. a v0.2 daemon) doesn't accidentally clear someone else's
+        active lease. Lease writes themselves call this with
+        `preserve_lease=False` since the whole point is to overwrite.
+        """
+        if preserve_lease:
+            existing = self.read_manifest(paths)
+            if existing is not None:
+                manifest.active_lease = existing.active_lease
         self.upload_bytes(data=manifest.to_json().encode("utf-8"),
+                          dest=paths.manifest)
+
+    def write_active_lease(self, *, paths: CloudPaths,
+                           lease: ActiveLease | None) -> None:
+        """Read-modify-write the manifest's `active_lease` field.
+
+        Used by `leases.acquire/heartbeat/release`. Preserves every
+        other field of the manifest. If the manifest doesn't exist yet
+        we create a minimal one so the lease has somewhere to live —
+        the first sync of this game will fill in the rest.
+        """
+        existing = self.read_manifest(paths)
+        if existing is None:
+            game_id = paths.base.rsplit("/", 1)[-1]
+            system = paths.base.rsplit("/", 2)[-2] if "/" in paths.base else ""
+            existing = Manifest(
+                schema=MANIFEST_SCHEMA,
+                source_id="",
+                system=system,
+                game_id=game_id,
+                save_path="",
+                save_filename=None,
+                current_hash=None,
+                updated_at=utc_iso(),
+                versions=[],
+            )
+        existing.active_lease = lease
+        existing.updated_at = utc_iso()
+        self.upload_bytes(data=existing.to_json().encode("utf-8"),
                           dest=paths.manifest)
 
     def read_manifest(self, paths: CloudPaths) -> Manifest | None:
@@ -386,7 +469,7 @@ class RcloneCloud:
 
 
 def parse_manifest(raw: dict) -> Manifest:
-    """Parse a manifest dict tolerantly. Accepts v1 and v2 layouts."""
+    """Parse a manifest dict tolerantly. Accepts v1, v2, and v3 layouts."""
     versions: list[ManifestEntry] = []
     for v in raw.get("versions", []):
         versions.append(ManifestEntry(
@@ -416,6 +499,16 @@ def parse_manifest(raw: dict) -> Manifest:
             resolved_at=c.get("resolved_at"),
             winner_hash=c.get("winner_hash"),
         ))
+    lease_raw = raw.get("active_lease")
+    active_lease: ActiveLease | None = None
+    if isinstance(lease_raw, dict) and lease_raw.get("source_id"):
+        active_lease = ActiveLease(
+            source_id=lease_raw.get("source_id", ""),
+            started_at=lease_raw.get("started_at", ""),
+            expires_at=lease_raw.get("expires_at", ""),
+            last_heartbeat=lease_raw.get("last_heartbeat", ""),
+            current_hash_at_lease=lease_raw.get("current_hash_at_lease"),
+        )
     return Manifest(
         schema=raw.get("schema", 1),
         source_id=raw.get("source_id", ""),
@@ -428,6 +521,7 @@ def parse_manifest(raw: dict) -> Manifest:
         versions=versions,
         device_state=device_state,
         conflicts=conflicts,
+        active_lease=active_lease,
     )
 
 

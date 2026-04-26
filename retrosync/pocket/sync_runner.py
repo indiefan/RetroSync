@@ -23,6 +23,7 @@ from pathlib import Path
 
 from ..cloud import CloudError, RcloneCloud, compose_paths
 from ..config import Config
+from ..lease_tracker import LeaseTracker
 from ..sources.base import SaveRef
 from ..sources.pocket import PocketConfig, PocketSource
 from ..state import StateStore
@@ -179,6 +180,10 @@ async def run_pocket_sync(*, source: PocketSource, config: Config,
     ctx = SyncContext(state=state, cloud=cloud, cfg=sync_cfg)
     summary = PocketSyncSummary()
     refresh_targets: dict[str, tuple[str, str, object]] = {}
+    # One lease per game we sync; released in the `finally` below so
+    # an exception mid-pass doesn't leave leases hanging.
+    lease_tracker = LeaseTracker(source_id=source.id, cloud=cloud,
+                                 cfg=config.lease)
 
     health = await source.health()
     if not health.ok:
@@ -187,44 +192,60 @@ async def run_pocket_sync(*, source: PocketSource, config: Config,
         summary.errors += 1
         return summary
 
-    saves = await source.list_saves()
-    log.info("pocket: %d save file(s) found in %s",
-             len(saves), source.saves_dir)
-    seen_game_ids: set[str] = set()
-    for ref in saves:
-        try:
-            outcome = await sync_one_game(source=source, ref=ref, ctx=ctx)
-        except CloudError as exc:
-            log.warning("sync of %s failed: %s", ref.path, exc)
-            summary.errors += 1
-            continue
-        log.info("  %s → %s", Path(ref.path).name, outcome.result.value)
-        summary.add(outcome.result)
-        seen_game_ids.add(outcome.game_id)
-        if outcome.paths is not None and outcome.result in (
-                SyncResult.UPLOADED, SyncResult.BOOTSTRAP_UPLOADED,
-                SyncResult.DOWNLOADED, SyncResult.BOOTSTRAP_DOWNLOADED,
-                SyncResult.CONFLICT, SyncResult.CONFLICT_RESOLVED):
-            refresh_targets[outcome.game_id] = (
-                outcome.game_id, outcome.save_path, outcome.paths)
-
-    # Bootstrap-pull: cloud has games the device doesn't.
-    if config.cloud_to_device:
-        for game_id, _paths in _cloud_games(cloud, source.system):
-            if game_id in seen_game_ids:
+    try:
+        saves = await source.list_saves()
+        log.info("pocket: %d save file(s) found in %s",
+                 len(saves), source.saves_dir)
+        seen_game_ids: set[str] = set()
+        for ref in saves:
+            game_id = source.resolve_game_id(ref)
+            paths = compose_paths(remote=cloud.remote, system=source.system,
+                                  game_id=game_id, save_filename=ref.path)
+            if not lease_tracker.ensure(game_id=game_id, paths=paths):
+                log.info("  %s → SKIPPED (hard-mode lease contention)",
+                         Path(ref.path).name)
+                summary.skipped += 1
                 continue
-            await _bootstrap_pull(source=source, game_id=game_id,
-                                  ctx=ctx, summary=summary,
-                                  refresh_targets=refresh_targets)
+            try:
+                outcome = await sync_one_game(source=source, ref=ref, ctx=ctx)
+            except CloudError as exc:
+                log.warning("sync of %s failed: %s", ref.path, exc)
+                summary.errors += 1
+                continue
+            log.info("  %s → %s", Path(ref.path).name, outcome.result.value)
+            summary.add(outcome.result)
+            seen_game_ids.add(outcome.game_id)
+            if outcome.paths is not None and outcome.result in (
+                    SyncResult.UPLOADED, SyncResult.BOOTSTRAP_UPLOADED,
+                    SyncResult.DOWNLOADED, SyncResult.BOOTSTRAP_DOWNLOADED,
+                    SyncResult.CONFLICT, SyncResult.CONFLICT_RESOLVED):
+                refresh_targets[outcome.game_id] = (
+                    outcome.game_id, outcome.save_path, outcome.paths)
 
-    for game_id, save_path, paths in refresh_targets.values():
-        try:
-            refresh_manifest(source=source, save_path=save_path,
-                             game_id=game_id, paths=paths, ctx=ctx)
-        except CloudError as exc:
-            log.warning("manifest refresh failed for %s: %s",
-                        save_path, exc)
-    state.close()
+        # Bootstrap-pull: cloud has games the device doesn't.
+        if config.cloud_to_device:
+            for game_id, paths in _cloud_games(cloud, source.system):
+                if game_id in seen_game_ids:
+                    continue
+                if not lease_tracker.ensure(game_id=game_id, paths=paths):
+                    log.info("  bootstrap %s → SKIPPED (lease contention)",
+                             game_id)
+                    summary.skipped += 1
+                    continue
+                await _bootstrap_pull(source=source, game_id=game_id,
+                                      ctx=ctx, summary=summary,
+                                      refresh_targets=refresh_targets)
+
+        for game_id, save_path, paths in refresh_targets.values():
+            try:
+                refresh_manifest(source=source, save_path=save_path,
+                                 game_id=game_id, paths=paths, ctx=ctx)
+            except CloudError as exc:
+                log.warning("manifest refresh failed for %s: %s",
+                            save_path, exc)
+    finally:
+        lease_tracker.release_all()
+        state.close()
     log.info("pocket sync complete: %s", summary.render())
     return summary
 

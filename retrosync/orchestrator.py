@@ -32,7 +32,8 @@ from .cloud import (
     CloudError, ManifestEntry, RcloneCloud, build_manifest, compose_paths,
     sha256_bytes, utc_iso,
 )
-from .config import Config, OrchestratorConfig, SourceConfig
+from .config import Config, LeaseConfig, OrchestratorConfig, SourceConfig
+from .lease_tracker import LeaseTracker
 from .sources.base import SaveRef, SaveSource, SourceError
 from .sources.registry import build as build_source
 from .state import (ST_DEBOUNCING, ST_READY, StateStore, VersionRow)
@@ -50,10 +51,13 @@ class OrchestratorDeps:
     cloud: RcloneCloud
     cfg: OrchestratorConfig
     sync_cfg: SyncConfig = None  # type: ignore[assignment]
+    lease_cfg: LeaseConfig = None  # type: ignore[assignment]
 
     def __post_init__(self):
         if self.sync_cfg is None:
             self.sync_cfg = SyncConfig()
+        if self.lease_cfg is None:
+            self.lease_cfg = LeaseConfig()
 
 
 class BackupOrchestrator:
@@ -73,6 +77,12 @@ class BackupOrchestrator:
         # "unhealthy" log (otherwise the fast-recheck path would spam
         # the journal every 2s while the cart is off).
         self._last_health_ok: bool | None = None
+        # Per-source lease holder. Acquires per-game leases when the
+        # source becomes healthy (proxy for "console just turned on"),
+        # heartbeats them while it stays healthy, releases them on the
+        # health → unhealthy transition (proxy for "console powered off").
+        self._lease_tracker = LeaseTracker(
+            source_id=source.id, cloud=deps.cloud, cfg=deps.lease_cfg)
 
     def poke(self) -> None:
         """Signal the orchestrator to interrupt its current wait and run
@@ -135,6 +145,13 @@ class BackupOrchestrator:
             if self._last_health_ok is not False:
                 log.info("source %s unhealthy: %s",
                          self._source.id, health.detail)
+                # Health → unhealthy transition: release any leases
+                # we were holding so other devices don't have to wait
+                # out the TTL after a cart-detach.
+                if self._lease_tracker.held_game_ids():
+                    n = self._lease_tracker.release_all()
+                    log.info("released %d lease(s) on cart-detach for %s",
+                             n, self._source.id)
             else:
                 log.debug("source %s still unhealthy: %s",
                           self._source.id, health.detail)
@@ -207,6 +224,20 @@ class BackupOrchestrator:
         game_id = await self._resolve_game_id(ref)
         self._deps.state.touch_file(source_id=self._source.id,
                                     path=ref.path, game_id=game_id)
+
+        # Ensure we hold the lease for this game (acquire on first sight,
+        # heartbeat on subsequent passes). In hard mode with contention
+        # this returns False and we skip the per-game work — sync would
+        # otherwise potentially overwrite another device's in-flight save.
+        paths = compose_paths(remote=self._deps.cloud.remote,
+                              system=self._source.system,
+                              game_id=game_id, save_filename=ref.path)
+        if not self._lease_tracker.ensure(
+                game_id=game_id, paths=paths, current_hash=h):
+            log.info("hard-mode lease contention for %s on %s; skipping "
+                     "this game until the holder releases",
+                     game_id, self._source.id)
+            return
 
         if h == prev_h:
             latest = self._deps.state.latest_active_version(
@@ -369,7 +400,19 @@ async def run_all(config: Config, *,
     once they're constructed. Lets the daemon register signal handlers
     that need to reach into the orchestrators (e.g. SIGUSR1 → poke
     every orchestrator to run an immediate pass).
+
+    Source kind dispatch:
+      - EmuDeckSource → InotifyOrchestrator (event-driven push)
+      - everything else → BackupOrchestrator (polling)
+
+    Pocket sources are NOT instantiated by the daemon — they're
+    udev-fired one-shots via `retrosync pocket-sync`.
     """
+    # Lazy imports so the polling-only Pi daemon doesn't pay for the
+    # inotify wrapper's ctypes init at import time.
+    from .inotify_orchestrator import InotifyOrchestrator
+    from .sources.emudeck import EmuDeckSource
+
     state = StateStore(config.state.db_path)
     cloud = RcloneCloud(remote=config.cloud.rclone_remote,
                         binary=config.cloud.rclone_binary,
@@ -381,17 +424,34 @@ async def run_all(config: Config, *,
         drift_threshold=dict(config.drift_threshold))
     deps = OrchestratorDeps(state=state, cloud=cloud,
                             cfg=config.orchestrator,
-                            sync_cfg=sync_cfg)
-    sources = build_sources(config.sources)
+                            sync_cfg=sync_cfg,
+                            lease_cfg=config.lease)
+    sources = []
+    for s in config.sources:
+        # Pocket sources are wired up via udev — daemon doesn't
+        # instantiate them.
+        if s.adapter == "pocket":
+            log.info("daemon: skipping pocket source %s "
+                     "(udev-fired one-shot)", s.id)
+            continue
+        sources.append(build_source(s.adapter, id=s.id, **s.options))
     if not sources:
-        raise SystemExit("config has no sources; nothing to do")
+        raise SystemExit("config has no daemon-managed sources; "
+                         "nothing to do")
 
     # Register sources in DB so foreign keys are happy.
     for src in sources:
         state.upsert_source(id=src.id, system=src.system,
                             adapter=type(src).__name__, config_json="{}")
 
-    orchestrators = [BackupOrchestrator(s, deps) for s in sources]
+    orchestrators: list = []
+    for src in sources:
+        if isinstance(src, EmuDeckSource):
+            orchestrators.append(InotifyOrchestrator(
+                source=src, state=state, cloud=cloud,
+                sync_cfg=sync_cfg, lease_cfg=config.lease))
+        else:
+            orchestrators.append(BackupOrchestrator(src, deps))
     if on_started is not None:
         on_started(orchestrators)
     tasks = [asyncio.create_task(o.run()) for o in orchestrators]

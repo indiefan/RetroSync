@@ -60,6 +60,27 @@ class StateConfig:
 
 
 @dataclass
+class LeaseConfig:
+    """Active-device lease tunables. See `retrosync/leases.py` for the
+    semantics; the EmuDeck design doc §9 for the full rationale.
+
+    `mode`: 'soft' (warn on contention, proceed) or 'hard' (block).
+    `ttl_minutes`: how long a lease lasts without a heartbeat. Auto-
+       expires so a crashed device doesn't lock the fleet out.
+    `heartbeat_minutes`: how often the holder refreshes the lease
+       while activity is live. Should be < ttl_minutes / 2.
+    `notify_backend`: where to send "lease contended" notifications.
+       'journald' (default) is just structured logs; 'pushover' /
+       'discord' are stubs awaiting the operator to plug their
+       creds in (see notify.py).
+    """
+    mode: str = "soft"           # soft | hard
+    ttl_minutes: int = 15
+    heartbeat_minutes: int = 5
+    notify_backend: str = "journald"
+
+
+@dataclass
 class SourceConfig:
     id: str
     adapter: str           # 'fxpak', 'everdrive_n64', 'emulator_dir', ...
@@ -108,6 +129,10 @@ class Config:
     #   drift_threshold:
     #     pocket: 4
     drift_threshold: dict[str, int] = field(default_factory=dict)
+    # Active-device lease (EmuDeck design §9). Used by every source that
+    # learns to acquire/release a lease; absent leases are simply absent
+    # — no behavior change for sources that don't grab one.
+    lease: LeaseConfig = field(default_factory=LeaseConfig)
 
     # ----------- loading -----------
 
@@ -137,6 +162,7 @@ class Config:
             ))
         drift = {str(k): int(v)
                  for k, v in (raw.get("drift_threshold") or {}).items()}
+        lease = LeaseConfig(**(raw.get("lease") or {}))
         return cls(
             cloud=cloud, orchestrator=orch, state=state, sources=sources,
             game_aliases=aliases,
@@ -145,6 +171,7 @@ class Config:
             cloud_wins_on_unknown_device=bool(raw.get(
                 "cloud_wins_on_unknown_device", False)),
             drift_threshold=drift,
+            lease=lease,
         )
 
     @staticmethod
@@ -204,6 +231,20 @@ cloud_wins_on_unknown_device: false
 drift_threshold:
   pocket: 4
 
+# Active-device lease (EmuDeck sync design §9). When a device starts
+# playing a game, it acquires a per-game lease in the cloud manifest
+# so other devices know not to overwrite. Auto-expires after
+# `ttl_minutes` so a crashed device doesn't lock anyone out.
+#   mode=soft (default): warn on contention and proceed (device-wins
+#     auto-resolve preserves the loser anyway, so nothing's destroyed).
+#   mode=hard: refuse the contended operation. Strict; recommended only
+#     once every device in the fleet is lease-aware.
+lease:
+  mode: soft
+  ttl_minutes: 15
+  heartbeat_minutes: 5
+  notify_backend: journald
+
 # Optional manual alias table for cases where slug normalization can't
 # collapse two filenames on its own. Each entry maps a canonical id to
 # the list of raw slugs that should resolve to it.
@@ -232,6 +273,19 @@ sources:
   #     # SNES core (agg23.SNES) writes to the shared snes/common/ dir.
   #     core: snes/common
   #     file_extension: .sav
+
+  # EmuDeck (Steam Deck) source. Watches the configured saves dir with
+  # inotify; uploads on each in-game save (~5s debounce). The Deck-
+  # side `setup-deck.sh` writes this stanza for you. saves_root /
+  # roms_root usually live under ~/Emulation/.
+  # - id: deck-1
+  #   adapter: emudeck
+  #   options:
+  #     saves_root: /home/deck/Emulation/saves/retroarch/saves
+  #     roms_root:  /home/deck/Emulation/roms/snes
+  #     save_extension: .srm
+  #     rom_extensions: [".sfc", ".smc", ".swc", ".fig"]
+  #     system: snes
 """
 
     def write_example_to(self, path: str | os.PathLike) -> None:

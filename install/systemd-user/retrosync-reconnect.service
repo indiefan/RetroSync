@@ -1,0 +1,10 @@
+[Unit]
+Description=RetroSync — re-attempt deferred uploads after network reconnect
+
+[Service]
+Type=oneshot
+Environment=RETROSYNC_CONFIG=%h/.config/retrosync/config.yaml
+Environment=RCLONE_CONFIG=%h/.config/retrosync/rclone.conf
+ExecStart=%h/.local/share/retrosync/.venv/bin/retrosync --config ${RETROSYNC_CONFIG} sync-pending
+StandardOutput=journal
+StandardError=journal
