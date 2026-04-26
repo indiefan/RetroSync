@@ -2,12 +2,20 @@
 
 Hands-off save backup from retro flash carts to Google Drive.
 
-The first hardware target is the **FXPak Pro** (SNES) over USB. The
-foundation is built so adding EverDrives (N64 / GB / MD) and handheld
-emulator sync later doesn't require redesign.
+Two hardware targets so far:
+
+- **FXPak Pro** (SNES) over USB — continuous, ~30s polling.
+- **Analogue Pocket** (SNES core) over USB mass-storage — on-demand, fired
+  by udev when you flip the Pocket into "Mount as USB Drive".
+
+Both feed into the same Google Drive bucket so a save made on either
+side picks up where the other left off. The foundation is built so adding
+EverDrives (N64 / GB / MD) and other handheld emulator targets later
+doesn't require redesign.
 
 See [docs/design.pdf](docs/design.pdf) for the full design and
-[docs/architecture.png](docs/architecture.png) for the diagram.
+[docs/pocket-sync-design.md](docs/pocket-sync-design.md) for the
+bidirectional / Pocket Sync extension.
 
 ---
 
@@ -116,9 +124,10 @@ The `retrosync` command is a wrapper that auto-elevates to the
 `retrosync` system user, so you don't need `sudo` for any of these:
 
 ```bash
-retrosync status                          # daemon-wide summary
+retrosync status                          # daemon-wide summary (incl. open conflicts)
 retrosync list                            # every (source, save) on record
 retrosync show fxpak-pro-1 /Mario.srm     # version history for one save
+retrosync sync-status                     # last-synced hash per (source, game)
 retrosync test-cart fxpak-pro-1           # smoke-test cart connection
 retrosync test-cloud                      # smoke-test rclone remote
 
@@ -126,13 +135,67 @@ retrosync test-cloud                      # smoke-test rclone remote
 retrosync pull <cloud-path-from-show> /tmp/restored.srm
 retrosync push fxpak-pro-1 /Mario.srm /tmp/restored.srm --confirm
 
+# Conflicts (when bidirectional sync sees both sides change):
+retrosync conflicts list
+retrosync conflicts show <id>
+retrosync conflicts resolve <id> --winner {cloud | device | <hash>}
+
+# Pocket sync (normally fired by udev; manual override):
+sudo retrosync pocket-sync --device /dev/sda1
+
+# Migrate the legacy unknown_*/<crc32>_* cloud layout:
+retrosync migrate-paths --dry-run        # plan only
+retrosync migrate-paths                  # apply
+
 # Get the latest source + re-apply the installer in one step.
-# Prompts for sudo password once.
 retrosync upgrade
 ```
 
 Configuration: `/etc/retrosync/config.yaml`. Restart with
 `sudo systemctl restart retrosync` after changes.
+
+### Pocket sync setup
+
+1. Plug the Pocket into the Pi. On the Pocket: **Tools → USB → Mount as
+   USB Drive**.
+2. From the Pi, capture the Pocket's USB IDs:
+
+   ```bash
+   lsusb | grep -i analogue
+   # → Bus 001 Device 005: ID XXXX:YYYY Analogue Pocket
+   ```
+
+3. Edit `/etc/udev/rules.d/99-retrosync-pocket.rules`, replacing the
+   `XXXX:YYYY` placeholders with the IDs from `lsusb`. Then:
+
+   ```bash
+   sudo udevadm control --reload
+   sudo udevadm trigger
+   ```
+
+4. Optional but recommended: add a `pocket-1` source to
+   `/etc/retrosync/config.yaml` so its options (core name, file
+   extension) are stored alongside the FXPak entry:
+
+   ```yaml
+   sources:
+     - id: pocket-1
+       adapter: pocket
+       options:
+         core: agg23.SNES
+         file_extension: .sav
+   ```
+
+5. Flip on bidirectional sync once you've verified Pocket and FXPak save
+   formats round-trip cleanly (see
+   [docs/pocket-sync-design.md §10](docs/pocket-sync-design.md)):
+
+   ```yaml
+   cloud_to_device: true
+   ```
+
+Each plug-in fires a one-shot sync. Watch progress with
+`journalctl -u 'retrosync-pocket-sync@*'`.
 
 ---
 
@@ -145,34 +208,44 @@ retrosync/
 │   │   ├── base.py        # SaveSource protocol — the extension point
 │   │   ├── usb2snes.py    # WebSocket client for SNI / QUsb2snes
 │   │   ├── fxpak.py       # FXPak Pro adapter
+│   │   ├── pocket.py      # Analogue Pocket adapter (mounted SD)
 │   │   └── registry.py    # config 'adapter' string -> ctor
+│   ├── pocket/            # udev-fired one-shot Pocket sync runner
+│   ├── game_id.py         # canonical slug + alias resolution
 │   ├── state.py           # SQLite store
-│   ├── cloud.py           # rclone wrapper, path scheme, manifest
-│   ├── orchestrator.py    # poll/diff/debounce/upload
+│   ├── cloud.py           # rclone wrapper, path scheme, manifest v2
+│   ├── orchestrator.py    # FXPak poll/diff/debounce loop
+│   ├── sync.py            # bidirectional engine (shared)
+│   ├── conflicts.py       # conflict storage + resolve helpers
+│   ├── migrate.py         # one-shot legacy-layout migration
 │   ├── daemon.py          # systemd entry point
 │   ├── cli.py             # operator CLI
 │   └── config.py
 ├── install/
 │   ├── setup.sh           # one-shot installer
-│   └── systemd/           # unit files
+│   ├── systemd/           # unit files (incl. Pocket sync template)
+│   └── udev/              # 99-retrosync-pocket.rules
 ├── docs/
-│   ├── design.pdf         # full design doc
-│   ├── architecture.png   # diagram
-│   └── imaging.md         # detailed Pi Imager walkthrough with caveats
+│   ├── design.pdf                # original design
+│   ├── pocket-sync-design.md     # Pocket Sync extension
+│   ├── architecture.png          # diagram
+│   └── imaging.md
 ├── tests/
 └── pyproject.toml
 ```
 
-## Adding a new source (future)
+## Adding a new source
 
 The whole orchestrator is built around the `SaveSource` protocol in
 [`retrosync/sources/base.py`](retrosync/sources/base.py). Implement it,
 register the adapter in `registry.py`, and add a stanza to your
-`config.yaml`. No changes elsewhere.
+`config.yaml`. The bidirectional sync engine in `retrosync/sync.py`
+takes over from there — the per-source code only has to know how to
+read, write, and list saves.
 
-A LocalDirSource for RetroArch / standalone emulators will land in v2,
-along with two-way sync (handheld ↔ FXPak Pro). See the design doc's
-appendix for the conflict-resolution plan.
+The Pocket adapter ([`retrosync/sources/pocket.py`](retrosync/sources/pocket.py))
+is the simplest current example: it backs onto a directory, so the
+whole adapter is ~80 lines.
 
 ## License
 

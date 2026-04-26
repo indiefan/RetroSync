@@ -7,9 +7,8 @@ store, cloud wrapper, and rclone integration end-to-end.
 from __future__ import annotations
 
 import asyncio
-import re
-from pathlib import PurePosixPath
 
+from retrosync.game_id import resolve_game_id as canonical_id
 from retrosync.sources.base import HealthStatus, SaveRef
 
 
@@ -18,10 +17,14 @@ class MockFXPakSource:
 
     system = "snes"
 
-    def __init__(self, *, id: str, files: dict[str, bytes]):
+    def __init__(self, *, id: str, files: dict[str, bytes],
+                 save_extension: str = ".srm",
+                 game_aliases: dict[str, list[str]] | None = None):
         self.id = id
         self.files = files
         self._fail_health = False
+        self._ext = save_extension
+        self._aliases = dict(game_aliases or {})
 
     def break_(self) -> None:
         self._fail_health = True
@@ -38,7 +41,7 @@ class MockFXPakSource:
     async def list_saves(self) -> list[SaveRef]:
         await asyncio.sleep(0)
         return [SaveRef(path=p, size_bytes=len(b))
-                for p, b in self.files.items() if p.endswith(".srm")]
+                for p, b in self.files.items() if p.endswith(self._ext)]
 
     async def read_save(self, ref: SaveRef) -> bytes:
         await asyncio.sleep(0)
@@ -48,13 +51,7 @@ class MockFXPakSource:
         self.files[ref.path] = data
 
     def resolve_game_id(self, ref: SaveRef) -> str:
-        stem = PurePosixPath(ref.path).stem
-        slug = re.sub(r"[^a-z0-9]+", "_", stem.lower()).strip("_")
-        # Pretend CRC32 = first 8 chars of save's hash, to differentiate games.
-        rom_path = ref.path.rsplit(".", 1)[0] + ".smc"
-        rom = self.files.get(rom_path, b"")
-        crc = sum(rom) & 0xFFFFFFFF
-        return f"{crc:08x}_{slug or 'unnamed'}"
+        return canonical_id(ref.path, aliases=self._aliases)
 
     async def async_resolve_game_id(self, ref: SaveRef) -> str:
         return self.resolve_game_id(ref)

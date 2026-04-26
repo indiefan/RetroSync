@@ -64,6 +64,16 @@ class Config:
     orchestrator: OrchestratorConfig = field(default_factory=OrchestratorConfig)
     state: StateConfig = field(default_factory=StateConfig)
     sources: list[SourceConfig] = field(default_factory=list)
+    # Top-level alias map shared across all sources. Each source may also
+    # accept a `game_aliases` option that overrides this for its own scope.
+    # Keys are canonical game ids; values are raw slugs that should resolve
+    # to the key.
+    game_aliases: dict[str, list[str]] = field(default_factory=dict)
+    # When true, the engine is allowed to write cloud-newer saves back to
+    # the device. Off by default until a hardware-side compatibility check
+    # has confirmed the bytes round-trip correctly. See pocket-sync-design
+    # §10.
+    cloud_to_device: bool = False
 
     # ----------- loading -----------
 
@@ -80,15 +90,22 @@ class Config:
         cloud = CloudConfig(**(raw.get("cloud") or {}))
         orch = OrchestratorConfig(**(raw.get("orchestrator") or {}))
         state = StateConfig(**(raw.get("state") or {}))
-        sources = [
-            SourceConfig(
-                id=s["id"],
-                adapter=s["adapter"],
-                options=s.get("options") or {},
-            )
-            for s in (raw.get("sources") or [])
-        ]
-        return cls(cloud=cloud, orchestrator=orch, state=state, sources=sources)
+        aliases = dict(raw.get("game_aliases") or {})
+        sources = []
+        for s in (raw.get("sources") or []):
+            opts = dict(s.get("options") or {})
+            # If the source didn't override aliases, inject the global map
+            # so the adapter sees a consistent table.
+            if aliases and "game_aliases" not in opts:
+                opts["game_aliases"] = aliases
+            sources.append(SourceConfig(
+                id=s["id"], adapter=s["adapter"], options=opts,
+            ))
+        return cls(
+            cloud=cloud, orchestrator=orch, state=state, sources=sources,
+            game_aliases=aliases,
+            cloud_to_device=bool(raw.get("cloud_to_device", False)),
+        )
 
     @staticmethod
     def example_yaml() -> str:
@@ -112,6 +129,21 @@ orchestrator:
 state:
   db_path: /var/lib/retrosync/state.db
 
+# When true, the daemon can push cloud-newer saves back to the device.
+# Default false; flip on after verifying byte-for-byte round-tripping
+# between FXPak Pro and Pocket SNES core. See docs/pocket-sync-design.md §10.
+cloud_to_device: false
+
+# Optional manual alias table for cases where slug normalization can't
+# collapse two filenames on its own. Each entry maps a canonical id to
+# the list of raw slugs that should resolve to it.
+#
+# game_aliases:
+#   super_metroid:
+#     - super_metroid_jpn
+#     - super_metroid_usa_europe_en_ja_virtual_console
+game_aliases: {}
+
 sources:
   - id: fxpak-pro-1
     adapter: fxpak
@@ -120,12 +152,14 @@ sources:
       sd_root: /
       save_extensions: [".srm"]
 
-  # Future:
-  # - id: retroarch-deck
-  #   adapter: emulator_dir
+  # Pocket sync runs on-demand, triggered by udev when the Pocket is
+  # mounted in 'USB Drive' mode. The mount path is supplied at trigger
+  # time by the systemd unit, not here.
+  # - id: pocket-1
+  #   adapter: pocket
   #   options:
-  #     system: snes
-  #     directory: /home/deck/.config/retroarch/saves
+  #     core: agg23.SNES
+  #     file_extension: .sav
 """
 
     def write_example_to(self, path: str | os.PathLike) -> None:

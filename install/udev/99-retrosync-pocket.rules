@@ -1,0 +1,30 @@
+# RetroSync — fire a one-shot sync when the Analogue Pocket presents
+# itself as a USB Mass-Storage device.
+#
+# This rule installs to /etc/udev/rules.d/99-retrosync-pocket.rules and
+# is reloaded by `udevadm control --reload && udevadm trigger`.
+#
+# The Pocket's vendor:product IDs must be filled in here. To capture them,
+# enable "Tools → USB → Mount as USB Drive" on the Pocket while plugged
+# into the Pi, then run:
+#
+#     lsusb | grep -i analogue
+#     # → Bus 001 Device 005: ID XXXX:YYYY Analogue Pocket
+#
+# Replace the XXXX:YYYY pair below with what `lsusb` reports.
+#
+# We match SUBSYSTEM=="block" and the partition (PARTN=="1") so we only
+# fire on the first FAT partition, not the whole-disk device.
+
+ACTION=="add", SUBSYSTEM=="block", ENV{ID_FS_TYPE}=="vfat", \
+  ENV{ID_VENDOR_ID}=="XXXX", ENV{ID_MODEL_ID}=="YYYY", \
+  ENV{SYSTEMD_WANTS}+="retrosync-pocket-sync@%k.service", \
+  TAG+="systemd"
+
+# Fallback for kernels/udev versions that don't populate ID_VENDOR_ID at
+# the partition level. Walks up the device tree to match the parent USB
+# device's IDs.
+ACTION=="add", SUBSYSTEM=="block", ENV{ID_FS_TYPE}=="vfat", \
+  ATTRS{idVendor}=="XXXX", ATTRS{idProduct}=="YYYY", \
+  ENV{SYSTEMD_WANTS}+="retrosync-pocket-sync@%k.service", \
+  TAG+="systemd"

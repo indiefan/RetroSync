@@ -1,4 +1,5 @@
-"""Operator CLI: list, show, pull, push, test-cart, status."""
+"""Operator CLI: list, show, pull, push, test-cart, status, conflicts,
+sync-status, pocket-sync."""
 from __future__ import annotations
 
 import asyncio
@@ -9,7 +10,8 @@ from pathlib import Path
 
 import click
 
-from .cloud import RcloneCloud, compose_paths, sha256_bytes
+from . import conflicts as conflicts_mod
+from .cloud import RcloneCloud, compose_paths, hash8, sha256_bytes
 from .config import DEFAULT_CONFIG_PATH, Config
 from .sources.base import SaveRef
 from .sources.registry import build as build_source
@@ -56,12 +58,17 @@ def cmd_status(ctx: click.Context) -> None:
         "WHERE state IN ('pending','debouncing','ready','uploading')"
     ).fetchone()["n"]
 
+    open_conflicts = state._conn.execute(
+        "SELECT COUNT(*) AS n FROM conflicts WHERE resolved_at IS NULL"
+    ).fetchone()["n"]
+
     click.echo(f"sources       : {len(sources)}")
     for s in sources:
         click.echo(f"  - {s['id']}  ({s['system']}, adapter={s['adapter']})")
     click.echo(f"files tracked : {files_total}")
     click.echo(f"versions: uploaded={versions_uploaded} "
                f"pending={versions_pending}")
+    click.echo(f"conflicts     : {open_conflicts} open")
     click.echo(f"db            : {cfg.state.db_path}")
     click.echo(f"cloud remote  : {cfg.cloud.rclone_remote}")
     state.close()
@@ -232,6 +239,190 @@ def cmd_upgrade(ctx: click.Context) -> None:
                "Run setup.sh from the repo to (re)install the upgrade entry "
                "point.", err=True)
     ctx.exit(1)
+
+
+# ---------------- pocket-sync ----------------
+
+@main.command("pocket-sync")
+@click.option("--device", required=True,
+              help="Block device, e.g. /dev/sda1, presented by the Pocket.")
+@click.option("--source-id", default="pocket-1", show_default=True,
+              help="Source id to record uploads under in state.db.")
+@click.option("--mount-path", default="/run/retrosync/pocket-mount",
+              show_default=True,
+              help="Where to mount the Pocket SD.")
+@click.option("--skip-mount", is_flag=True,
+              help="Treat --mount-path as already-mounted (testing).")
+@click.pass_context
+def cmd_pocket_sync(ctx: click.Context, device: str, source_id: str,
+                    mount_path: str, skip_mount: bool) -> None:
+    """One-shot: mount the Pocket, run a sync, unmount.
+
+    Designed to be invoked by the udev-triggered systemd unit
+    `retrosync-pocket-sync@<dev>.service`. Can also be run by hand for
+    debugging.
+    """
+    cfg: Config = ctx.obj["config"]
+    # Lazy import: pocket sync requires sources/pocket.py + the runner; we
+    # don't want CLI startup to pull either in for non-pocket commands.
+    from .pocket.sync_runner import cli_pocket_sync
+    rc = cli_pocket_sync(device=device, source_id=source_id,
+                         mount_path=mount_path, config=cfg,
+                         skip_mount=skip_mount)
+    if rc != 0:
+        sys.exit(rc)
+
+
+# ---------------- conflicts ----------------
+
+@main.group("conflicts")
+def cmd_conflicts() -> None:
+    """List, inspect, and resolve sync conflicts."""
+
+
+@cmd_conflicts.command("list")
+@click.option("--all", "show_all", is_flag=True,
+              help="Include already-resolved conflicts.")
+@click.pass_context
+def cmd_conflicts_list(ctx: click.Context, show_all: bool) -> None:
+    cfg: Config = ctx.obj["config"]
+    state = StateStore(cfg.state.db_path)
+    rows = (conflicts_mod.list_all(state) if show_all
+            else conflicts_mod.list_open(state))
+    if not rows:
+        click.echo("(no conflicts)")
+        state.close()
+        return
+    for r in rows:
+        status = ("resolved=" + r.resolved_at) if r.resolved_at else "OPEN"
+        click.echo(
+            f"#{r.id:<4}  game={r.game_id:<24} system={r.system:<6} "
+            f"source={r.source_id:<14} "
+            f"cloud={hash8(r.cloud_hash)} device={hash8(r.device_hash)} "
+            f"detected={r.detected_at}  {status}")
+    state.close()
+
+
+@cmd_conflicts.command("show")
+@click.argument("conflict_id", type=int)
+@click.pass_context
+def cmd_conflicts_show(ctx: click.Context, conflict_id: int) -> None:
+    cfg: Config = ctx.obj["config"]
+    state = StateStore(cfg.state.db_path)
+    row = conflicts_mod.get(state, conflict_id)
+    if row is None:
+        click.echo(f"no such conflict: {conflict_id}", err=True)
+        state.close()
+        sys.exit(1)
+    click.echo(f"id            : {row.id}")
+    click.echo(f"game_id       : {row.game_id}")
+    click.echo(f"system        : {row.system}")
+    click.echo(f"source        : {row.source_id}")
+    click.echo(f"detected_at   : {row.detected_at}")
+    click.echo(f"base_hash     : {row.base_hash or '(none)'}")
+    click.echo(f"cloud_hash    : {row.cloud_hash}")
+    click.echo(f"  cloud_path  : {row.cloud_path or '(unknown)'}")
+    click.echo(f"device_hash   : {row.device_hash}")
+    click.echo(f"  conflict_path: {row.conflict_path or '(unknown)'}")
+    if row.resolved_at:
+        click.echo(f"resolved_at   : {row.resolved_at}")
+        click.echo(f"winner_hash   : {row.winner_hash}")
+    else:
+        click.echo("status        : OPEN")
+        click.echo("Resolve with:  retrosync conflicts resolve "
+                   f"{row.id} --winner {{cloud|device|<hash>}}")
+    state.close()
+
+
+@cmd_conflicts.command("resolve")
+@click.argument("conflict_id", type=int)
+@click.option("--winner", required=True,
+              help="One of: cloud, device, or a full version hash.")
+@click.pass_context
+def cmd_conflicts_resolve(ctx: click.Context, conflict_id: int,
+                          winner: str) -> None:
+    cfg: Config = ctx.obj["config"]
+    state = StateStore(cfg.state.db_path)
+    cloud = RcloneCloud(remote=cfg.cloud.rclone_remote,
+                        binary=cfg.cloud.rclone_binary,
+                        config_path=cfg.cloud.rclone_config_path)
+    try:
+        result = conflicts_mod.resolve(
+            state=state, cloud=cloud, conflict_id=conflict_id,
+            winner=winner, remote=cfg.cloud.rclone_remote,
+        )
+    except (ValueError, Exception) as exc:  # noqa: BLE001
+        click.echo(f"resolve failed: {exc}", err=True)
+        state.close()
+        sys.exit(1)
+    click.echo(f"resolved #{result.conflict_id}: winner_hash="
+               f"{hash8(result.winner_hash)}, current is now {result.new_current_path}")
+    state.close()
+
+
+# ---------------- sync-status ----------------
+
+@main.command("sync-status")
+@click.option("--source", "source_id",
+              help="Restrict to one source id.")
+@click.pass_context
+def cmd_sync_status(ctx: click.Context, source_id: str | None) -> None:
+    """Per-(source, game) last-sync summary from source_sync_state."""
+    cfg: Config = ctx.obj["config"]
+    state = StateStore(cfg.state.db_path)
+    sql = "SELECT * FROM source_sync_state"
+    args: tuple = ()
+    if source_id:
+        sql += " WHERE source_id=?"
+        args = (source_id,)
+    sql += " ORDER BY source_id, game_id"
+    rows = list(state._conn.execute(sql, args))
+    if not rows:
+        click.echo("(no sync state recorded yet)")
+        state.close()
+        return
+    for r in rows:
+        click.echo(
+            f"{r['source_id']:<14}  {r['game_id']:<28} "
+            f"last_synced_hash={hash8(r['last_synced_hash'])} "
+            f"at={r['last_synced_at']}")
+    state.close()
+
+
+@main.command("migrate-paths")
+@click.option("--system", default="snes", show_default=True,
+              help="System namespace to migrate.")
+@click.option("--dry-run", is_flag=True,
+              help="Print the plan without modifying cloud or state.db.")
+@click.pass_context
+def cmd_migrate_paths(ctx: click.Context, system: str, dry_run: bool) -> None:
+    """One-shot: collapse legacy `<crc32>_<slug>` and `unknown_<slug>`
+    cloud folders into the new canonical `<slug>` layout.
+
+    Idempotent: re-running on an already-migrated tree is a no-op.
+    """
+    from . import migrate as migrate_mod
+    cfg: Config = ctx.obj["config"]
+    state = StateStore(cfg.state.db_path)
+    cloud = RcloneCloud(remote=cfg.cloud.rclone_remote,
+                        binary=cfg.cloud.rclone_binary,
+                        config_path=cfg.cloud.rclone_config_path)
+    plan = migrate_mod.plan_migration(cloud=cloud, system=system)
+    if not plan:
+        click.echo(f"(nothing under {cfg.cloud.rclone_remote}/{system}/)")
+        state.close()
+        return
+    for p in plan:
+        click.echo(f"  {p.action:<6}  {p.legacy_id} → {p.canonical_id}")
+    if dry_run:
+        click.echo("(dry-run; no changes made)")
+        state.close()
+        return
+    counts = migrate_mod.apply_migration(cloud=cloud, plan=plan, state=state,
+                                         dry_run=False)
+    click.echo("done. summary: " +
+               ", ".join(f"{k}={v}" for k, v in counts.items()))
+    state.close()
 
 
 @main.command("dump-config")

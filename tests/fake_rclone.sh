@@ -106,7 +106,40 @@ case "${cmd}" in
     ;;
   delete)
     rel="$(strip_remote "$1")"
-    rm -f "${FAKE_RCLONE_ROOT}/${rel}" || true
+    rm -rf "${FAKE_RCLONE_ROOT}/${rel}" || true
+    ;;
+  rmdir)
+    rel="$(strip_remote "$1")"
+    rmdir "${FAKE_RCLONE_ROOT}/${rel}" 2>/dev/null || true
+    ;;
+  move)
+    rel_src="$(strip_remote "$1")"
+    rel_dst="$(strip_remote "$2")"
+    src="${FAKE_RCLONE_ROOT}/${rel_src}"
+    dst="${FAKE_RCLONE_ROOT}/${rel_dst}"
+    mkdir -p "${dst}"
+    if [[ -d "${src}" ]]; then
+      shopt -s dotglob nullglob
+      for entry in "${src}"/*; do
+        bn=$(basename "${entry}")
+        if [[ -d "${entry}" && -d "${dst}/${bn}" ]]; then
+          # Recurse: copy contents into existing dest dir.
+          mkdir -p "${dst}/${bn}"
+          mv "${entry}"/* "${dst}/${bn}/" 2>/dev/null || true
+          rmdir "${entry}" 2>/dev/null || true
+        else
+          mv "${entry}" "${dst}/" 2>/dev/null || true
+        fi
+      done
+    fi
+    ;;
+  moveto)
+    rel_src="$(strip_remote "$1")"
+    rel_dst="$(strip_remote "$2")"
+    src="${FAKE_RCLONE_ROOT}/${rel_src}"
+    dst="${FAKE_RCLONE_ROOT}/${rel_dst}"
+    mkdir -p "$(dirname "${dst}")"
+    mv "${src}" "${dst}"
     ;;
   *)
     echo "fake_rclone: unsupported subcommand '${cmd}'" >&2

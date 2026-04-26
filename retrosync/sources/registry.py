@@ -48,4 +48,9 @@ def _load_fxpak() -> None:
     from . import fxpak  # noqa: F401  (registers itself on import)
 
 
+def _load_pocket() -> None:
+    from . import pocket  # noqa: F401  (registers itself on import)
+
+
 register_lazy("fxpak", _load_fxpak)
+register_lazy("pocket", _load_pocket)

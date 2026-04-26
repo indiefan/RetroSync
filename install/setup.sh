@@ -219,6 +219,13 @@ if [[ "${1:-}" == "upgrade" ]]; then
   exec /usr/local/bin/retrosync-upgrade "$@"
 fi
 
+# pocket-sync needs root for mount/umount/udisksctl. Don't drop to the
+# retrosync user when the caller is already root (typical: systemd unit
+# or `sudo retrosync pocket-sync ...`).
+if [[ "${1:-}" == "pocket-sync" && "$(id -u)" == "0" ]]; then
+  exec "$TARGET" "$@"
+fi
+
 if [[ "$(id -un)" == "retrosync" ]]; then
   exec "$TARGET" "$@"
 fi
@@ -279,9 +286,28 @@ install_systemd_units() {
                   /etc/systemd/system/sni.service
   install -m 0644 "${RETROSYNC_DIR}/install/systemd/retrosync.service" \
                   /etc/systemd/system/retrosync.service
+  install -m 0644 "${RETROSYNC_DIR}/install/systemd/retrosync-pocket-sync@.service" \
+                  /etc/systemd/system/retrosync-pocket-sync@.service
   systemctl daemon-reload
   systemctl enable sni.service retrosync.service
   systemctl restart sni.service
+  # Templated pocket-sync units don't need to be enabled — they're
+  # triggered via udev's SYSTEMD_WANTS.
+}
+
+install_udev_rules() {
+  local src="${RETROSYNC_DIR}/install/udev/99-retrosync-pocket.rules"
+  local dst="/etc/udev/rules.d/99-retrosync-pocket.rules"
+  if grep -q "XXXX" "${src}"; then
+    warn "udev rule still has XXXX:YYYY placeholder vendor/product IDs."
+    warn "Plug in the Pocket (Tools → USB → Mount as USB Drive) and run:"
+    warn "    lsusb | grep -i analogue"
+    warn "Then edit ${dst} to replace XXXX:YYYY with the printed IDs."
+  fi
+  install -m 0644 "${src}" "${dst}"
+  udevadm control --reload || true
+  udevadm trigger || true
+  log "installed udev rule -> ${dst}"
 }
 
 # -------- step 8: rclone OAuth ------------------------------------------
@@ -373,6 +399,7 @@ main() {
   install_retrosync_app
   write_config
   install_systemd_units
+  install_udev_rules
   if [[ "${SKIP_RCLONE_CONFIG:-0}" != "1" ]]; then
     ensure_rclone_remote
   else
