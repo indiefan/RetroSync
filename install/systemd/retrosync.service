@@ -10,9 +10,12 @@ User=retrosync
 Group=retrosync
 Environment=RETROSYNC_CONFIG=/etc/retrosync/config.yaml
 # rclone's default config search path is ~/.config/rclone/rclone.conf, which
-# is hidden by ProtectHome=true even though we ReadWritePaths it back in.
-# Setting RCLONE_CONFIG explicitly bypasses the path search.
-Environment=RCLONE_CONFIG=/home/retrosync/.config/rclone/rclone.conf
+# is hidden by ProtectHome=true. Even adding /home/retrosync/.config/rclone
+# to ReadWritePaths doesn't make the parent directory traversable inside
+# the namespace systemd builds. We keep the rclone config under /var/lib
+# (already in the writable space) instead. Both the daemon and the CLI
+# read from this exact path; setup.sh writes the OAuth credentials there.
+Environment=RCLONE_CONFIG=/var/lib/retrosync/rclone.conf
 ExecStart=/opt/retrosync/.venv/bin/retrosyncd --config ${RETROSYNC_CONFIG}
 Restart=always
 RestartSec=5

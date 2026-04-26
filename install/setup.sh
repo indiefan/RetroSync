@@ -247,11 +247,22 @@ install_systemd_units() {
 # -------- step 8: rclone OAuth ------------------------------------------
 ensure_rclone_remote() {
   local remote_name="gdrive"
-  local conf="${RETROSYNC_HOME}/.config/rclone/rclone.conf"
+  local conf="${RETROSYNC_DATA}/rclone.conf"
+  local legacy_conf="${RETROSYNC_HOME}/.config/rclone/rclone.conf"
+
+  # Migrate from the old location (used by installs from before the
+  # /var/lib move). We keep the rclone config under /var/lib/retrosync
+  # because the daemon's ProtectHome=true masks /home from its namespace.
+  if [[ -f "${legacy_conf}" && ! -f "${conf}" ]]; then
+    log "migrating rclone config: ${legacy_conf} -> ${conf}"
+    install -o "${RETROSYNC_USER}" -g "${RETROSYNC_USER}" -m 0600 \
+      "${legacy_conf}" "${conf}"
+    rm -f "${legacy_conf}"
+  fi
 
   if sudo -u "${RETROSYNC_USER}" rclone --config "${conf}" \
        listremotes 2>/dev/null | grep -q "^${remote_name}:$"; then
-    log "rclone remote '${remote_name}' already configured"
+    log "rclone remote '${remote_name}' already configured at ${conf}"
     return
   fi
 
