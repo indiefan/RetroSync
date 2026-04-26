@@ -832,16 +832,25 @@ def cmd_deck_patch_srm(ctx: click.Context,
 
 @cmd_deck.command("detect-paths")
 @click.option("--system", default="snes", show_default=True)
+@click.option("--emudeck-root", default=None,
+              help="Override the auto-detected EmuDeck root. Use when "
+                   "your Emulation/ directory isn't in any of the "
+                   "default locations.")
 @click.pass_context
-def cmd_deck_detect_paths(ctx: click.Context, system: str) -> None:
+def cmd_deck_detect_paths(ctx: click.Context, system: str,
+                          emudeck_root: str | None) -> None:
     """Print the EmuDeck root, saves dir, and ROM dir we'd use.
 
     Useful for validating the install before running the daemon — if
     this prints sensible paths, the daemon will too."""
     from .deck import emudeck_paths
-    paths = emudeck_paths.detect_paths(system=system)
+    override = Path(emudeck_root) if emudeck_root else None
+    paths = emudeck_paths.detect_paths(system=system,
+                                       emudeck_root_override=override)
     if paths is None:
         click.echo("EmuDeck install not detected — checked:")
+        if override is not None:
+            click.echo(f"  {override} (--emudeck-root)")
         for p in emudeck_paths.EMUDECK_ROOT_CANDIDATES:
             click.echo(f"  {p}")
         sys.exit(1)
