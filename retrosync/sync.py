@@ -44,10 +44,16 @@ class SyncResult(str, Enum):
     DOWNLOADED = "downloaded"
     BOOTSTRAP_UPLOADED = "bootstrap_uploaded"
     BOOTSTRAP_DOWNLOADED = "bootstrap_downloaded"
-    CONFLICT = "conflict"
+    CONFLICT = "conflict"             # preserved unresolved (conflict_winner=preserve)
+    CONFLICT_RESOLVED = "conflict_resolved"   # auto-resolved on the spot
     SKIPPED = "skipped"
     DRIFTED = "drifted"          # source changed mid-upload; re-pended
     NO_DEVICE_DATA = "no_data"   # device has no save AND nothing to pull
+
+
+# conflict_winner values
+WINNER_DEVICE = "device"
+WINNER_PRESERVE = "preserve"
 
 
 @dataclass
@@ -65,6 +71,19 @@ class SyncConfig:
     cloud_to_device: bool = False
     """Whether the engine may overwrite a device's save with a newer cloud copy.
     Off by default; flip on after byte-compatibility verification (§10)."""
+
+    conflict_winner: str = WINNER_DEVICE
+    """How to handle divergence between the device and cloud.
+
+    - "device" (default): the device's bytes win automatically. They become a
+      new versions/* entry and the cloud's `current.<ext>`. The previous cloud
+      bytes stay in `versions/<previous-hash>.<ext>` (where they already
+      lived), so nothing is destroyed. A resolved conflict row is recorded
+      for forensics; recover the loser via `retrosync conflicts show <id>`.
+    - "preserve": don't auto-pick. Upload the device bytes to `conflicts/`,
+      leave cloud's current alone, and require an operator
+      `retrosync conflicts resolve` decision. Conservative, more work.
+    """
 
     inter_op_sleep_sec: float = 0.5
     """Pacing between cloud writes inside one engine pass — protects rclone's
@@ -214,12 +233,11 @@ async def sync_one_game(*, source: SaveSource, ref: SaveRef,
 
     # 4. Cloud and device disagree, no prior agreement → conflict.
     if h_last is None:
-        await _record_conflict(
+        return await _handle_divergence(
             source=source, ref=ref, data=data, h_dev=h_dev,
             h_cloud=h_cloud, base=None, paths=paths, game_id=game_id,
-            ctx=ctx)
-        return SyncOutcome(SyncResult.CONFLICT, game_id, ref.path, paths,
-                           "no prior agreement between source and cloud")
+            ctx=ctx, version_row=version_row,
+            detail="no prior agreement between source and cloud")
 
     # 5. Cloud unchanged since last sync, device advanced → upload.
     if h_last == h_cloud and h_dev != h_cloud:
@@ -248,12 +266,11 @@ async def sync_one_game(*, source: SaveSource, ref: SaveRef,
         return SyncOutcome(SyncResult.DOWNLOADED, game_id, ref.path, paths)
 
     # 7. Both moved since last sync → conflict.
-    await _record_conflict(
+    return await _handle_divergence(
         source=source, ref=ref, data=data, h_dev=h_dev,
         h_cloud=h_cloud, base=h_last, paths=paths, game_id=game_id,
-        ctx=ctx)
-    return SyncOutcome(SyncResult.CONFLICT, game_id, ref.path, paths,
-                       f"divergence from common base {hash8(h_last)}")
+        ctx=ctx, version_row=version_row,
+        detail=f"divergence from common base {hash8(h_last)}")
 
 
 # --------------------------------------------------------------------------
@@ -324,6 +341,83 @@ async def _pull_to_device(*, source: SaveSource, ref: SaveRef,
                                h=expected_hash)
     log.info("sync: pulled %s for %s → device %s",
              hash8(expected_hash), game_id, ref.path)
+
+
+async def _handle_divergence(*, source: SaveSource, ref: SaveRef,
+                             data: bytes, h_dev: str, h_cloud: str,
+                             base: str | None, paths: CloudPaths,
+                             game_id: str, ctx: SyncContext,
+                             version_row: VersionRow | None,
+                             detail: str) -> SyncOutcome:
+    """Branch on `conflict_winner`: either auto-resolve to the device, or
+    park the device bytes in `conflicts/` for a manual decision.
+
+    The cloud's previous bytes are *always* preserved — they're already in
+    `versions/<previous-hash>.<ext>` from when they were first uploaded —
+    so neither path is destructive.
+    """
+    if ctx.cfg.conflict_winner == WINNER_DEVICE:
+        return await _auto_resolve_device_wins(
+            source=source, ref=ref, data=data, h_dev=h_dev,
+            h_cloud=h_cloud, base=base, paths=paths, game_id=game_id,
+            ctx=ctx, version_row=version_row, detail=detail)
+    # WINNER_PRESERVE — leave open, require operator decision.
+    await _record_conflict(
+        source=source, ref=ref, data=data, h_dev=h_dev,
+        h_cloud=h_cloud, base=base, paths=paths, game_id=game_id, ctx=ctx)
+    return SyncOutcome(SyncResult.CONFLICT, game_id, ref.path, paths, detail)
+
+
+async def _auto_resolve_device_wins(*, source: SaveSource, ref: SaveRef,
+                                    data: bytes, h_dev: str, h_cloud: str,
+                                    base: str | None, paths: CloudPaths,
+                                    game_id: str, ctx: SyncContext,
+                                    version_row: VersionRow | None,
+                                    detail: str) -> SyncOutcome:
+    """Make the device's bytes the new current. Cloud's previous current
+    stays in `versions/` (where it already is); a resolved conflict row
+    records the divergence so the loser is discoverable later via
+    `retrosync conflicts show <id>`."""
+    cloud_version = _find_cloud_version_path(
+        ctx.manifest_for(paths), h_cloud)
+    await _upload_version_path(
+        source=source, ref=ref, data=data, h=h_dev,
+        paths=paths, game_id=game_id, ctx=ctx,
+        parent_hash=h_cloud, version_row=version_row,
+    )
+    # Only update THIS source's sync state. Other devices keep their
+    # pointers and will see a divergence next time they sync, which is the
+    # correct "be quiet, you're behind" behavior — see pocket-sync-design
+    # discussion of multi-device convergence.
+    ctx.state.set_sync_state(
+        source_id=source.id, game_id=game_id,
+        last_synced_hash=h_dev, device_seen_path=ref.path)
+    cid = ctx.state.insert_conflict(
+        game_id=game_id, system=source.system, source_id=source.id,
+        base_hash=base, cloud_hash=h_cloud, device_hash=h_dev,
+        cloud_path=cloud_version, conflict_path=None,
+    )
+    ctx.state.resolve_conflict(cid, winner_hash=h_dev)
+    # Close any pre-existing OPEN conflicts for this game — they represent
+    # divergences from earlier syncs (likely under conflict_winner=preserve)
+    # that this auto-resolve has now superseded. The bytes those rows point
+    # to (in conflicts/<...>.srm) stay in cloud, so nothing's lost; only
+    # the "needs operator attention" status changes.
+    superseded = ctx.state.open_conflicts_for_game(game_id)
+    for prior in superseded:
+        if prior.id == cid:
+            continue
+        ctx.state.resolve_conflict(prior.id, winner_hash=h_dev)
+        log.info("  closed prior OPEN conflict #%d (superseded by #%d)",
+                 prior.id, cid)
+    ctx.invalidate_manifest(paths)
+    log.info(
+        "auto-resolved divergence #%d for %s on %s: device wins (%s); "
+        "previous cloud bytes (%s) preserved at %s",
+        cid, game_id, source.id, hash8(h_dev), hash8(h_cloud),
+        cloud_version or "(no versions/ entry — manifest pre-v2)")
+    return SyncOutcome(SyncResult.CONFLICT_RESOLVED, game_id, ref.path,
+                       paths, detail)
 
 
 async def _record_conflict(*, source: SaveSource, ref: SaveRef,

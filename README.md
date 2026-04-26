@@ -136,9 +136,15 @@ retrosync pull <cloud-path-from-show> /tmp/restored.srm
 retrosync push fxpak-pro-1 /Mario.srm /tmp/restored.srm --confirm
 
 # Conflicts (when bidirectional sync sees both sides change):
-retrosync conflicts list
+retrosync conflicts list                  # open conflicts only
+retrosync conflicts list --all            # incl. resolved (auto + manual)
 retrosync conflicts show <id>
 retrosync conflicts resolve <id> --winner {cloud | device | <hash>}
+
+# By default `conflict_winner: device` in config.yaml — divergences are
+# auto-resolved by promoting the device's bytes; the previous cloud
+# bytes stay in versions/ for recovery. Set `conflict_winner: preserve`
+# to require manual resolve instead.
 
 # Pocket sync (normally fired by udev; manual override):
 sudo retrosync pocket-sync --device /dev/sda1

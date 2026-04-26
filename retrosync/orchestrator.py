@@ -224,7 +224,8 @@ class BackupOrchestrator:
                                   SyncResult.BOOTSTRAP_UPLOADED,
                                   SyncResult.DOWNLOADED,
                                   SyncResult.BOOTSTRAP_DOWNLOADED,
-                                  SyncResult.CONFLICT):
+                                  SyncResult.CONFLICT,
+                                  SyncResult.CONFLICT_RESOLVED):
             return
         key = f"{outcome.game_id}::{outcome.save_path}"
         refresh_targets[key] = (outcome.game_id, outcome.save_path,
@@ -301,7 +302,8 @@ async def run_all(config: Config) -> None:
     cloud = RcloneCloud(remote=config.cloud.rclone_remote,
                         binary=config.cloud.rclone_binary,
                         config_path=config.cloud.rclone_config_path)
-    sync_cfg = SyncConfig(cloud_to_device=config.cloud_to_device)
+    sync_cfg = SyncConfig(cloud_to_device=config.cloud_to_device,
+                          conflict_winner=config.conflict_winner)
     deps = OrchestratorDeps(state=state, cloud=cloud,
                             cfg=config.orchestrator,
                             sync_cfg=sync_cfg)

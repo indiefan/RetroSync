@@ -132,9 +132,9 @@ async def test_cloud_to_device_pull() -> bool:
     return ok
 
 
-async def test_conflict_no_prior_agreement() -> bool:
-    """Cloud has X; device has Y; no source_sync_state for this device.
-    → CONFLICT."""
+async def test_conflict_no_prior_agreement_preserve() -> bool:
+    """conflict_winner='preserve': cloud has X; device has Y; no
+    source_sync_state for this device → CONFLICT (left open)."""
     _, state, cloud = _setup()
     # Pre-populate cloud with a different device's save.
     fx2_files = {"/Mario.srm": b"abc" * 100}
@@ -142,7 +142,8 @@ async def test_conflict_no_prior_agreement() -> bool:
     state.upsert_source(id=fx2.id, system=fx2.system,
                         adapter="MockFXPakSource", config_json="{}")
     ctx = SyncContext(state=state, cloud=cloud,
-                      cfg=SyncConfig(cloud_to_device=True))
+                      cfg=SyncConfig(cloud_to_device=True,
+                                     conflict_winner="preserve"))
     out_setup = await sync_one_game(source=fx2,
                                     ref=SaveRef(path="/Mario.srm"), ctx=ctx)
     refresh_manifest(source=fx2, save_path="/Mario.srm",
@@ -161,9 +162,58 @@ async def test_conflict_no_prior_agreement() -> bool:
     state.close()
 
     ok = _check(out.result, SyncResult.CONFLICT,
-                "diverging device + no prior agreement → CONFLICT")
+                "diverging device + preserve → CONFLICT (open)")
     ok &= _check(len(open_conflicts), 1,
                  "one open conflict in DB")
+    return ok
+
+
+async def test_conflict_device_wins_default() -> bool:
+    """Default conflict_winner='device': diverging device bytes auto-win,
+    become the new current. Cloud's previous bytes survive in versions/.
+    A resolved conflict row is recorded for forensics."""
+    _, state, cloud = _setup()
+    # Set up cloud with one device's bytes.
+    fx2_files = {"/Mario.srm": b"abc" * 100}
+    fx2 = MockFXPakSource(id="fx2", files=fx2_files)
+    state.upsert_source(id=fx2.id, system=fx2.system,
+                        adapter="MockFXPakSource", config_json="{}")
+    ctx = SyncContext(state=state, cloud=cloud,
+                      cfg=SyncConfig(cloud_to_device=True))
+    out_setup = await sync_one_game(source=fx2,
+                                    ref=SaveRef(path="/Mario.srm"), ctx=ctx)
+    refresh_manifest(source=fx2, save_path="/Mario.srm",
+                     game_id=out_setup.game_id, paths=out_setup.paths, ctx=ctx)
+    cloud_loser_path = out_setup.paths.current
+    cloud_loser_bytes = cloud.download_bytes(src=cloud_loser_path)
+    h_loser = sha256_bytes(cloud_loser_bytes)
+
+    # New device with diverging bytes, never synced before.
+    fx_files = {"/Mario.srm": b"xyz" * 100}
+    fx = MockFXPakSource(id="fx-new", files=fx_files)
+    state.upsert_source(id=fx.id, system=fx.system,
+                        adapter="MockFXPakSource", config_json="{}")
+    ctx.invalidate_manifest(out_setup.paths)
+    out = await sync_one_game(source=fx, ref=SaveRef(path="/Mario.srm"),
+                              ctx=ctx)
+
+    new_current = cloud.download_bytes(src=out.paths.current)
+    open_conflicts = state.list_conflicts(open_only=True)
+    all_conflicts = state.list_conflicts(open_only=False)
+    fx2_state = state.get_sync_state(fx2.id, out.game_id)
+    state.close()
+
+    ok = _check(out.result, SyncResult.CONFLICT_RESOLVED,
+                "diverging device + default → CONFLICT_RESOLVED")
+    ok &= _check(new_current, b"xyz" * 100,
+                 "new current is the device's bytes")
+    ok &= _check(sha256_bytes(cloud_loser_bytes), h_loser,
+                 "previous cloud bytes still readable from versions/")
+    ok &= _check(len(open_conflicts), 0, "no OPEN conflicts (auto-resolved)")
+    ok &= _check(len(all_conflicts), 1,
+                 "but the conflict row exists for forensics")
+    ok &= _check(fx2_state.last_synced_hash if fx2_state else None,
+                 h_loser, "fx2's sync state is unchanged (no ping-pong)")
     return ok
 
 
@@ -216,7 +266,8 @@ async def test_cloud_to_device_off_skips_pull() -> bool:
 
 async def test_resolve_conflict_to_device() -> bool:
     """Open a conflict, resolve --winner device, verify cloud current
-    becomes the device bytes and the conflict is marked resolved."""
+    becomes the device bytes and the conflict is marked resolved.
+    (Uses preserve mode so we have an open conflict to resolve.)"""
     from retrosync import conflicts as cmod
     _, state, cloud = _setup()
 
@@ -226,7 +277,8 @@ async def test_resolve_conflict_to_device() -> bool:
     state.upsert_source(id=fx2.id, system=fx2.system,
                         adapter="MockFXPakSource", config_json="{}")
     ctx = SyncContext(state=state, cloud=cloud,
-                      cfg=SyncConfig(cloud_to_device=True))
+                      cfg=SyncConfig(cloud_to_device=True,
+                                     conflict_winner="preserve"))
     out_setup = await sync_one_game(source=fx2,
                                     ref=SaveRef(path="/Mario.srm"), ctx=ctx)
     refresh_manifest(source=fx2, save_path="/Mario.srm",
@@ -271,7 +323,10 @@ def main() -> int:
         ("test_bootstrap_upload", test_bootstrap_upload),
         ("test_in_sync", test_in_sync),
         ("test_cloud_to_device_pull", test_cloud_to_device_pull),
-        ("test_conflict_no_prior_agreement", test_conflict_no_prior_agreement),
+        ("test_conflict_no_prior_agreement_preserve",
+         test_conflict_no_prior_agreement_preserve),
+        ("test_conflict_device_wins_default",
+         test_conflict_device_wins_default),
         ("test_cloud_to_device_off_skips_pull",
          test_cloud_to_device_off_skips_pull),
         ("test_resolve_conflict_to_device", test_resolve_conflict_to_device),
