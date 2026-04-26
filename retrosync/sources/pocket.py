@@ -45,8 +45,13 @@ class PocketConfig:
 class PocketSource:
     """SaveSource over a mounted Pocket SD filesystem.
 
-    Public attributes `id` and `system` per the SaveSource protocol.
+    Public attributes `id`, `system`, `device_kind` per the SaveSource
+    protocol. `device_kind = "pocket"` keeps Pocket-authored versions
+    visually grouped under `versions/pocket/...` regardless of which
+    core (snes, nes, ...) they came from.
     """
+
+    device_kind = "pocket"
 
     def __init__(self, config: PocketConfig):
         self._cfg = config

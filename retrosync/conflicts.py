@@ -158,25 +158,42 @@ def _compose_paths_for(state: StateStore, row: ConflictRow, *,
 
 def _find_paths_by_hash(*, cloud: RcloneCloud, paths: CloudPaths,
                         h: str) -> list[str]:
-    """Scan the canonical game folder's versions/ and conflicts/ subdirs
+    """Scan the canonical game folder's versions/ and conflicts/ trees
     for files whose name encodes <hash8>. Returns matching cloud paths.
 
     Used as a fallback when the conflict row's stored cloud_path is
     stale (e.g. after `migrate-paths` moved the cloud folder out from
     under it). Filenames embed only the first 8 hex chars of the hash,
     so the caller still needs to verify the full hash by downloading.
+
+    Recurses one level into device-kind subfolders (`versions/snes/`,
+    `versions/pocket/`) introduced for at-a-glance browsing — older
+    unprefixed paths still match.
     """
     h8 = hash8(h)
     out: list[str] = []
     for sub in ("versions", "conflicts"):
+        root = f"{paths.base}/{sub}"
         try:
-            entries = cloud.lsjson(f"{paths.base}/{sub}")
+            entries = cloud.lsjson(root)
         except CloudError:
             continue
         for e in entries:
             name = e.get("Name", "")
             if e.get("IsDir"):
+                # Recurse one level into device-kind subfolders.
+                child_root = f"{root}/{name}"
+                try:
+                    children = cloud.lsjson(child_root)
+                except CloudError:
+                    continue
+                for c in children:
+                    cname = c.get("Name", "")
+                    if c.get("IsDir"):
+                        continue
+                    if h8 in cname:
+                        out.append(f"{child_root}/{cname}")
                 continue
             if h8 in name:
-                out.append(f"{paths.base}/{sub}/{name}")
+                out.append(f"{root}/{name}")
     return out

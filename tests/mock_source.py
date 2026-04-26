@@ -16,6 +16,7 @@ class MockFXPakSource:
     """Behaves like FXPakSource but pulls bytes from a python dict."""
 
     system = "snes"
+    device_kind = "snes"
 
     def __init__(self, *, id: str, files: dict[str, bytes],
                  save_extension: str = ".srm",

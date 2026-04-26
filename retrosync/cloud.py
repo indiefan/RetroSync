@@ -49,19 +49,34 @@ class CloudPaths:
     current: str            # base + '/current.srm'
     manifest: str           # base + '/manifest.json'
 
-    def version(self, ts_iso: str, hash8: str, ext: str) -> str:
+    def version(self, ts_iso: str, hash8: str, ext: str,
+                device_kind: str | None = None) -> str:
+        """Return the cloud path for a versions/ entry. When device_kind
+        is given, files are organized under a per-device subfolder
+        (e.g. versions/snes/, versions/pocket/) for at-a-glance browsing.
+        Layout is purely cosmetic — the engine resolves saves by hash,
+        not by path."""
         # Drive-safe timestamp: ':' → '-'. Z is already safe.
         safe_ts = ts_iso.replace(":", "-")
-        return f"{self.base}/versions/{safe_ts}--{hash8}{ext}"
+        sub = f"{_safe_dirname(device_kind)}/" if device_kind else ""
+        return f"{self.base}/versions/{sub}{safe_ts}--{hash8}{ext}"
 
     def conflict(self, ts_iso: str, hash8: str, ext: str,
-                 source_id: str) -> str:
+                 source_id: str,
+                 device_kind: str | None = None) -> str:
         safe_ts = ts_iso.replace(":", "-")
         # source-id may contain anything; sanitize for path safety.
         safe_src = "".join(
             ch if ch.isalnum() or ch in "-_." else "-" for ch in source_id)
-        return (f"{self.base}/conflicts/"
+        sub = f"{_safe_dirname(device_kind)}/" if device_kind else ""
+        return (f"{self.base}/conflicts/{sub}"
                 f"{safe_ts}--{hash8}--from-{safe_src}{ext}")
+
+
+def _safe_dirname(name: str) -> str:
+    """Strip slashes / weird characters so a device_kind can't break out
+    of the versions/ subfolder."""
+    return "".join(c if c.isalnum() or c in "-_." else "-" for c in name)
 
 
 def hash8(full_hash: str) -> str:
@@ -327,8 +342,14 @@ class RcloneCloud:
     # ----------- high-level upload -----------
 
     def upload_version(self, *, paths: CloudPaths, save_data: bytes,
-                       full_hash: str, observed_at: str) -> str:
-        """Write versions/<ts>--<hash8>.<ext> and return its cloud path.
+                       full_hash: str, observed_at: str,
+                       device_kind: str | None = None) -> str:
+        """Write versions/<sub>/<ts>--<hash8>.<ext> and return its cloud path.
+
+        `device_kind`, when given, becomes a subfolder under versions/
+        (e.g. "snes", "pocket") so an operator can `rclone lsf` and tell
+        at a glance which device authored each version. The engine only
+        resolves saves by hash; layout is purely cosmetic.
 
         Idempotent: if the version path already exists with the same size,
         we trust it. Hash comparison would require a download.
@@ -339,7 +360,8 @@ class RcloneCloud:
         # `observed_at` is when the daemon first saw this hash, which may be
         # slightly earlier; using upload time keeps timestamps strictly
         # monotonic in the cloud listing.
-        version_path = paths.version(utc_iso(), hash8(full_hash), ext)
+        version_path = paths.version(utc_iso(), hash8(full_hash), ext,
+                                     device_kind=device_kind)
         if self.exists(version_path):
             log.debug("version already in cloud: %s", version_path)
             return version_path

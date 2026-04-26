@@ -45,10 +45,13 @@ class FXPakConfig:
 class FXPakSource:
     """SaveSource implementation for the FXPak Pro flash cart.
 
-    `id` and `system` are public attributes per the SaveSource protocol.
+    `id`, `system`, and `device_kind` are public attributes per the
+    SaveSource protocol. `device_kind = "snes"` so versions land under
+    `versions/snes/` for at-a-glance cloud-browse identification.
     """
 
     system = "snes"
+    device_kind = "snes"
 
     def __init__(self, config: FXPakConfig):
         self._cfg = config
