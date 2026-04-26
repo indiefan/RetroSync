@@ -342,14 +342,70 @@ EOF
 
 # -------- step 8: SRM patch --------------------------------------------------
 patch_srm() {
+  # Skip cleanly when SRM hasn't been used (low-integration setups
+  # using EmulationStation / ES-DE etc.). The patcher itself errors
+  # if userConfigurations.json is missing; check first to keep the
+  # log quiet for those operators.
+  local srm_cfg="${HOME}/.config/steam-rom-manager/userData/userConfigurations.json"
+  if [[ ! -f "${srm_cfg}" ]]; then
+    log "Steam ROM Manager not configured (${srm_cfg} missing); skipping."
+    log "  This is fine if you launch games via EmulationStation / ES-DE"
+    log "  — the ES-DE hooks (next step) cover the same pre-launch path."
+    return 0
+  fi
   log "patching Steam ROM Manager parser configs"
   if "${USER_BIN}/retrosync" --config "${ETC_DIR}/config.yaml" \
         deck patch-srm; then
     log "SRM parsers patched."
   else
-    warn "SRM patch failed (config not found?). Open Steam ROM Manager"
-    warn "via EmuDeck → Tools at least once so the config is created,"
-    warn "then re-run: retrosync deck patch-srm"
+    warn "SRM patch failed unexpectedly; re-run with: retrosync deck patch-srm"
+  fi
+}
+
+# -------- step 8b: ES-DE pre/post hooks --------------------------------------
+install_es_de_hooks() {
+  # ES-DE custom event scripts let us run arbitrary commands before
+  # game launch and after game exit — same role as the SRM wrapper
+  # but for low-integration setups. Idempotent: scripts are owned by
+  # us (`00-retrosync-*.sh`), safe to overwrite.
+  local es_root="${HOME}/.emulationstation"
+  if [[ ! -d "${es_root}" ]]; then
+    log "EmulationStation not detected at ${es_root}; skipping ES-DE hooks."
+    log "  (Re-run setup-deck.sh after first ES-DE launch to install them.)"
+    return 0
+  fi
+  log "installing ES-DE pre/post hooks"
+  local start_dir="${es_root}/scripts/game-start"
+  local end_dir="${es_root}/scripts/game-end"
+  mkdir -p "${start_dir}" "${end_dir}"
+  install -m 0755 "${RETROSYNC_DIR}/install/scripts/es-de-game-start.sh" \
+                  "${start_dir}/00-retrosync-pre.sh"
+  install -m 0755 "${RETROSYNC_DIR}/install/scripts/es-de-game-end.sh" \
+                  "${end_dir}/00-retrosync-post.sh"
+  log "  -> ${start_dir}/00-retrosync-pre.sh"
+  log "  -> ${end_dir}/00-retrosync-post.sh"
+  # Detect whether custom-event-scripts is enabled in es_settings.xml.
+  # We don't toggle it ourselves (XML editing is fiddly and the
+  # operator may have unrelated tweaks in the file); just print what
+  # to do.
+  local settings="${es_root}/es_settings.xml"
+  if [[ -f "${settings}" ]] && grep -q 'CustomEventScripts.*"true"' "${settings}"; then
+    log "  (custom event scripts already enabled in ES-DE settings)"
+  else
+    cat <<EOF
+
+  ----------------------------------------------------------------
+  NEXT STEP for ES-DE: enable custom event scripts so the hooks
+  actually fire. In ES-DE:
+
+      Main Menu  →  Other Settings  →  Enable custom event scripts
+      → ON
+
+  After that, every game you launch via ES-DE will sync via
+  RetroSync automatically.
+  ----------------------------------------------------------------
+
+EOF
   fi
 }
 
@@ -369,6 +425,7 @@ main() {
     warn "SKIP_RCLONE_CONFIG=1 — skipping OAuth setup"
   fi
   patch_srm
+  install_es_de_hooks
   cat <<EOF
 
 ================================================================
