@@ -9,6 +9,10 @@ Type=simple
 User=retrosync
 Group=retrosync
 Environment=RETROSYNC_CONFIG=/etc/retrosync/config.yaml
+# rclone's default config search path is ~/.config/rclone/rclone.conf, which
+# is hidden by ProtectHome=true even though we ReadWritePaths it back in.
+# Setting RCLONE_CONFIG explicitly bypasses the path search.
+Environment=RCLONE_CONFIG=/home/retrosync/.config/rclone/rclone.conf
 ExecStart=/opt/retrosync/.venv/bin/retrosyncd --config ${RETROSYNC_CONFIG}
 Restart=always
 RestartSec=5
