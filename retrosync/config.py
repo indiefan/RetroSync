@@ -28,6 +28,11 @@ DEFAULT_CONFIG_PATH = "/etc/retrosync/config.yaml"
 class CloudConfig:
     rclone_remote: str = "gdrive:retro-saves"
     rclone_binary: str = "rclone"
+    # Explicit path to rclone's config file. Lives under /var/lib (not
+    # /home) so the daemon's ProtectHome=true doesn't mask it. Both the
+    # daemon and the CLI use this exact path so they always agree on
+    # which credentials to use.
+    rclone_config_path: str = "/var/lib/retrosync/rclone.conf"
     # Per-game retention behavior; the v1 daemon only reads the default.
     # M4 will introduce per-game overrides via this map.
     retention_default: str = "keep"  # keep|prune|archive
@@ -94,6 +99,9 @@ cloud:
   # An rclone remote name. Set up via `rclone config` (the installer does
   # this for you). Path after the colon is the root folder in Drive.
   rclone_remote: "gdrive:retro-saves"
+  # rclone's config file. Default is under /var/lib so the daemon's
+  # ProtectHome=true doesn't mask it. Change only if you've moved it.
+  rclone_config_path: "/var/lib/retrosync/rclone.conf"
 
 orchestrator:
   poll_interval_sec: 30

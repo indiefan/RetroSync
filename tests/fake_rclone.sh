@@ -15,20 +15,30 @@ set -euo pipefail
 : "${FAKE_RCLONE_ROOT:=/tmp/retrosync-fake-cloud}"
 mkdir -p "${FAKE_RCLONE_ROOT}"
 
+# Skip leading global flags (RetroSync now invokes rclone with --config
+# and the retry/timeout flags before the subcommand).
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --config|--retries|--low-level-retries|--timeout|--transfers)
+      shift; shift || true ;;
+    --*)
+      shift ;;
+    *)
+      break ;;
+  esac
+done
+
 cmd="${1:-}"
 shift || true
 
-# Drop trailing rclone flags we don't care about (--retries, --timeout, etc).
+# Drop any remaining flags scattered after the subcommand.
 declare -a positional=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --config|--retries|--low-level-retries|--timeout|--transfers)
+      shift; shift || true ;;
     --*)
-      # Skip flag and its value if it's the kind that takes one.
-      case "$1" in
-        --retries|--low-level-retries|--timeout|--config|--transfers)
-          shift; shift || true ;;
-        *) shift ;;
-      esac ;;
+      shift ;;
     *) positional+=("$1"); shift ;;
   esac
 done

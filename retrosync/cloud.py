@@ -120,9 +120,14 @@ class RcloneCloud:
     """Wraps the rclone CLI. We deliberately shell out rather than use the
     Python rclone bindings — the binary's behavior, retry logic, and config
     are battle-tested, and shelling out keeps the surface area tiny.
+
+    `config_path` is passed via --config to every rclone invocation so the
+    daemon and the CLI always agree on which credentials to use, regardless
+    of HOME, RCLONE_CONFIG env var, or systemd namespace restrictions.
     """
 
     def __init__(self, *, remote: str, binary: str = "rclone",
+                 config_path: str | None = None,
                  extra_args: tuple[str, ...] = ("--retries", "3",
                                                 "--low-level-retries", "5",
                                                 "--timeout", "60s")):
@@ -131,7 +136,13 @@ class RcloneCloud:
                 f"remote must be 'remote-name:path', got {remote!r}")
         self._remote = remote
         self._binary = binary
-        self._extra = tuple(extra_args)
+        self._config_path = config_path
+        # Build the args once; --config goes first so it's clear in process
+        # listings.
+        prefix: tuple[str, ...] = ()
+        if config_path:
+            prefix = ("--config", config_path)
+        self._extra = prefix + tuple(extra_args)
 
     @property
     def remote(self) -> str:
@@ -141,7 +152,9 @@ class RcloneCloud:
 
     def _run(self, *args: str, stdin: bytes | None = None,
              capture: bool = False, check: bool = True) -> subprocess.CompletedProcess:
-        cmd = [self._binary, *args, *self._extra]
+        # Global flags (--config, --retries, --timeout) before the subcommand;
+        # rclone accepts them either side but this is the conventional order.
+        cmd = [self._binary, *self._extra, *args]
         log.debug("rclone: %s", " ".join(cmd))
         try:
             proc = subprocess.run(

@@ -163,12 +163,44 @@ class BackupOrchestrator:
             log.info("promoted version %d to READY", r["id"])
 
     async def _drain_ready(self) -> None:
-        for v in list(self._deps.state.ready_versions()):
-            if v.source_id != self._source.id:
-                continue
-            await self._upload_version(v)
+        # Track which (game_id, save_path) tuples need a manifest refresh.
+        # The original design wrote the manifest after every version upload,
+        # which on a first-sync of N saves caused 2N rclone calls in a few
+        # seconds and tripped Drive's per-project rate limiter (the default
+        # rclone OAuth client is shared across all rclone users globally).
+        # Now we upload all version files first and refresh each affected
+        # game's manifest exactly once at the end of the pass.
+        manifests_to_refresh: dict[str, dict] = {}
+        ready = [v for v in self._deps.state.ready_versions()
+                 if v.source_id == self._source.id]
+        for i, v in enumerate(ready):
+            refreshed = await self._upload_version(v)
+            if refreshed is not None:
+                key = f"{refreshed['game_id']}::{refreshed['save_path']}"
+                manifests_to_refresh[key] = refreshed
+            # Inter-upload pacing — small sleep between rclone invocations
+            # to spread API calls across the per-minute rate-limit window.
+            if i + 1 < len(ready):
+                await asyncio.sleep(0.5)
 
-    async def _upload_version(self, v: VersionRow) -> None:
+        for entry in manifests_to_refresh.values():
+            try:
+                self._refresh_manifest(
+                    paths=entry["paths"],
+                    source_id=self._source.id,
+                    system=self._source.system,
+                    game_id=entry["game_id"],
+                    save_path=entry["save_path"],
+                )
+            except CloudError as exc:
+                log.warning("manifest refresh failed for %s; next pass "
+                            "will retry: %s", entry["save_path"], exc)
+
+    async def _upload_version(self, v: VersionRow) -> dict | None:
+        """Upload one version's data + current.<ext>. Returns a dict the
+        caller can use to refresh the manifest for this game once the whole
+        ready batch has finished, or None if no upload happened.
+        """
         # Re-read the current bytes from source so we upload the actual hash.
         # The save may have changed again since we promoted; if so, the
         # post-upload hash check will catch it and we'll re-poll.
@@ -177,7 +209,7 @@ class BackupOrchestrator:
             data = await self._source.read_save(ref)
         except SourceError as exc:
             log.warning("re-read failed for upload of %s: %s", v.path, exc)
-            return
+            return None
         h = sha256_bytes(data)
         if h != v.hash:
             log.info("source changed under us during upload of %s "
@@ -191,7 +223,7 @@ class BackupOrchestrator:
             self._deps.state.set_current_hash(
                 source_id=self._source.id, path=v.path, h=h)
             self._deps.state.bump_debounce(new_id)
-            return
+            return None
 
         game_id = await self._resolve_game_id(ref)
         save_filename = v.path.rsplit("/", 1)[-1]
@@ -206,23 +238,18 @@ class BackupOrchestrator:
                 full_hash=h, observed_at=v.observed_at,
             )
             self._deps.cloud.overwrite_current(paths=paths, save_data=data)
-            # Mark the row uploaded BEFORE writing the manifest so the
-            # rebuilt manifest includes this version. If the manifest write
-            # itself fails, the version is still safely recorded; the next
-            # pass will rebuild the manifest from SQLite.
+            # Mark the row uploaded BEFORE the manifest is rebuilt so that
+            # the rebuild includes this version. The manifest itself is
+            # written by _drain_ready after the whole ready batch finishes.
             self._deps.state.mark_uploaded(v.id, cloud_path=cloud_version_path)
-            try:
-                self._refresh_manifest(paths=paths, source_id=self._source.id,
-                                       system=self._source.system,
-                                       game_id=game_id, save_path=v.path)
-            except CloudError as exc:
-                log.warning("manifest refresh failed for %s; next pass "
-                            "will retry: %s", v.path, exc)
             log.info("uploaded %s → %s (%d bytes)",
                      v.path, cloud_version_path, v.size_bytes)
+            return {"paths": paths, "game_id": game_id, "save_path": v.path}
         except CloudError as exc:
             log.warning("upload failed for v%d (%s); will retry next pass: %s",
                         v.id, v.path, exc)
+            self._deps.state.revert_to_ready(v.id)
+            return None
             self._deps.state.revert_to_ready(v.id)
 
     def _refresh_manifest(self, *, paths, source_id, system, game_id, save_path):
@@ -283,7 +310,8 @@ def build_sources(sources: list[SourceConfig]) -> list[SaveSource]:
 async def run_all(config: Config) -> None:
     state = StateStore(config.state.db_path)
     cloud = RcloneCloud(remote=config.cloud.rclone_remote,
-                        binary=config.cloud.rclone_binary)
+                        binary=config.cloud.rclone_binary,
+                        config_path=config.cloud.rclone_config_path)
     deps = OrchestratorDeps(state=state, cloud=cloud,
                             cfg=config.orchestrator)
     sources = build_sources(config.sources)

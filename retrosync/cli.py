@@ -124,7 +124,8 @@ def cmd_pull(ctx: click.Context, cloud_path: str, local_path: str) -> None:
     """
     cfg: Config = ctx.obj["config"]
     cloud = RcloneCloud(remote=cfg.cloud.rclone_remote,
-                        binary=cfg.cloud.rclone_binary)
+                        binary=cfg.cloud.rclone_binary,
+                        config_path=cfg.cloud.rclone_config_path)
     data = cloud.download_bytes(src=cloud_path)
     Path(local_path).write_bytes(data)
     click.echo(f"wrote {len(data)} bytes to {local_path} "
@@ -203,7 +204,8 @@ def cmd_test_cloud(ctx: click.Context) -> None:
     """Verify rclone can reach the configured remote."""
     cfg: Config = ctx.obj["config"]
     cloud = RcloneCloud(remote=cfg.cloud.rclone_remote,
-                        binary=cfg.cloud.rclone_binary)
+                        binary=cfg.cloud.rclone_binary,
+                        config_path=cfg.cloud.rclone_config_path)
     if cloud.reachable():
         click.echo(f"OK - {cfg.cloud.rclone_remote} is reachable")
     else:
