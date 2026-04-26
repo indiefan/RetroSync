@@ -52,6 +52,14 @@ class OrchestratorConfig:
     # cheap (a websocket connect attempt) so the extra polling is
     # negligible while disconnected.
     unhealthy_recheck_sec: int = 2
+    # InotifyOrchestrator (Deck-side) periodic re-scan interval. The
+    # inotify watcher only fires on local file changes; cross-device
+    # promotes / uploads to cloud's current.<ext> are invisible to it
+    # until the local file is touched. The periodic re-scan is the
+    # safety net: every N seconds, walk the saves dir and run
+    # sync_one_game on each, which detects cloud-newer state via the
+    # manifest read. Set to 0 to disable.
+    inotify_rescan_sec: int = 60
 
 
 @dataclass

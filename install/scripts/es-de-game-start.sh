@@ -51,6 +51,19 @@ if [[ -z "${ROM_PATH}" ]]; then
 fi
 echo "$(ts) [pre] launching with ROM=${ROM_PATH}" >> "${LOG}"
 
+# ES-DE on some setups passes the ROM path with shell-style backslash
+# escapes baked into the argument value (e.g. "Final\ Fantasy" instead
+# of "Final Fantasy"). If the literal path doesn't exist on disk, try
+# a stripped version. SNES / console ROM filenames don't legitimately
+# contain backslashes, so it's safe to drop them all.
+if [[ ! -f "${ROM_PATH}" ]]; then
+  STRIPPED="${ROM_PATH//\\/}"
+  if [[ -f "${STRIPPED}" ]]; then
+    echo "$(ts) [pre] unescaped ROM_PATH → ${STRIPPED}" >> "${LOG}"
+    ROM_PATH="${STRIPPED}"
+  fi
+fi
+
 SYSTEM_GAME="$("${RETROSYNC_BIN}" wrap-derive-game-id "${ROM_PATH}" \
                 2>>"${LOG}" | head -n1 || true)"
 if [[ -z "${SYSTEM_GAME}" ]]; then

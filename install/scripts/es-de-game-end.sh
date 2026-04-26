@@ -36,6 +36,16 @@ if [[ -z "${ROM_PATH}" ]]; then
 fi
 echo "$(ts) [post] exit with ROM=${ROM_PATH}" >> "${LOG}"
 
+# Match the de-escape logic in game-start. ES-DE on some setups
+# bakes shell escapes into $1.
+if [[ ! -f "${ROM_PATH}" ]]; then
+  STRIPPED="${ROM_PATH//\\/}"
+  if [[ -f "${STRIPPED}" ]]; then
+    echo "$(ts) [post] unescaped ROM_PATH → ${STRIPPED}" >> "${LOG}"
+    ROM_PATH="${STRIPPED}"
+  fi
+fi
+
 SYSTEM_GAME="$("${RETROSYNC_BIN}" wrap-derive-game-id "${ROM_PATH}" \
                 2>>"${LOG}" | head -n1 || true)"
 if [[ -z "${SYSTEM_GAME}" ]]; then

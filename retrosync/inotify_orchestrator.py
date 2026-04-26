@@ -12,6 +12,13 @@ Lifecycle:
   2. Register the saves dir with InotifyWatcher.
   3. Wait forever; on each debounced event, sync_one_game for the
      matching game.
+  4. In parallel: a periodic re-scan timer (default every 60s) does
+     a full pass like step 1. This is the safety net for cross-device
+     handoff: if another device promotes / uploads a new current and
+     `wrap-pre` doesn't fire (custom event scripts disabled, hooks
+     not installed, ROM launched outside ES-DE, etc.), the Deck still
+     pulls the cloud-newer save within ~poll_seconds rather than
+     waiting for an inotify event that may never come.
 """
 from __future__ import annotations
 
@@ -44,27 +51,58 @@ class InotifyOrchestrator:
     def __init__(self, *, source: EmuDeckSource, state: StateStore,
                  cloud: RcloneCloud, sync_cfg: SyncConfig,
                  lease_cfg: LeaseConfig,
-                 debounce_seconds: float = 5.0):
+                 debounce_seconds: float = 5.0,
+                 periodic_rescan_seconds: float = 60.0):
         self._source = source
         self._state = state
         self._cloud = cloud
         self._sync_cfg = sync_cfg
         self._debounce_seconds = debounce_seconds
+        self._periodic_rescan_seconds = periodic_rescan_seconds
         self._stop = asyncio.Event()
         self._lease_tracker = LeaseTracker(
             source_id=source.id, cloud=cloud, cfg=lease_cfg)
+        # Serialize sync passes so the periodic re-scan doesn't race
+        # with an inotify-fired sync of the same game.
+        self._sync_lock = asyncio.Lock()
 
     async def run(self) -> None:
         """Run forever. Stop with `cancel()`."""
         log.info("inotify orchestrator starting for %s", self._source.id)
-        await self._initial_pass()
+        await self._do_full_pass(reason="initial pass")
         try:
-            await self._inotify_loop()
+            tasks = [
+                asyncio.create_task(self._inotify_loop()),
+                asyncio.create_task(self._periodic_rescan_loop()),
+            ]
+            await asyncio.gather(*tasks)
         finally:
             n = self._lease_tracker.release_all()
             if n:
                 log.info("released %d lease(s) on shutdown for %s",
                          n, self._source.id)
+
+    async def _periodic_rescan_loop(self) -> None:
+        """Run a full pass every `periodic_rescan_seconds`. Cheap when
+        nothing's changed (the per-pass manifest cache short-circuits
+        most cloud calls); meaningful when another device promoted /
+        uploaded a new current and we'd otherwise miss it until the
+        local file changes."""
+        if self._periodic_rescan_seconds <= 0:
+            return
+        while not self._stop.is_set():
+            try:
+                await asyncio.wait_for(
+                    self._stop.wait(),
+                    timeout=self._periodic_rescan_seconds)
+                return  # _stop set
+            except asyncio.TimeoutError:
+                pass
+            try:
+                await self._do_full_pass(reason="periodic re-scan")
+            except Exception:  # noqa: BLE001
+                log.exception("periodic re-scan errored for %s",
+                              self._source.id)
 
     def cancel(self) -> None:
         self._stop.set()
@@ -75,29 +113,36 @@ class InotifyOrchestrator:
         AttributeError when an InotifyOrchestrator is in the mix."""
         return
 
-    async def _initial_pass(self) -> None:
-        """Sync every save the Deck currently has — catches changes
-        made while the daemon was down."""
-        ctx = SyncContext(state=self._state, cloud=self._cloud,
-                          cfg=self._sync_cfg)
-        try:
-            refs = await self._source.list_saves()
-        except Exception as exc:  # noqa: BLE001
-            log.warning("initial pass list_saves failed for %s: %s",
-                        self._source.id, exc)
-            return
-        log.info("initial pass: %d save file(s) under %s",
-                 len(refs), self._source.saves_root)
-        refresh_targets: dict[str, tuple[str, str, object]] = {}
-        for ref in refs:
-            await self._sync_ref(ref, ctx, refresh_targets)
-        for game_id, save_path, paths in refresh_targets.values():
+    async def _do_full_pass(self, *, reason: str) -> None:
+        """Sync every save the Deck currently has. Used for the
+        initial-pass-on-start case and the periodic re-scan timer.
+
+        The periodic case is what catches cross-device promotes /
+        uploads that this Deck would otherwise miss — inotify only
+        fires on local file changes, but a cloud-newer current.<ext>
+        is just a manifest read away.
+        """
+        async with self._sync_lock:
+            ctx = SyncContext(state=self._state, cloud=self._cloud,
+                              cfg=self._sync_cfg)
             try:
-                refresh_manifest(source=self._source, save_path=save_path,
-                                 game_id=game_id, paths=paths, ctx=ctx)
-            except CloudError as exc:
-                log.warning("manifest refresh for %s failed: %s",
-                            game_id, exc)
+                refs = await self._source.list_saves()
+            except Exception as exc:  # noqa: BLE001
+                log.warning("%s: list_saves failed for %s: %s",
+                            reason, self._source.id, exc)
+                return
+            log.info("%s: %d save file(s) under %s",
+                     reason, len(refs), self._source.saves_root)
+            refresh_targets: dict[str, tuple[str, str, object]] = {}
+            for ref in refs:
+                await self._sync_ref(ref, ctx, refresh_targets)
+            for game_id, save_path, paths in refresh_targets.values():
+                try:
+                    refresh_manifest(source=self._source, save_path=save_path,
+                                     game_id=game_id, paths=paths, ctx=ctx)
+                except CloudError as exc:
+                    log.warning("manifest refresh for %s failed: %s",
+                                game_id, exc)
 
     async def _sync_ref(self, ref: SaveRef, ctx: SyncContext,
                         refresh_targets: dict) -> None:
@@ -136,24 +181,27 @@ class InotifyOrchestrator:
         watcher.add_path(self._source.saves_root)
 
         async def handler(_key: str, paths: list[Path]) -> None:
-            ctx = SyncContext(state=self._state, cloud=self._cloud,
-                              cfg=self._sync_cfg)
-            refresh_targets: dict[str, tuple[str, str, object]] = {}
-            for p in paths:
-                if not p.exists():
-                    continue
-                ref = SaveRef(path=str(p),
-                              size_bytes=p.stat().st_size)
-                await self._sync_ref(ref, ctx, refresh_targets)
-            for game_id, save_path, gpaths in refresh_targets.values():
-                try:
-                    refresh_manifest(source=self._source,
-                                     save_path=save_path,
-                                     game_id=game_id, paths=gpaths,
-                                     ctx=ctx)
-                except CloudError as exc:
-                    log.warning("manifest refresh for %s failed: %s",
-                                game_id, exc)
+            # Serialize against the periodic re-scan so two passes don't
+            # race on the same game's manifest read-modify-write.
+            async with self._sync_lock:
+                ctx = SyncContext(state=self._state, cloud=self._cloud,
+                                  cfg=self._sync_cfg)
+                refresh_targets: dict[str, tuple[str, str, object]] = {}
+                for p in paths:
+                    if not p.exists():
+                        continue
+                    ref = SaveRef(path=str(p),
+                                  size_bytes=p.stat().st_size)
+                    await self._sync_ref(ref, ctx, refresh_targets)
+                for game_id, save_path, gpaths in refresh_targets.values():
+                    try:
+                        refresh_manifest(source=self._source,
+                                         save_path=save_path,
+                                         game_id=game_id, paths=gpaths,
+                                         ctx=ctx)
+                    except CloudError as exc:
+                        log.warning("manifest refresh for %s failed: %s",
+                                    game_id, exc)
 
         # Filter to the configured save extension so we don't fire on
         # save states (.state*), screenshots, etc.

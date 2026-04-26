@@ -449,7 +449,8 @@ async def run_all(config: Config, *,
         if isinstance(src, EmuDeckSource):
             orchestrators.append(InotifyOrchestrator(
                 source=src, state=state, cloud=cloud,
-                sync_cfg=sync_cfg, lease_cfg=config.lease))
+                sync_cfg=sync_cfg, lease_cfg=config.lease,
+                periodic_rescan_seconds=config.orchestrator.inotify_rescan_sec))
         else:
             orchestrators.append(BackupOrchestrator(src, deps))
     if on_started is not None:
