@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 import signal
 import sys
 
@@ -22,8 +23,11 @@ def _configure_logging(verbose: bool) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="retrosyncd")
-    parser.add_argument("--config", default=DEFAULT_CONFIG_PATH,
-                        help="Path to config.yaml")
+    parser.add_argument("--config",
+                        default=os.environ.get("RETROSYNC_CONFIG",
+                                               DEFAULT_CONFIG_PATH),
+                        help="Path to config.yaml (honors "
+                             "RETROSYNC_CONFIG env var).")
     parser.add_argument("--verbose", "-v", action="store_true")
     args = parser.parse_args(argv)
     _configure_logging(args.verbose)

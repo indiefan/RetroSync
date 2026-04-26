@@ -29,7 +29,8 @@ def _configure_logging(verbose: bool) -> None:
 
 @click.group()
 @click.option("--config", "config_path", default=DEFAULT_CONFIG_PATH,
-              show_default=True, help="Path to config.yaml")
+              envvar="RETROSYNC_CONFIG", show_default=True,
+              help="Path to config.yaml. Honors RETROSYNC_CONFIG.")
 @click.option("-v", "--verbose", is_flag=True)
 @click.pass_context
 def main(ctx: click.Context, config_path: str, verbose: bool) -> None:
