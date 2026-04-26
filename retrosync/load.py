@@ -21,8 +21,9 @@ from pathlib import Path
 
 from .cloud import (CloudError, RcloneCloud, compose_paths, sha256_bytes)
 from .config import Config, SourceConfig
-from .pocket.sync_runner import (build_pocket_source, mount_pocket,
-                                 unmount_pocket)
+from .pocket.sync_runner import (build_pocket_source,
+                                 derive_source_id_for_device,
+                                 mount_pocket, unmount_pocket)
 from .sources.base import SaveRef, SaveSource
 from .sources.registry import build as build_source
 from .state import StateStore
@@ -231,11 +232,14 @@ def _load_pocket(*, cfg: Config, game_id: str, data: bytes, h: str,
                                           on_wait=on_wait)
     try:
         # find_pocket_device may have set the device after the wait —
-        # re-resolve so unmount can power it off cleanly.
+        # re-resolve so unmount can power it off cleanly AND so the
+        # source_id can be derived from the SD's filesystem UUID.
         if device is None:
             device = find_pocket_device()
+        source_id = _pocket_source_id(cfg, device=device)
+        log.info("pocket: using source_id=%s for %s", source_id, device)
         source = build_pocket_source(
-            source_id=_pocket_source_id(cfg),
+            source_id=source_id,
             mount_path=actual_mount, config=cfg)
         # Prefer overwriting the existing on-device save (its filename
         # matches the ROM, so the Pocket actually loads it). Fall back to
@@ -261,7 +265,7 @@ def _load_pocket(*, cfg: Config, game_id: str, data: bytes, h: str,
         SKIP_AUTO_SYNC_FLAG.unlink(missing_ok=True)
     return LoadResult(
         target=TARGET_POCKET, game_id=game_id,
-        source_id=_pocket_source_id(cfg),
+        source_id=source_id,
         cloud_path=cloud_path, written_path=str(target_path),
         bytes_written=len(data), sha256=h,
     )
@@ -285,9 +289,23 @@ def _load_cart(*, cfg: Config, system: str, game_id: str,
     )
 
 
-def _pocket_source_id(cfg: Config) -> str:
+def _pocket_source_id(cfg: Config, *, device: str | None = None) -> str:
+    """Resolve the source_id to use for this Pocket sync run.
+
+    Priority:
+      1. An explicitly-configured `pocket` source in config.yaml.
+      2. Auto-derive from the mounted SD's filesystem UUID via blkid —
+         so two physical Pockets get distinct identities even with no
+         per-device config.
+      3. Fall back to the generic "pocket-1".
+    """
     src = next((s for s in cfg.sources if s.adapter == "pocket"), None)
-    return src.id if src is not None else "pocket-1"
+    if src is not None:
+        return src.id
+    if device is not None:
+        return derive_source_id_for_device(device=device,
+                                           fallback="pocket-1")
+    return "pocket-1"
 
 
 def _pocket_system(cfg: Config) -> str:

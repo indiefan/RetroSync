@@ -365,6 +365,59 @@ async def test_resolve_with_stale_cloud_path() -> bool:
                   "stale cloud_path → fallback by hash succeeded")
 
 
+async def test_no_duplicate_upload_on_transient_manifest_failure() -> bool:
+    """Regression: a transient `rclone lsjson` failure (rate limit, network
+    blip) made `exists()` return False, which made `read_manifest()` return
+    None, which made the engine think there was no cloud version → case 2
+    bootstrap upload → re-uploaded the unchanged save. The fix: exists()
+    distinguishes transient errors from "definitely missing" via rclone's
+    exit codes, and sync_one_game returns SKIPPED on transient failures
+    rather than uploading.
+    """
+    from unittest.mock import patch
+    _, state, cloud = _setup()
+    fx = MockFXPakSource(id="fx", files={"/Mario.srm": b"abc" * 100})
+    state.upsert_source(id=fx.id, system=fx.system,
+                        adapter="MockFXPakSource", config_json="{}")
+    ctx = SyncContext(state=state, cloud=cloud, cfg=SyncConfig())
+
+    out_setup = await sync_one_game(source=fx,
+                                    ref=SaveRef(path="/Mario.srm"), ctx=ctx)
+    refresh_manifest(source=fx, save_path="/Mario.srm",
+                     game_id=out_setup.game_id, paths=out_setup.paths, ctx=ctx)
+    if out_setup.result != SyncResult.BOOTSTRAP_UPLOADED:
+        print(f"FAIL: setup expected BOOTSTRAP_UPLOADED, got {out_setup.result}")
+        state.close()
+        return False
+    n_versions_before = len(state.list_versions(fx.id, "/Mario.srm"))
+
+    # Now the in-sync case: re-sync, manifest read works, expect IN_SYNC.
+    ctx.invalidate_manifest(out_setup.paths)
+    out_in_sync = await sync_one_game(source=fx,
+                                      ref=SaveRef(path="/Mario.srm"), ctx=ctx)
+    if out_in_sync.result != SyncResult.IN_SYNC:
+        print(f"FAIL: expected IN_SYNC second sync, got {out_in_sync.result}")
+        state.close()
+        return False
+
+    # Now simulate the transient failure: cloud.exists raises CloudError.
+    # The engine must SKIP rather than upload.
+    ctx.invalidate_manifest(out_setup.paths)
+    from retrosync.cloud import CloudError as _CE
+    with patch.object(cloud, "exists",
+                      side_effect=_CE("simulated rclone rate-limit")):
+        out_transient = await sync_one_game(
+            source=fx, ref=SaveRef(path="/Mario.srm"), ctx=ctx)
+    n_versions_after = len(state.list_versions(fx.id, "/Mario.srm"))
+    state.close()
+
+    ok = _check(out_transient.result, SyncResult.SKIPPED,
+                "transient manifest failure → SKIPPED (no spurious upload)")
+    ok &= _check(n_versions_after, n_versions_before,
+                 "no new version row inserted on transient failure")
+    return ok
+
+
 def main() -> int:
     ok = True
     for name, factory in [
@@ -380,6 +433,8 @@ def main() -> int:
         ("test_resolve_conflict_to_device", test_resolve_conflict_to_device),
         ("test_resolve_with_stale_cloud_path",
          test_resolve_with_stale_cloud_path),
+        ("test_no_duplicate_upload_on_transient_manifest_failure",
+         test_no_duplicate_upload_on_transient_manifest_failure),
     ]:
         print(f"--- {name} ---")
         ok &= asyncio.run(factory())

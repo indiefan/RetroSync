@@ -289,17 +289,30 @@ class RcloneCloud:
         return proc.stdout
 
     def exists(self, path: str) -> bool:
-        # `rclone lsf` returns 0 with no output when the path doesn't exist
-        # in the remote root; for nested paths it returns nonzero. We use
-        # `rclone lsjson` for unambiguous existence.
+        """Return True iff <path> exists in cloud.
+
+        Distinguishes "definitely missing" from "couldn't tell" via
+        rclone's documented exit codes:
+          0 + non-empty json → exists
+          0 + empty json     → doesn't exist
+          3 (directory not found), 4 (file not found) → doesn't exist
+          anything else (2 / 5 / 6 / 7 / quota / network) → transient,
+              raise CloudError so the caller doesn't misinterpret a
+              network blip as "this game's manifest is missing → bootstrap
+              upload" and silently re-upload an unchanged save.
+        """
         proc = self._run("lsjson", path, capture=True, check=False)
-        if proc.returncode != 0:
+        if proc.returncode == 0:
+            try:
+                entries = json.loads(proc.stdout or b"[]")
+            except json.JSONDecodeError:
+                return False
+            return bool(entries)
+        if proc.returncode in (3, 4):
             return False
-        try:
-            entries = json.loads(proc.stdout or b"[]")
-        except json.JSONDecodeError:
-            return False
-        return bool(entries)
+        raise CloudError(
+            f"rclone lsjson {path} failed (exit {proc.returncode}): "
+            f"{proc.stderr.decode(errors='replace').strip()}")
 
     def lsjson(self, path: str) -> list[dict]:
         proc = self._run("lsjson", path, capture=True)

@@ -98,6 +98,66 @@ def cmd_list(ctx: click.Context) -> None:
     state.close()
 
 
+@main.command("versions")
+@click.argument("game_id")
+@click.option("--from", "from_source",
+              help="Restrict to versions uploaded by this source id.")
+@click.pass_context
+def cmd_versions(ctx: click.Context, game_id: str,
+                 from_source: str | None) -> None:
+    """Show full version history for GAME_ID across all sources.
+
+    Each line shows when the version was uploaded, its hash and size,
+    which device uploaded it, and its parent (the hash this version
+    replaced on that device). The trailing per-source block is the
+    "last hash we and the cloud agreed on" pointer the engine uses to
+    decide upload vs. download vs. conflict on the next sync.
+
+    Example:
+      retrosync versions super_metroid
+      retrosync versions super_metroid --from pocket-1
+    """
+    cfg: Config = ctx.obj["config"]
+    state = StateStore(cfg.state.db_path)
+    sql = """
+        SELECT v.*, f.game_id
+        FROM versions v
+        JOIN files f ON v.source_id = f.source_id AND v.path = f.path
+        WHERE f.game_id = ? AND v.state = 'uploaded'
+    """
+    args: tuple = (game_id,)
+    if from_source:
+        sql += " AND v.source_id = ?"
+        args = (game_id, from_source)
+    sql += " ORDER BY v.uploaded_at DESC"
+    rows = list(state._conn.execute(sql, args))
+    if not rows:
+        click.echo(f"(no versions for {game_id}"
+                   f"{' from ' + from_source if from_source else ''})")
+        state.close()
+        return
+    click.echo("uploaded_at               hash     size    from           "
+               "parent   cloud_path")
+    for r in rows:
+        parent = (r["parent_hash"] or "")[:8] or "-"
+        click.echo(f"  {r['uploaded_at']:24}  {r['hash'][:8]} "
+                   f"{r['size_bytes']:>6}  {r['source_id']:<14} "
+                   f"{parent:<8} {r['cloud_path'] or '-'}")
+    # Per-source last-synced pointer for this game.
+    sync_rows = list(state._conn.execute(
+        "SELECT * FROM source_sync_state WHERE game_id=? "
+        "ORDER BY source_id", (game_id,)))
+    if sync_rows:
+        click.echo()
+        click.echo("Per-source last-synced hash (engine's "
+                   "'we and cloud agree on this' pointer):")
+        for r in sync_rows:
+            click.echo(f"  {r['source_id']:<14}  "
+                       f"{r['last_synced_hash'][:8]}  at "
+                       f"{r['last_synced_at']}")
+    state.close()
+
+
 @main.command("show")
 @click.argument("source_id")
 @click.argument("path")
