@@ -119,8 +119,16 @@ install_rclone() {
   local tmp="$(mktemp -d)"
   trap "rm -rf ${tmp}" RETURN
   local arch="$(detect_arch)"
-  local url="https://downloads.rclone.org/${RCLONE_VERSION}/rclone-${RCLONE_VERSION}-${arch}.zip"
-  curl -fsSL "${url}" -o "${tmp}/rclone.zip"
+  # rclone publishes "current" at the root (no version prefix) and
+  # versioned releases under /v1.x.y/. Pick the right URL shape.
+  local url
+  if [[ "${RCLONE_VERSION}" == "current" ]]; then
+    url="https://downloads.rclone.org/rclone-current-${arch}.zip"
+  else
+    url="https://downloads.rclone.org/${RCLONE_VERSION}/rclone-${RCLONE_VERSION}-${arch}.zip"
+  fi
+  curl -fSL "${url}" -o "${tmp}/rclone.zip" \
+    || die "rclone download failed: ${url}"
   unzip -q "${tmp}/rclone.zip" -d "${tmp}"
   install -m 0755 "${tmp}"/rclone-*/rclone "${USER_BIN}/rclone"
   log "installed rclone -> ${USER_BIN}/rclone"
