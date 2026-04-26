@@ -1,28 +1,24 @@
 # RetroSync — poke the daemon for an immediate sync when the FXPak Pro
-# (or any usb2snes-compatible cart) is connected.
+# (or any usb2snes-compatible cart sharing the same USB IDs) is connected.
 #
 # Without this, cart-on → first sync latency is bounded by the
 # orchestrator's `unhealthy_recheck_sec` (default 2s). With it, the
 # daemon does an immediate pass on USB attach (sub-second latency).
 #
-# The FXPak Pro presents as a USB CDC ACM device. Vendor:product ID
-# varies by firmware revision — capture yours with the cart powered on
-# and plugged into the Pi:
-#
-#     lsusb
-#     # look for the device that appears when you power-cycle the SNES
-#
-# Then replace the XXXX:YYYY pair below.
+# Vendor:product 1209:5a22 is "Generic ikari_01 sd2snes" — pid.codes
+# allocation used by the FXPak Pro / sd2snes firmware. Confirm yours
+# with `lsusb` if the rule doesn't fire (some clones may use different
+# IDs).
 #
 # The rule signals the running retrosync daemon via SIGUSR1, which
 # pokes every orchestrator into running an immediate pass.
 
 ACTION=="add", SUBSYSTEM=="tty", \
-  ATTRS{idVendor}=="XXXX", ATTRS{idProduct}=="YYYY", \
+  ATTRS{idVendor}=="1209", ATTRS{idProduct}=="5a22", \
   RUN+="/bin/systemctl kill --signal=SIGUSR1 retrosync.service"
 
 # Fallback for older udev that doesn't recurse to the parent USB
 # device's ATTRS at the tty level.
 ACTION=="add", SUBSYSTEM=="usb", \
-  ATTR{idVendor}=="XXXX", ATTR{idProduct}=="YYYY", \
+  ATTR{idVendor}=="1209", ATTR{idProduct}=="5a22", \
   RUN+="/bin/systemctl kill --signal=SIGUSR1 retrosync.service"
