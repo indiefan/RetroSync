@@ -40,6 +40,18 @@ class PocketConfig:
     file_extension: str = ".sav"
     system: str = "snes"
     game_aliases: dict[str, list[str]] = field(default_factory=dict)
+    # ROM extensions to scan when looking up a ROM filename for a game
+    # we've never seen on the Pocket. The Pocket loads saves by ROM-stem
+    # match, so a fresh save needs to be named after one of these ROMs.
+    rom_extensions: tuple[str, ...] = (".smc", ".sfc")
+    # Optional override: where to look for ROMs. Empty = mirror `core`'s
+    # path under Assets/ (i.e. Assets/snes/common when core=snes/common).
+    assets_subpath: str = ""
+    # Region preference for picking among multiple ROMs that resolve to
+    # the same game_id (e.g. USA + Europe + Japan dumps). The first
+    # marker that case-insensitively appears in the filename wins.
+    region_preference: tuple[str, ...] = (
+        "usa", "world", "europe", "japan")
 
 
 class PocketSource:
@@ -63,6 +75,14 @@ class PocketSource:
         # `core` may contain slashes ("snes/common") for cores that share
         # a save directory with the platform's other cores.
         return Path(self._cfg.mount_path) / "Saves" / self._cfg.core
+
+    @property
+    def assets_dir(self) -> Path:
+        """Where the Pocket keeps ROMs for this core. Defaults to mirroring
+        the saves layout (Assets/<core>/) — same convention openFPGA
+        uses to pair Saves/ and Assets/."""
+        sub = self._cfg.assets_subpath or self._cfg.core
+        return Path(self._cfg.mount_path) / "Assets" / sub
 
     # ----------- SaveSource methods -----------
 
@@ -170,6 +190,59 @@ class PocketSource:
         # place; for v0.2 we keep this simple.
         return self.saves_dir / f"{game_id}{self._cfg.file_extension}"
 
+    def find_rom_for(self, game_id: str) -> Path | None:
+        """Scan `assets_dir` for ROM files whose canonical slug matches
+        `game_id`. Returns the best match, preferring USA region dumps
+        (configurable via PocketConfig.region_preference). Returns None
+        if no matching ROM exists.
+        """
+        if not self.assets_dir.exists():
+            return None
+        exts = tuple(e.lower() for e in self._cfg.rom_extensions)
+        candidates: list[Path] = []
+        try:
+            for entry in self.assets_dir.iterdir():
+                if not entry.is_file():
+                    continue
+                if entry.name.startswith("._"):
+                    continue
+                if not entry.name.lower().endswith(exts):
+                    continue
+                slug = resolve_game_id(entry.name,
+                                       aliases=self._cfg.game_aliases)
+                if slug == game_id:
+                    candidates.append(entry)
+        except OSError as exc:
+            log.warning("find_rom_for: scanning %s failed: %s",
+                        self.assets_dir, exc)
+            return None
+        if not candidates:
+            return None
+        # Lowest priority value wins; alphabetic for stability tiebreaker.
+        prefs = tuple(p.lower() for p in self._cfg.region_preference)
+        candidates.sort(key=lambda p: (
+            _region_priority(p.name, prefs), p.name))
+        return candidates[0]
+
+    def target_save_path_for(self, game_id: str) -> Path:
+        """Decide where to write a save for `game_id` on the Pocket.
+
+        Priority:
+          1. An existing on-device save matching the game (the Pocket
+             already loads this file at boot).
+          2. A ROM in assets_dir matching the game — use its stem +
+             save extension. Prefers USA dumps over EUR/JP.
+          3. Fall back to the slug-based filename. The Pocket likely
+             won't load this — caller should warn the operator.
+        """
+        existing = self.existing_save_for(game_id)
+        if existing is not None:
+            return existing
+        rom = self.find_rom_for(game_id)
+        if rom is not None:
+            return self.saves_dir / (rom.stem + self._cfg.file_extension)
+        return self.canonical_save_path(game_id)
+
     def existing_save_for(self, game_id: str) -> Path | None:
         """Return the on-device save file whose canonical slug matches
         `game_id`, if one already exists. The Pocket loads saves by
@@ -217,16 +290,54 @@ class PocketSource:
         return matches[0][0]
 
 
+# Region tags as they typically appear inside parens in dumped ROM
+# filenames: "USA", "U", "Europe", "E", "Japan", "J", "World", "W".
+# We collapse single-letter forms into the full word for matching.
+_SINGLE_LETTER_REGIONS = {"u": "usa", "e": "europe", "j": "japan",
+                          "w": "world"}
+
+
+def _region_priority(filename: str,
+                     preference: tuple[str, ...]) -> int:
+    """Return the index of the first preference that matches the filename
+    (case-insensitive substring on the full or single-letter region tag).
+    Lower = better. Returns len(preference) for filenames with no
+    recognized region tag (so they sort last but still sort)."""
+    lname = filename.lower()
+    for i, want in enumerate(preference):
+        # Full-word match (e.g. "(usa," / "(usa)" / "(usa, ").
+        if want in lname:
+            return i
+        # Single-letter equivalent (e.g. "(u)" → usa).
+        for letter, full in _SINGLE_LETTER_REGIONS.items():
+            if full == want and (
+                    f"({letter})" in lname
+                    or f"({letter}," in lname
+                    or f", {letter})" in lname
+                    or f", {letter}," in lname):
+                return i
+    return len(preference)
+
+
 def _build(*, id: str, mount_path: str,
-           core: str = "agg23.SNES",
+           core: str = "snes/common",
            file_extension: str = ".sav",
            system: str = "snes",
-           game_aliases: dict[str, list[str]] | None = None) -> PocketSource:
-    return PocketSource(PocketConfig(
+           game_aliases: dict[str, list[str]] | None = None,
+           rom_extensions: list[str] | None = None,
+           assets_subpath: str = "",
+           region_preference: list[str] | None = None) -> PocketSource:
+    cfg = PocketConfig(
         id=id, mount_path=mount_path, core=core,
         file_extension=file_extension, system=system,
         game_aliases=dict(game_aliases or {}),
-    ))
+        assets_subpath=assets_subpath,
+    )
+    if rom_extensions:
+        cfg.rom_extensions = tuple(rom_extensions)
+    if region_preference:
+        cfg.region_preference = tuple(region_preference)
+    return PocketSource(cfg)
 
 
 register("pocket", _build)

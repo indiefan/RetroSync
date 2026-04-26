@@ -175,6 +175,64 @@ async def test_list_saves_dedupes_same_game_id() -> bool:
                   "ROM-decorated file wins over slug-named duplicate")
 
 
+def test_find_rom_for_picks_usa_over_other_regions() -> bool:
+    """When multiple ROMs match a slug, find_rom_for picks USA by default."""
+    workdir, mount, state, cloud = _setup()
+    assets = mount / "Assets" / "agg23.SNES"
+    assets.mkdir(parents=True)
+    (assets / "Super Metroid (Japan).smc").write_bytes(b"jp-rom")
+    (assets / "Super Metroid (USA).smc").write_bytes(b"usa-rom")
+    (assets / "Super Metroid (Europe).smc").write_bytes(b"eu-rom")
+
+    source = PocketSource(PocketConfig(
+        id="pocket-1", mount_path=str(mount), core="agg23.SNES",
+        file_extension=".sav", system="snes",
+    ))
+    state.close()
+    rom = source.find_rom_for("super_metroid")
+    return _check(rom.name if rom else None,
+                  "Super Metroid (USA).smc",
+                  "find_rom_for prefers USA over JP/EU")
+
+
+def test_target_save_path_for_uses_rom_stem() -> bool:
+    """When a fresh save is being written for a game with no on-device
+    save yet, target_save_path_for finds the ROM and returns the matching
+    stem + save extension."""
+    workdir, mount, state, cloud = _setup()
+    saves = mount / "Saves" / "agg23.SNES"
+    saves.mkdir(parents=True, exist_ok=True)
+    assets = mount / "Assets" / "agg23.SNES"
+    assets.mkdir(parents=True)
+    (assets / "Chrono Trigger (USA).smc").write_bytes(b"rom")
+
+    source = PocketSource(PocketConfig(
+        id="pocket-1", mount_path=str(mount), core="agg23.SNES",
+        file_extension=".sav", system="snes",
+    ))
+    state.close()
+    target = source.target_save_path_for("chrono_trigger")
+    return _check(target.name, "Chrono Trigger (USA).sav",
+                  "uses ROM stem for fresh save filename")
+
+
+def test_target_save_path_for_falls_back_to_slug() -> bool:
+    """When no existing save AND no matching ROM, target_save_path_for
+    falls back to the slug-based name."""
+    workdir, mount, state, cloud = _setup()
+    saves = mount / "Saves" / "agg23.SNES"
+    saves.mkdir(parents=True, exist_ok=True)
+    # Note: no Assets/ at all.
+    source = PocketSource(PocketConfig(
+        id="pocket-1", mount_path=str(mount), core="agg23.SNES",
+        file_extension=".sav", system="snes",
+    ))
+    state.close()
+    target = source.target_save_path_for("chrono_trigger")
+    return _check(target.name, "chrono_trigger.sav",
+                  "no ROM → falls back to slug-named")
+
+
 def test_existing_save_for_prefers_decorated_name() -> bool:
     """When both `final_fantasy_iii.sav` (slug fallback from a previous
     load) and `Final Fantasy III (U) (v1.1).sav` (ROM-named original)
@@ -243,6 +301,12 @@ def main() -> int:
     ok &= test_existing_save_for_matches_by_slug()
     print("--- test_existing_save_for_prefers_decorated_name ---")
     ok &= test_existing_save_for_prefers_decorated_name()
+    print("--- test_find_rom_for_picks_usa_over_other_regions ---")
+    ok &= test_find_rom_for_picks_usa_over_other_regions()
+    print("--- test_target_save_path_for_uses_rom_stem ---")
+    ok &= test_target_save_path_for_uses_rom_stem()
+    print("--- test_target_save_path_for_falls_back_to_slug ---")
+    ok &= test_target_save_path_for_falls_back_to_slug()
     print("--- test_derive_source_id_for_device ---")
     ok &= test_derive_source_id_for_device()
     return 0 if ok else 1

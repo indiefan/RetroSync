@@ -241,22 +241,21 @@ def _load_pocket(*, cfg: Config, game_id: str, data: bytes, h: str,
         source = build_pocket_source(
             source_id=source_id,
             mount_path=actual_mount, config=cfg)
-        # Prefer overwriting the existing on-device save (its filename
-        # matches the ROM, so the Pocket actually loads it). Fall back to
-        # the slug-based filename only if no existing save is found —
-        # but warn loudly because the Pocket likely won't load it then.
-        existing = source.existing_save_for(game_id)
-        if existing is not None:
-            target_path = existing
-            log.info("writing pocket save to existing file %s", target_path)
-        else:
-            target_path = source.canonical_save_path(game_id)
+        # target_save_path_for handles the lookup: existing save → ROM
+        # in Assets/ matched by canonical slug (USA preferred) → slug
+        # fallback. Only the slug fallback is non-loadable; warn on it.
+        target_path = source.target_save_path_for(game_id)
+        if (source.existing_save_for(game_id) is None
+                and source.find_rom_for(game_id) is None):
             log.warning(
-                "no existing save on the Pocket matches %s; writing to "
-                "%s. The Pocket loads saves by ROM filename — if your "
-                "ROM is e.g. 'Foo (U).smc', rename this file to "
-                "'Foo (U).sav' for the save to be picked up.",
-                game_id, target_path)
+                "no existing save AND no matching ROM on the Pocket for "
+                "%s; writing to %s. The Pocket loads saves by ROM "
+                "filename — if your ROM is e.g. 'Foo (U).smc', either "
+                "drop it in %s or rename this file to 'Foo (U).sav' so "
+                "it gets picked up.",
+                game_id, target_path, source.assets_dir)
+        else:
+            log.info("writing pocket save to %s", target_path)
         asyncio.run(source.write_save(SaveRef(path=str(target_path)), data))
     finally:
         if owned:
