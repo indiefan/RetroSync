@@ -1,6 +1,6 @@
 [Unit]
 Description=RetroSync save backup daemon
-Documentation=https://github.com/REPLACE_ME/retrosync
+Documentation=https://github.com/indiefan/RetroSync
 After=network-online.target sni.service
 Wants=network-online.target sni.service
 

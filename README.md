@@ -79,7 +79,7 @@ page and `ssh pi@<ip-address>`.
 On the Pi:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/REPLACE_ME/retrosync/main/install/setup.sh \
+curl -fsSL https://raw.githubusercontent.com/indiefan/RetroSync/main/install/setup.sh \
   | sudo bash
 ```
 

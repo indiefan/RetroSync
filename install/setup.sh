@@ -3,7 +3,7 @@
 #
 # Usage on the Pi (after SSHing in):
 #
-#   curl -fsSL https://raw.githubusercontent.com/REPLACE_ME/retrosync/main/install/setup.sh | sudo bash
+#   curl -fsSL https://raw.githubusercontent.com/indiefan/RetroSync/main/install/setup.sh | sudo bash
 #
 # Or, if you've cloned the repo yourself:
 #
@@ -27,7 +27,7 @@
 set -euo pipefail
 
 # -------- knobs ----------------------------------------------------------
-RETROSYNC_REPO="${RETROSYNC_REPO:-https://github.com/REPLACE_ME/retrosync.git}"
+RETROSYNC_REPO="${RETROSYNC_REPO:-https://github.com/indiefan/RetroSync.git}"
 RETROSYNC_REF="${RETROSYNC_REF:-main}"
 RETROSYNC_DIR="${RETROSYNC_DIR:-/opt/retrosync}"
 RETROSYNC_USER="${RETROSYNC_USER:-retrosync}"
