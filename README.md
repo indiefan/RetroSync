@@ -330,15 +330,28 @@ serial port.
    # Expect: health: OK - EverDrive 64 (handshake ok, status=...)
    ```
 
-**Status:** the handshake (CMD_TEST) is verified end-to-end on real
-hardware. SD-file operations (`dir_list`, `file_read`, etc.) are
-**stubbed pending Krikzz USB tool source review** — UNFLoader's
-source only contains ROM upload + debug + PIFboot, not the SD-file
-commands the OS64 firmware also exposes. The 16-byte command frame
-layout, the test-command identification, and the `EverDrive64Source`
-adapter on top are all done; what's missing is the byte-level format
-of the SD operations themselves. Until that's in, `retrosync test-
-cart` works but `retrosync sync-status` won't show N64 saves.
+**Status:** handshake + SD-file operations (file_open / read / write
+/ close / info) are implemented per Krikzz's `usb64` tool source and
+verified against real hardware. The remaining gap is **directory
+listing** — Krikzz's tool requires explicit paths and doesn't expose
+a dir-list command, so the adapter can't auto-enumerate saves on the
+SD. Workaround: declare ROM filenames in config under
+`options.rom_filenames` (one per game you care about), and the
+adapter uses `file_exists` to enumerate per-format save files for
+each. Once an OS64 dir-list byte is reverse-engineered, this becomes
+optional.
+
+```yaml
+options:
+  ...
+  rom_filenames:
+    - "Super Mario 64 (USA).z64"
+    - "The Legend of Zelda - Ocarina of Time (USA).z64"
+    - "Paper Mario (USA).z64"
+```
+
+Add filenames as they appear on your SD card; the adapter strips the
+extension and probes for `<stem>.eep / .sra / .fla / .mp1..mp4`.
 
 ### Steam Deck (EmuDeck) setup
 

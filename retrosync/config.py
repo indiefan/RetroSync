@@ -348,6 +348,19 @@ sources:
   #     sd_roms_root: /ED64/ROMS
   #     rom_extensions: [".z64", ".n64", ".v64"]
   #     system: n64
+  #     # Krikzz's USB tool source doesn't expose a directory-list
+  #     # operation, so the adapter can't auto-enumerate saves on
+  #     # the SD. Until an OS64 dir-list cmd byte is found, the
+  #     # operator declares ROM filenames here. The adapter walks
+  #     # each ROM's per-format save filenames (Foo.z64 → Foo.eep,
+  #     # Foo.sra, Foo.fla, Foo.mp1..mp4) and uses file_exists to
+  #     # discover which actually exist on the cart's SD. ROM
+  #     # filename — including extension — must match what's on the
+  #     # SD card under sd_roms_root.
+  #     rom_filenames:
+  #       - "Super Mario 64 (USA).z64"
+  #       - "The Legend of Zelda - Ocarina of Time (USA).z64"
+  #       - "Paper Mario (USA).z64"
   #
   # And a corresponding Deck-side EmuDeck source for N64 (separate
   # from the SNES one above):

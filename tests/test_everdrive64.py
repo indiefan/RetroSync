@@ -195,6 +195,57 @@ async def test_target_save_paths_for_no_rom() -> bool:
                   "no matching ROM → empty dict (skip bootstrap)")
 
 
+async def test_list_saves_via_rom_filenames_fallback() -> bool:
+    """When the transport doesn't support dir_list (real Krikzz
+    serial transport), the adapter enumerates by checking
+    file_exists for each per-format file derived from the
+    operator-configured rom_filenames."""
+    from retrosync.transport.krikzz_ftdi import KrikzzFtdiTransport, FileEntry
+
+    class NoDirListTransport(KrikzzFtdiTransport):
+        """Like the real serial transport: dir_list NotImplementedError,
+        but file_exists and file_read/write work."""
+        def __init__(self, files: dict[str, bytes]):
+            self._files = files
+        async def open(self): pass
+        async def close(self): pass
+        async def health(self): return True, "fake"
+        async def dir_list(self, path):
+            raise NotImplementedError("simulating real serial transport")
+        async def file_read(self, path):
+            return self._files[path]
+        async def file_write(self, path, data):
+            self._files[path] = bytes(data)
+        async def file_delete(self, path):
+            self._files.pop(path, None)
+        async def file_exists(self, path):
+            return path in self._files
+
+    files = {
+        "/ED64/SAVES/Super Mario 64.eep": b"\x00" * n64.EEPROM_4KBIT_BYTES,
+        "/ED64/SAVES/Paper Mario.fla":    b"\x00" * n64.FLASHRAM_SIZE,
+        "/ED64/SAVES/Paper Mario.mp1":    b"\x00" * n64.CPAK_SIZE,
+        # An entry on the SD that's NOT in rom_filenames — should be
+        # ignored by the fallback enumeration.
+        "/ED64/SAVES/Some Other Game.sra": b"\x00" * n64.SRAM_SIZE,
+    }
+    transport = NoDirListTransport(files)
+    cfg = EverDrive64Config(
+        id="everdrive64-1", transport="mock",
+        sd_saves_root="/ED64/SAVES", sd_roms_root="/ED64/ROMS",
+        rom_filenames=("Super Mario 64.z64", "Paper Mario.z64"),
+        transport_instance=transport,
+    )
+    src = EverDrive64Source(cfg)
+    refs = await src.list_saves()
+    paths = sorted(r.path for r in refs)
+    return _check(paths, [
+        "/ED64/SAVES/Paper Mario.fla",
+        "/ED64/SAVES/Paper Mario.mp1",
+        "/ED64/SAVES/Super Mario 64.eep",
+    ], "fallback enumerates only configured ROMs' per-format files")
+
+
 async def test_end_to_end_upload_via_engine() -> bool:
     """Full sync_one_game flow: EverDrive 64 source uploads its
     canonical blob to cloud, manifest gets written, hashes match."""
@@ -241,6 +292,8 @@ def main() -> int:
          test_target_save_paths_for_finds_rom_stem),
         ("target_save_paths_for_no_rom",
          test_target_save_paths_for_no_rom),
+        ("list_saves_via_rom_filenames_fallback",
+         test_list_saves_via_rom_filenames_fallback),
         ("end_to_end_upload_via_engine",
          test_end_to_end_upload_via_engine),
     ]:
