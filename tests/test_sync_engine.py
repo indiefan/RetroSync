@@ -317,6 +317,54 @@ async def test_resolve_conflict_to_device() -> bool:
     return ok
 
 
+async def test_resolve_with_stale_cloud_path() -> bool:
+    """Regression: a conflict row's stored cloud_path is stale (e.g. the
+    cloud folder got migrated under it). Resolve should fall back to
+    scanning the canonical folder by hash and still find the bytes."""
+    from retrosync import conflicts as cmod
+    _, state, cloud = _setup()
+
+    # Set up a preserve-mode conflict so we have a row to mess with.
+    fx2_files = {"/Mario.srm": b"abc" * 100}
+    fx2 = MockFXPakSource(id="fx2", files=fx2_files)
+    state.upsert_source(id=fx2.id, system=fx2.system,
+                        adapter="MockFXPakSource", config_json="{}")
+    ctx = SyncContext(state=state, cloud=cloud,
+                      cfg=SyncConfig(cloud_to_device=True,
+                                     conflict_winner="preserve"))
+    out_setup = await sync_one_game(source=fx2,
+                                    ref=SaveRef(path="/Mario.srm"), ctx=ctx)
+    refresh_manifest(source=fx2, save_path="/Mario.srm",
+                     game_id=out_setup.game_id, paths=out_setup.paths, ctx=ctx)
+
+    fx_files = {"/Mario.srm": b"xyz" * 100}
+    fx = MockFXPakSource(id="fx-new", files=fx_files)
+    state.upsert_source(id=fx.id, system=fx.system,
+                        adapter="MockFXPakSource", config_json="{}")
+    ctx.invalidate_manifest(out_setup.paths)
+    out_conflict = await sync_one_game(source=fx,
+                                       ref=SaveRef(path="/Mario.srm"), ctx=ctx)
+    cid = out_conflict.game_id  # actually we want the conflict id
+    open_conflicts = state.list_conflicts(open_only=True)
+    cid = open_conflicts[0].id
+
+    # Simulate a stale cloud_path: change it to point at a path that
+    # doesn't exist (mimicking a post-migration leftover).
+    with state.tx() as c:
+        c.execute("UPDATE conflicts SET cloud_path = ? WHERE id = ?",
+                  ("gdrive:retro-saves/snes/old_legacy_name/versions/"
+                   "1900-01-01T00-00-00Z--d9f5aeb0.srm", cid))
+
+    # Now resolve --winner cloud. The stored path is bogus but the bytes
+    # exist in the canonical folder; the fallback should find them.
+    result = cmod.resolve(state=state, cloud=cloud, conflict_id=cid,
+                          winner="cloud", remote="gdrive:retro-saves")
+    new_current = cloud.download_bytes(src=result.new_current_path)
+    state.close()
+    return _check(sha256_bytes(new_current), sha256_bytes(b"abc" * 100),
+                  "stale cloud_path → fallback by hash succeeded")
+
+
 def main() -> int:
     ok = True
     for name, factory in [
@@ -330,6 +378,8 @@ def main() -> int:
         ("test_cloud_to_device_off_skips_pull",
          test_cloud_to_device_off_skips_pull),
         ("test_resolve_conflict_to_device", test_resolve_conflict_to_device),
+        ("test_resolve_with_stale_cloud_path",
+         test_resolve_with_stale_cloud_path),
     ]:
         print(f"--- {name} ---")
         ok &= asyncio.run(factory())

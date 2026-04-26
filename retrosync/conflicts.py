@@ -72,34 +72,62 @@ def resolve(*, state: StateStore, cloud: RcloneCloud,
 
     if winner == WIN_CLOUD:
         winner_hash = row.cloud_hash
-        winner_path = row.cloud_path
+        candidate_paths = [row.cloud_path]
     elif winner == WIN_DEVICE:
         winner_hash = row.device_hash
-        winner_path = row.conflict_path
+        candidate_paths = [row.conflict_path]
     else:
         if winner == row.cloud_hash:
-            winner_hash, winner_path = row.cloud_hash, row.cloud_path
+            winner_hash = row.cloud_hash
+            candidate_paths = [row.cloud_path]
         elif winner == row.device_hash:
-            winner_hash, winner_path = row.device_hash, row.conflict_path
+            winner_hash = row.device_hash
+            candidate_paths = [row.conflict_path]
         else:
             raise ValueError(
                 f"hash {winner[:8]} matches neither side of conflict "
                 f"{conflict_id} (cloud={hash8(row.cloud_hash)}, "
                 f"device={hash8(row.device_hash)})")
-    if not winner_path:
-        raise ValueError(
-            f"conflict {conflict_id}: winner side has no preserved cloud "
-            f"path; cannot promote to current")
 
     paths = _compose_paths_for(state, row, remote=remote)
 
-    # Pull the winning bytes and write them as the new `current`.
-    data = cloud.download_bytes(src=winner_path)
-    got = sha256_bytes(data)
-    if got != winner_hash:
+    # The path stored on the conflict row may be stale — e.g. an earlier
+    # `migrate-paths` moved the cloud folder, so the row points at a
+    # location that no longer exists. Try the stored path first, then fall
+    # back to scanning the canonical game folder for a versions/* or
+    # conflicts/* file matching the winner_hash.
+    candidate_paths += list(_find_paths_by_hash(
+        cloud=cloud, paths=paths, h=winner_hash))
+    candidate_paths = [p for p in candidate_paths if p]
+    if not candidate_paths:
+        raise ValueError(
+            f"conflict {conflict_id}: no cloud bytes found for "
+            f"{hash8(winner_hash)}; cannot promote to current")
+
+    data = None
+    last_err: Exception | None = None
+    winner_path = ""
+    for cp in candidate_paths:
+        try:
+            data = cloud.download_bytes(src=cp)
+        except CloudError as exc:
+            log.info("conflict %d: candidate path %s unreachable (%s); "
+                     "trying next", conflict_id, cp, exc)
+            last_err = exc
+            continue
+        got = sha256_bytes(data)
+        if got != winner_hash:
+            log.info("conflict %d: candidate path %s has wrong hash "
+                     "(%s vs expected %s); trying next",
+                     conflict_id, cp, hash8(got), hash8(winner_hash))
+            data = None
+            continue
+        winner_path = cp
+        break
+    if data is None:
         raise CloudError(
-            f"hash mismatch downloading winner: expected "
-            f"{hash8(winner_hash)}, got {hash8(got)}")
+            f"could not locate winning bytes for conflict {conflict_id} "
+            f"(hash {hash8(winner_hash)}). Last error: {last_err}")
     cloud.overwrite_current(paths=paths, save_data=data)
 
     # Mark resolved in DB. Sync state is cleared so next sync re-syncs
@@ -126,3 +154,29 @@ def _compose_paths_for(state: StateStore, row: ConflictRow, *,
     return compose_paths(remote=remote, system=row.system,
                          game_id=row.game_id,
                          save_filename=f"current{ext}")
+
+
+def _find_paths_by_hash(*, cloud: RcloneCloud, paths: CloudPaths,
+                        h: str) -> list[str]:
+    """Scan the canonical game folder's versions/ and conflicts/ subdirs
+    for files whose name encodes <hash8>. Returns matching cloud paths.
+
+    Used as a fallback when the conflict row's stored cloud_path is
+    stale (e.g. after `migrate-paths` moved the cloud folder out from
+    under it). Filenames embed only the first 8 hex chars of the hash,
+    so the caller still needs to verify the full hash by downloading.
+    """
+    h8 = hash8(h)
+    out: list[str] = []
+    for sub in ("versions", "conflicts"):
+        try:
+            entries = cloud.lsjson(f"{paths.base}/{sub}")
+        except CloudError:
+            continue
+        for e in entries:
+            name = e.get("Name", "")
+            if e.get("IsDir"):
+                continue
+            if h8 in name:
+                out.append(f"{paths.base}/{sub}/{name}")
+    return out
