@@ -166,6 +166,11 @@ retrosync conflicts resolve <id> --winner {cloud | device | <hash>}
 # Pocket sync (normally fired by udev; manual override):
 sudo retrosync pocket-sync --device /dev/sda1
 
+# Force-promote a historical version to be cloud's current save
+# (e.g. revert after a stale device overwrote a real save):
+retrosync promote final_fantasy_iii 7def5901
+# Devices pull the promoted bytes on their next sync (case 6).
+
 # Active-device leases (cloud-stored coordinator across devices):
 retrosync lease list                     # who's holding what (per system)
 retrosync lease show deck-1:super_metroid
