@@ -40,6 +40,11 @@ class FXPakConfig:
     sd_root: str = "/"
     save_extensions: tuple[str, ...] = (SRM_SUFFIX,)
     game_aliases: dict[str, list[str]] = field(default_factory=dict)
+    # FXPak only ships SNES today, but `system` is now first-class
+    # config across every adapter (per n64-sync-design §6.1). Keeping
+    # it here means a hypothetical FXPak-on-Genesis gets one config
+    # line rather than a separate adapter class.
+    system: str = "snes"
 
 
 class FXPakSource:
@@ -50,12 +55,12 @@ class FXPakSource:
     `versions/snes/` for at-a-glance cloud-browse identification.
     """
 
-    system = "snes"
     device_kind = "snes"
 
     def __init__(self, config: FXPakConfig):
         self._cfg = config
         self.id = config.id
+        self.system = config.system
         # Populated by list_saves, consumed by resolve_game_id. Path → slug.
         self._slug_assignments: dict[str, str] = {}
 
@@ -173,6 +178,7 @@ def _build(*, id: str, sni_url: str = "ws://127.0.0.1:23074",
            sd_root: str = "/",
            save_extensions: list[str] | None = None,
            game_aliases: dict[str, list[str]] | None = None,
+           system: str = "snes",
            # Accepted but ignored — older config.yaml files may still set
            # these. Kept here so an upgrade doesn't crash on stale options.
            cache_dir: str | None = None,
@@ -181,6 +187,7 @@ def _build(*, id: str, sni_url: str = "ws://127.0.0.1:23074",
         id=id, sni_url=sni_url, sd_root=sd_root,
         save_extensions=tuple(save_extensions or [SRM_SUFFIX]),
         game_aliases=dict(game_aliases or {}),
+        system=system,
     ))
 
 

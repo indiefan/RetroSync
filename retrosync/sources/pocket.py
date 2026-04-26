@@ -243,6 +243,18 @@ class PocketSource:
             return self.saves_dir / (rom.stem + self._cfg.file_extension)
         return self.canonical_save_path(game_id)
 
+    def target_save_paths_for(self, game_id: str) -> dict[str, str]:
+        """Generalized form of `target_save_path_for` — returns a
+        single-entry dict keyed by save extension.
+
+        Multi-format adapters (EverDrive 64) return multiple entries.
+        Single-file adapters always return a one-entry dict. Callers
+        that don't care about format multiplicity can iterate the
+        values uniformly.
+        """
+        ext = self._cfg.file_extension.lstrip(".") or "sav"
+        return {ext: str(self.target_save_path_for(game_id))}
+
     def existing_save_for(self, game_id: str) -> Path | None:
         """Return the on-device save file whose canonical slug matches
         `game_id`, if one already exists. The Pocket loads saves by
