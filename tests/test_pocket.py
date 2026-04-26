@@ -124,6 +124,30 @@ async def test_pocket_to_fxpak_roundtrip() -> bool:
     return ok
 
 
+def test_existing_save_for_matches_by_slug() -> bool:
+    """PocketSource.existing_save_for(<slug>) finds the on-device file
+    whose ROM-style name canonicalizes to <slug>. Used by `load` so we
+    overwrite the file the Pocket actually loads, not a slug-named copy
+    the ROM doesn't look at."""
+    workdir, mount, state, cloud = _setup()
+    save = mount / "Saves" / "agg23.SNES" / "Final Fantasy III (U) (v1.1).sav"
+    save.write_bytes(b"existing-bytes" + b"\x00" * 100)
+
+    source = PocketSource(PocketConfig(
+        id="pocket-1", mount_path=str(mount), core="agg23.SNES",
+        file_extension=".sav", system="snes",
+    ))
+    state.close()
+
+    found = source.existing_save_for("final_fantasy_iii")
+    ok = _check(found, save,
+                "existing_save_for finds ROM-named file by canonical slug")
+    none = source.existing_save_for("nonexistent_game")
+    ok &= _check(none, None,
+                 "existing_save_for returns None when no file matches")
+    return ok
+
+
 def main() -> int:
     ok = True
     for name, factory in [
@@ -132,6 +156,8 @@ def main() -> int:
     ]:
         print(f"--- {name} ---")
         ok &= asyncio.run(factory())
+    print("--- test_existing_save_for_matches_by_slug ---")
+    ok &= test_existing_save_for_matches_by_slug()
     return 0 if ok else 1
 
 
