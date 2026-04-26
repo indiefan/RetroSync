@@ -100,8 +100,14 @@ case "${cmd}" in
       done
       printf ']\n'
     else
+      # Real rclone returns 3 for "directory not found" and 4 for "file
+      # not found". cloud.exists() relies on these specific codes to
+      # distinguish "really missing" from "transient error".
       printf '[]\n'
-      exit 1
+      if [[ "${rel}" == */ || -d "$(dirname "${path}")" ]]; then
+        exit 4  # file not found (parent exists)
+      fi
+      exit 3  # directory not found
     fi
     ;;
   delete)

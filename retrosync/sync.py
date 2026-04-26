@@ -102,13 +102,14 @@ class SyncContext:
     _UNCACHED = object()
 
     def manifest_for(self, paths: CloudPaths) -> Manifest | None:
+        """Read the cloud manifest. Raises CloudError on transient
+        failures (rate limit, network blip) so callers can SKIP rather
+        than mis-treat the absence as "no cloud version → bootstrap
+        upload" and duplicate an unchanged save.
+        """
         if paths.base in self._manifest_cache:
             return self._manifest_cache[paths.base]
-        try:
-            m = self.cloud.read_manifest(paths)
-        except CloudError as exc:
-            log.warning("manifest read failed for %s: %s", paths.base, exc)
-            m = None
+        m = self.cloud.read_manifest(paths)
         self._manifest_cache[paths.base] = m
         return m
 
@@ -153,7 +154,17 @@ async def sync_one_game(*, source: SaveSource, ref: SaveRef,
     """
     game_id = await _resolve_game_id(source, ref)
     paths = _compose_paths(source, ref, game_id=game_id, cloud=ctx.cloud)
-    manifest = ctx.manifest_for(paths)
+    try:
+        manifest = ctx.manifest_for(paths)
+    except CloudError as exc:
+        # Transient cloud failure (rate limit, network blip). DON'T treat
+        # this as "no manifest → bootstrap upload" — that's how we got
+        # spurious duplicate uploads of unchanged saves. Skip this game
+        # for this pass; the next poll will retry.
+        log.warning("sync: skipping %s on %s — manifest read failed: %s",
+                    game_id, source.id, exc)
+        return SyncOutcome(SyncResult.SKIPPED, game_id, ref.path, paths,
+                           f"manifest read failed: {exc}")
     h_cloud = manifest.current_hash if manifest else None
     sync_state = ctx.state.get_sync_state(source.id, game_id)
     h_last = sync_state.last_synced_hash if sync_state else None
