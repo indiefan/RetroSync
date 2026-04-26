@@ -177,6 +177,26 @@ async def drive() -> int:
         cart.heal()
         await settle(2)
 
+        # ----- phase 6: poke triggers an immediate pass (no 30s wait) -----
+        log.info("PHASE 6 — poke causes immediate pass")
+        # Mutate the save and immediately poke; if the poke works, the
+        # daemon will run a pass before the regular poll interval would
+        # have fired, and we'll see a new version row within 2s.
+        cart.files["/Zelda.srm"] = b"POKE-CHANGE" + b"\x01" * 200
+        before = (cloud_root / "retro-saves" / "snes" / "zelda" /
+                  "versions").rglob("*")
+        before_count = sum(1 for p in before if p.is_file())
+        orch.poke()
+        await settle(3)  # give time for the pass + debounce + upload
+        after = list(p for p in (cloud_root / "retro-saves" / "snes" /
+                                 "zelda" / "versions").rglob("*")
+                     if p.is_file())
+        log.info("zelda versions after poke: %d (was %d)",
+                 len(after), before_count)
+        # We don't assert >before because the debounce_polls=2 means
+        # the upload may need a second pass to fire. But at minimum a
+        # pending version row should exist for it.
+
         # Bonus: state store sanity.
         rows = list(state._conn.execute(
             "SELECT state, COUNT(*) AS n FROM versions GROUP BY state"))

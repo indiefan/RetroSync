@@ -171,6 +171,25 @@ retrosync upgrade
 Configuration: `/etc/retrosync/config.yaml`. Restart with
 `sudo systemctl restart retrosync` after changes.
 
+### FXPak Pro instant-sync (optional)
+
+By default the daemon polls every 30s. When the cart is off, it
+falls back to a 2s recheck so cart-on → first sync latency is at
+most a couple seconds. To make it sub-second, install the FXPak
+udev rule with the cart's actual USB IDs:
+
+```bash
+# With the SNES powered on (cart connected via USB to the Pi):
+lsusb     # find the cart's vendor:product line
+sudoedit /etc/udev/rules.d/99-retrosync-fxpak.rules   # replace XXXX:YYYY
+sudo udevadm control --reload && sudo udevadm trigger
+```
+
+The rule signals the daemon (SIGUSR1) on USB attach, which pokes
+every orchestrator into running an immediate pass — useful if you
+want cloud-newer saves to land on the cart before you launch a
+ROM.
+
 ### Pocket sync setup
 
 1. Plug the Pocket into the Pi. On the Pocket: **Tools → USB → Mount as

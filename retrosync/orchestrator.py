@@ -63,6 +63,22 @@ class BackupOrchestrator:
         self._source = source
         self._deps = deps
         self._stop = asyncio.Event()
+        # Set externally (e.g. by a SIGUSR1 handler in daemon.py) to
+        # interrupt the inter-pass wait and run a pass immediately.
+        # Used by the udev rule that fires on FXPak Pro USB attach so
+        # cart-on → first sync latency is sub-second instead of waiting
+        # up to poll_interval_sec.
+        self._poke = asyncio.Event()
+        # Track the last health-check outcome so we can throttle the
+        # "unhealthy" log (otherwise the fast-recheck path would spam
+        # the journal every 2s while the cart is off).
+        self._last_health_ok: bool | None = None
+
+    def poke(self) -> None:
+        """Signal the orchestrator to interrupt its current wait and run
+        a pass immediately. Safe from any thread (asyncio.Event.set is
+        thread-safe in CPython)."""
+        self._poke.set()
 
     async def run(self) -> None:
         """Run forever. Designed to be wrapped in asyncio.Task."""
@@ -70,26 +86,74 @@ class BackupOrchestrator:
         await self._reconcile_on_start()
         while not self._stop.is_set():
             try:
-                await self._one_pass()
+                healthy = await self._one_pass_returning_health()
             except Exception:  # noqa: BLE001
-                log.exception("uncaught error in poll pass for %s", self._source.id)
-            try:
-                await asyncio.wait_for(self._stop.wait(),
-                                       timeout=self._deps.cfg.poll_interval_sec)
-            except asyncio.TimeoutError:
-                pass
+                log.exception("uncaught error in poll pass for %s",
+                              self._source.id)
+                healthy = False
+            # Pick the wait duration based on current health: full
+            # poll interval when the source is healthy (every 30s by
+            # default), shorter recheck when it's not (so cart-on is
+            # detected quickly).
+            wait = (self._deps.cfg.poll_interval_sec if healthy
+                    else self._deps.cfg.unhealthy_recheck_sec)
+            await self._wait_or_poke(wait)
+
+    async def _wait_or_poke(self, timeout: float) -> None:
+        """Wait up to `timeout` seconds, returning early if `_stop` or
+        `_poke` is set. Clears `_poke` on return."""
+        wait_stop = asyncio.create_task(self._stop.wait())
+        wait_poke = asyncio.create_task(self._poke.wait())
+        try:
+            done, _ = await asyncio.wait(
+                {wait_stop, wait_poke},
+                timeout=timeout,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        finally:
+            for t in (wait_stop, wait_poke):
+                if not t.done():
+                    t.cancel()
+        if self._poke.is_set():
+            log.info("source %s: poke received → immediate pass",
+                     self._source.id)
+            self._poke.clear()
 
     def cancel(self) -> None:
         self._stop.set()
 
     # ----------- the pass -----------
 
-    async def _one_pass(self) -> None:
+    async def _one_pass_returning_health(self) -> bool:
+        """Run one pass. Return whether the source was healthy at the
+        start (drives the wait-time choice in the run loop)."""
         health = await self._source.health()
         if not health.ok:
-            log.info("source %s unhealthy: %s",
+            # Throttle the unhealthy log: only emit on the first
+            # transition, debug-level afterwards. Fast-recheck mode
+            # would otherwise spam the journal every 2s.
+            if self._last_health_ok is not False:
+                log.info("source %s unhealthy: %s",
+                         self._source.id, health.detail)
+            else:
+                log.debug("source %s still unhealthy: %s",
+                          self._source.id, health.detail)
+            self._last_health_ok = False
+            return False
+        if self._last_health_ok is False:
+            log.info("source %s came back healthy: %s",
                      self._source.id, health.detail)
-            return
+        self._last_health_ok = True
+        await self._one_pass(health=health)
+        return True
+
+    async def _one_pass(self, *, health=None) -> None:
+        if health is None:
+            health = await self._source.health()
+            if not health.ok:
+                log.info("source %s unhealthy: %s",
+                         self._source.id, health.detail)
+                return
 
         try:
             refs = await self._source.list_saves()
@@ -297,7 +361,15 @@ def build_sources(sources: list[SourceConfig]) -> list[SaveSource]:
     return out
 
 
-async def run_all(config: Config) -> None:
+async def run_all(config: Config, *,
+                  on_started=None) -> None:
+    """Build orchestrators from `config` and run them all forever.
+
+    `on_started`, when given, is called with the list of orchestrators
+    once they're constructed. Lets the daemon register signal handlers
+    that need to reach into the orchestrators (e.g. SIGUSR1 → poke
+    every orchestrator to run an immediate pass).
+    """
     state = StateStore(config.state.db_path)
     cloud = RcloneCloud(remote=config.cloud.rclone_remote,
                         binary=config.cloud.rclone_binary,
@@ -320,6 +392,8 @@ async def run_all(config: Config) -> None:
                             adapter=type(src).__name__, config_json="{}")
 
     orchestrators = [BackupOrchestrator(s, deps) for s in sources]
+    if on_started is not None:
+        on_started(orchestrators)
     tasks = [asyncio.create_task(o.run()) for o in orchestrators]
 
     try:

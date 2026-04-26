@@ -329,18 +329,36 @@ install_systemd_units() {
 }
 
 install_udev_rules() {
-  local src="${RETROSYNC_DIR}/install/udev/99-retrosync-pocket.rules"
-  local dst="/etc/udev/rules.d/99-retrosync-pocket.rules"
+  local src dst
+  src="${RETROSYNC_DIR}/install/udev/99-retrosync-pocket.rules"
+  dst="/etc/udev/rules.d/99-retrosync-pocket.rules"
   if grep -q "XXXX" "${src}"; then
-    warn "udev rule still has XXXX:YYYY placeholder vendor/product IDs."
+    warn "Pocket udev rule still has XXXX:YYYY placeholders."
     warn "Plug in the Pocket (Tools → USB → Mount as USB Drive) and run:"
     warn "    lsusb | grep -i analogue"
     warn "Then edit ${dst} to replace XXXX:YYYY with the printed IDs."
   fi
   install -m 0644 "${src}" "${dst}"
+
+  # FXPak Pro: the udev rule signals the daemon for an immediate sync
+  # on cart-on. Vendor:product IDs are firmware-specific, so we ship
+  # placeholders and tell the operator how to capture theirs.
+  src="${RETROSYNC_DIR}/install/udev/99-retrosync-fxpak.rules"
+  dst="/etc/udev/rules.d/99-retrosync-fxpak.rules"
+  if grep -q "XXXX" "${src}"; then
+    warn "FXPak udev rule still has XXXX:YYYY placeholders."
+    warn "Power on the SNES with the FXPak Pro plugged into the Pi, run:"
+    warn "    lsusb"
+    warn "Find the cart's vendor:product line, then edit ${dst}."
+    warn "Without this, cart-on → first sync latency is bounded by"
+    warn "orchestrator.unhealthy_recheck_sec (~2s) instead of being"
+    warn "near-instant."
+  fi
+  install -m 0644 "${src}" "${dst}"
+
   udevadm control --reload || true
   udevadm trigger || true
-  log "installed udev rule -> ${dst}"
+  log "installed udev rules -> /etc/udev/rules.d/99-retrosync-*.rules"
 }
 
 # -------- step 8: rclone OAuth ------------------------------------------
