@@ -93,6 +93,23 @@ ensure_user_and_dirs() {
     "${RETROSYNC_HOME}/.config" \
     "${RETROSYNC_HOME}/.config/rclone"
   install -d -m 0755 "${RETROSYNC_ETC}"
+
+  # Defensive: rclone.conf and state.db must be readable by the retrosync
+  # user (the daemon and CLI both run as them). On some systems an earlier
+  # `sudo` operation re-owned these to root, which makes the daemon and
+  # CLI fail with "permission denied". Re-chown if they exist; harmless
+  # if they don't.
+  for f in "${RETROSYNC_DATA}/rclone.conf" \
+           "${RETROSYNC_DATA}/state.db" \
+           "${RETROSYNC_DATA}/state.db-shm" \
+           "${RETROSYNC_DATA}/state.db-wal"; do
+    if [[ -e "${f}" ]]; then
+      chown "${RETROSYNC_USER}:${RETROSYNC_USER}" "${f}"
+    fi
+  done
+  if [[ -e "${RETROSYNC_DATA}/rclone.conf" ]]; then
+    chmod 0600 "${RETROSYNC_DATA}/rclone.conf"
+  fi
 }
 
 # -------- step 3: SNI ----------------------------------------------------

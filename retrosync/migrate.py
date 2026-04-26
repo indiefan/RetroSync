@@ -164,11 +164,35 @@ def _merge_versions(cloud: RcloneCloud, src: str, dst: str) -> None:
 
 def _update_state_game_id(state: StateStore, legacy_id: str,
                           canonical_id: str) -> None:
-    """Re-tag any state.db files row whose game_id matches the legacy id."""
+    """Re-tag state.db rows so post-migration lookups land at the new path.
+
+    `files.game_id` is the obvious one. We also rewrite the
+    `<system>/<legacy_id>/` substring in any cloud_path columns
+    (`versions.cloud_path`, `conflicts.cloud_path`,
+    `conflicts.conflict_path`) so the rebuilt manifest and the
+    `retrosync conflicts resolve` lookup find the new locations.
+    """
+    legacy_seg = f"/{legacy_id}/"
+    canonical_seg = f"/{canonical_id}/"
     with state.tx() as c:
         c.execute(
             "UPDATE files SET game_id=? WHERE game_id=?",
             (canonical_id, legacy_id))
+        c.execute(
+            "UPDATE versions "
+            "SET cloud_path = REPLACE(cloud_path, ?, ?) "
+            "WHERE cloud_path LIKE ?",
+            (legacy_seg, canonical_seg, f"%{legacy_seg}%"))
+        c.execute(
+            "UPDATE conflicts "
+            "SET cloud_path = REPLACE(cloud_path, ?, ?) "
+            "WHERE cloud_path LIKE ?",
+            (legacy_seg, canonical_seg, f"%{legacy_seg}%"))
+        c.execute(
+            "UPDATE conflicts "
+            "SET conflict_path = REPLACE(conflict_path, ?, ?) "
+            "WHERE conflict_path LIKE ?",
+            (legacy_seg, canonical_seg, f"%{legacy_seg}%"))
 
 
 def migrate(*, cloud: RcloneCloud, system: str,
