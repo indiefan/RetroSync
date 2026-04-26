@@ -83,6 +83,14 @@ class Config:
     #     `conflicts/`, leave cloud current alone, require an operator
     #     `retrosync conflicts resolve` decision.
     conflict_winner: str = "device"
+    # When a device with no prior sync_state shows up with bytes that
+    # differ from cloud's current AND don't match any known historical
+    # version, prefer cloud over device. The device's bytes are still
+    # preserved as a versions/* entry (so you can recover them later).
+    # Useful for Pockets whose source_id has changed (per-UUID migration)
+    # and which now look "unknown" but actually have stale data. Default
+    # false (current behavior: device wins).
+    cloud_wins_on_unknown_device: bool = False
     # Per-device-kind byte-count threshold for the "drift filter" — when
     # the engine sees a fast-forward upload AND the device's bytes differ
     # from cloud by ≤ this many bytes, treat as in-sync rather than
@@ -126,6 +134,8 @@ class Config:
             game_aliases=aliases,
             cloud_to_device=bool(raw.get("cloud_to_device", False)),
             conflict_winner=str(raw.get("conflict_winner", "device")),
+            cloud_wins_on_unknown_device=bool(raw.get(
+                "cloud_wins_on_unknown_device", False)),
             drift_threshold=drift,
         )
 
@@ -163,6 +173,16 @@ cloud_to_device: false
 #   "preserve": park device bytes in conflicts/, leave cloud current
 #               alone, require operator `retrosync conflicts resolve`.
 conflict_winner: device
+
+# When a device with no prior sync_state shows up with bytes that differ
+# from cloud's current AND don't match any known historical version,
+# this flag controls whether to trust the device or trust cloud:
+#   false (default): conflict_winner kicks in (typically device wins).
+#   true: preserve the device's bytes as a versions/* entry, then make
+#         cloud's existing current the winner. Useful for Pockets whose
+#         source_id changed (per-physical-device UUID migration) and
+#         which now look "unknown" but actually have stale data.
+cloud_wins_on_unknown_device: false
 
 # Per-device-kind byte-count threshold for the "drift filter". When the
 # engine sees a fast-forward upload (cloud unchanged since last sync,

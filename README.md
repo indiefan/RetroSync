@@ -149,6 +149,13 @@ retrosync conflicts resolve <id> --winner {cloud | device | <hash>}
 # auto-resolved by promoting the device's bytes; the previous cloud
 # bytes stay in versions/ for recovery. Set `conflict_winner: preserve`
 # to require manual resolve instead.
+#
+# For multi-device setups where a device's source_id may have changed
+# (e.g. Pocket per-physical-UUID migration) and you'd rather inherit
+# cloud's latest than regress to stale device data, set:
+#   cloud_wins_on_unknown_device: true
+# This preserves the unknown device's bytes as a versions/* entry
+# (recoverable later) but makes cloud's current the winner.
 
 # Pocket sync (normally fired by udev; manual override):
 sudo retrosync pocket-sync --device /dev/sda1

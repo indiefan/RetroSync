@@ -313,6 +313,19 @@ class StateStore:
                 (ST_READY,)):
             yield _row_to_version(row)
 
+    def hash_in_versions_for_game(self, game_id: str, h: str) -> bool:
+        """Return True iff any source has ever uploaded a version with
+        hash `h` for `game_id`. Used by the sync engine to detect a
+        device presenting bytes that match a known historical version
+        — likely a stale device, not new content."""
+        row = self._conn.execute("""
+            SELECT 1 FROM versions v
+            JOIN files f ON v.source_id = f.source_id AND v.path = f.path
+            WHERE f.game_id = ? AND v.hash = ? AND v.state = 'uploaded'
+            LIMIT 1
+        """, (game_id, h)).fetchone()
+        return row is not None
+
     def list_versions(self, source_id: str,
                       path: str) -> list[VersionRow]:
         return [_row_to_version(r) for r in self._conn.execute("""
