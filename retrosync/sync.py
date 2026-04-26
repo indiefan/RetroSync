@@ -398,6 +398,18 @@ async def _auto_resolve_device_wins(*, source: SaveSource, ref: SaveRef,
         cloud_path=cloud_version, conflict_path=None,
     )
     ctx.state.resolve_conflict(cid, winner_hash=h_dev)
+    # Close any pre-existing OPEN conflicts for this game — they represent
+    # divergences from earlier syncs (likely under conflict_winner=preserve)
+    # that this auto-resolve has now superseded. The bytes those rows point
+    # to (in conflicts/<...>.srm) stay in cloud, so nothing's lost; only
+    # the "needs operator attention" status changes.
+    superseded = ctx.state.open_conflicts_for_game(game_id)
+    for prior in superseded:
+        if prior.id == cid:
+            continue
+        ctx.state.resolve_conflict(prior.id, winner_hash=h_dev)
+        log.info("  closed prior OPEN conflict #%d (superseded by #%d)",
+                 prior.id, cid)
     ctx.invalidate_manifest(paths)
     log.info(
         "auto-resolved divergence #%d for %s on %s: device wins (%s); "
