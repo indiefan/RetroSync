@@ -1,28 +1,25 @@
 """FXPak Pro source adapter (SNES, via usb2snes over USB).
 
-Save files on the FXPak Pro live as <ROM-stem>.srm. With the firmware's
-default settings they sit alongside the ROM, but the "Saves Directory"
-option redirects them to a single folder (e.g. /sd2snes/saves). We discover
-saves by walking the SD recursively from `sd_root`, and we discover the
-partner ROM by first looking next to the save and then, if absent, by
-walking `rom_root` once per process.
+Save files on the FXPak Pro live as <ROM-stem>.srm somewhere on the cart's
+SD card. We discover them by listing the cart recursively from `sd_root`
+and filtering on extension.
 
-Game ID strategy: <crc32>_<slug>, where the CRC32 comes from the ROM bytes
-the first time we encounter a save, and is cached in a small JSON file
-beside the state DB. The slug is the ROM filename minus extension,
-lowercased and made FS-safe. CRC alone is unfriendly to humans; slug alone
-is ambiguous across regions/revisions. When the CRC cannot be computed
-(e.g. the cart is mid-detach) we return `unknown_<slug>` for the current
-pass but DO NOT cache it — the next pass will retry.
+Game ID strategy: a "title slug" derived from the save filename with
+parenthetical/bracket tags stripped. So `Chrono Trigger (U) [!].srm`
+becomes `chrono_trigger`. The full filename (including the stripped
+tags) is preserved in the manifest's `save_path` field, so version
+provenance isn't lost.
+
+Collisions — two cart paths resolving to the same title slug — are
+flagged with a WARN and the alphabetically-first cart path keeps the
+clean slug. The rest fall back to their full filename slug. Subfolder
+promotion (`chrono_trigger/japan/...`) is left for if/when an operator
+actually has multi-region saves to back up.
 """
 from __future__ import annotations
 
-import asyncio
-import json
 import logging
-import os
 import re
-import zlib
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 
@@ -33,8 +30,11 @@ from .usb2snes import Usb2SnesClient, Usb2SnesError
 log = logging.getLogger(__name__)
 
 SRM_SUFFIX = ".srm"
-# A few common ROM extensions; we use these to find the partner ROM for CRC.
-ROM_EXTS = (".sfc", ".smc", ".swc", ".fig")
+
+# Parenthetical or bracketed run, with surrounding whitespace, e.g.
+# " (U)" or " [!]". Non-greedy so consecutive runs collapse cleanly.
+_TAG_RE = re.compile(r"\s*[\(\[].*?[\)\]]\s*")
+_NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
 
 
 @dataclass
@@ -43,12 +43,6 @@ class FXPakConfig:
     sni_url: str = "ws://127.0.0.1:23074"
     sd_root: str = "/"
     save_extensions: tuple[str, ...] = (SRM_SUFFIX,)
-    cache_dir: str = "/var/lib/retrosync/fxpak-cache"
-    # Where to look for ROMs when the partner ROM isn't sitting in the same
-    # directory as the save. Matches the FXPak firmware's "Saves Directory"
-    # feature, which puts every .srm under one folder regardless of where
-    # the ROM lives. Walked once per process and memoized.
-    rom_root: str = "/"
 
 
 class FXPakSource:
@@ -62,38 +56,8 @@ class FXPakSource:
     def __init__(self, config: FXPakConfig):
         self._cfg = config
         self.id = config.id
-        self._game_id_cache: dict[str, str] = {}
-        # Lazy index of {rom-stem-lowercase: full-rom-path} under rom_root,
-        # built on the first miss in a save's parent directory and reused
-        # for every subsequent miss within this process.
-        self._rom_index: dict[str, str] | None = None
-        self._rom_index_lock = asyncio.Lock()
-        os.makedirs(self._cfg.cache_dir, exist_ok=True)
-        self._cache_file = os.path.join(self._cfg.cache_dir, "game_ids.json")
-        self._load_cache()
-
-    def _load_cache(self) -> None:
-        try:
-            with open(self._cache_file) as fp:
-                raw = json.load(fp)
-        except (OSError, json.JSONDecodeError):
-            self._game_id_cache = {}
-            return
-        # Self-heal: drop any `unknown_*` entries left by older daemons that
-        # cached the CRC-miss fallback. Modern code only caches successful
-        # lookups, so on next poll these will be retried and (typically)
-        # resolve to a real <crc32>_<slug>.
-        purged = {k: v for k, v in raw.items() if not v.startswith("unknown_")}
-        if len(purged) != len(raw):
-            log.info("FXPak %s: dropped %d poisoned 'unknown_*' cache entries",
-                     self.id, len(raw) - len(purged))
-        self._game_id_cache = purged
-
-    def _save_cache(self) -> None:
-        tmp = self._cache_file + ".tmp"
-        with open(tmp, "w") as fp:
-            json.dump(self._game_id_cache, fp)
-        os.replace(tmp, self._cache_file)
+        # Populated by list_saves, consumed by resolve_game_id. Path → slug.
+        self._slug_assignments: dict[str, str] = {}
 
     # ----------- SaveSource methods -----------
 
@@ -123,7 +87,10 @@ class FXPakSource:
         for p in paths:
             if p.lower().endswith(suffixes):
                 saves.append(SaveRef(path=p))
-        log.debug("FXPak %s: found %d save files", self.id, len(saves))
+
+        self._slug_assignments = self._compute_slug_assignments(
+            [s.path for s in saves])
+        log.debug("FXPak %s: found %d save file(s)", self.id, len(saves))
         return saves
 
     async def read_save(self, ref: SaveRef) -> bytes:
@@ -143,124 +110,71 @@ class FXPakSource:
             raise SourceError(str(exc)) from exc
 
     def resolve_game_id(self, ref: SaveRef) -> str:
-        """Cached <crc32>_<slug>. Falls back to slug-only if CRC unavailable."""
-        cached = self._game_id_cache.get(ref.path)
-        if cached:
-            return cached
-        # Without an actual ROM read we can't compute CRC here synchronously.
-        # Defer to async helper below; orchestrator calls async_resolve when
-        # populating the manifest. For the synchronous fallback we slug only.
-        slug = self._slug_from_save_path(ref.path)
-        return f"unknown_{slug}"
+        """Return the assigned slug, computing it on the fly if needed.
 
-    async def async_resolve_game_id(self, ref: SaveRef) -> str:
-        """Async variant that reads the partner ROM to compute CRC32.
-
-        On a CRC miss we return `unknown_<slug>` for this call but do NOT
-        write it to the cache — caching the fallback would make the bad ID
-        sticky across restarts. Successful lookups are persisted.
+        list_saves populates `_slug_assignments` for the whole pass. For
+        callers that arrive without that priming (e.g. an upload of a
+        stuck-version row at startup), fall back to the title slug — it
+        won't have collision-aware fallback, but the orchestrator's
+        next list_saves will fix it within a poll.
         """
-        cached = self._game_id_cache.get(ref.path)
-        if cached:
-            return cached
-        slug = self._slug_from_save_path(ref.path)
-        crc = await self._fetch_rom_crc(ref.path)
-        if crc is None:
-            return f"unknown_{slug}"
-        game_id = f"{crc:08x}_{slug}"
-        self._game_id_cache[ref.path] = game_id
-        self._save_cache()
-        return game_id
+        return (self._slug_assignments.get(ref.path)
+                or self._title_slug(ref.path))
 
     # ----------- helpers -----------
 
     @staticmethod
-    def _slug_from_save_path(save_path: str) -> str:
+    def _title_slug(save_path: str) -> str:
+        """`Chrono Trigger (U) [!].srm` → `chrono_trigger`."""
         stem = PurePosixPath(save_path).stem
-        slug = re.sub(r"[^a-z0-9]+", "_", stem.lower()).strip("_")
+        stripped = _TAG_RE.sub(" ", stem)
+        slug = _NON_ALNUM_RE.sub("_", stripped.lower()).strip("_")
         return slug or "unnamed"
 
-    async def _fetch_rom_crc(self, save_path: str) -> int | None:
-        """Find the partner ROM and return its CRC32, or None.
-
-        Search order:
-          1. Same directory as the save (typical when saves live next to ROMs).
-          2. Recursive walk of `rom_root` (typical when the FXPak's "Saves
-             Directory" feature redirects every .srm into one folder).
-        The walk is memoized so it only runs once per process.
-        """
-        save_dir = str(PurePosixPath(save_path).parent) or "/"
-        save_stem = PurePosixPath(save_path).stem
-        try:
-            async with Usb2SnesClient(self._cfg.sni_url) as cart:
-                await cart.attach()
-
-                entries = await cart.list(save_dir)
-                rom_path = self._match_rom_in_entries(
-                    entries, save_dir, save_stem)
-
-                if rom_path is None and self._cfg.rom_root:
-                    index = await self._ensure_rom_index(cart)
-                    rom_path = index.get(save_stem.lower())
-
-                if rom_path is None:
-                    seen = sorted(e.name for e in entries if e.is_file)
-                    expected = [save_stem + ext for ext in ROM_EXTS]
-                    log.info(
-                        "no ROM match for %s — looked in %s (saw %d file(s): "
-                        "%s) and rom_root=%s; expected one of %s",
-                        save_path, save_dir, len(seen), seen[:20],
-                        self._cfg.rom_root, expected,
-                    )
-                    return None
-
-                data = await cart.get_file(rom_path)
-                return zlib.crc32(data) & 0xFFFFFFFF
-        except Usb2SnesError as exc:
-            log.warning("CRC lookup failed for %s: %s", save_path, exc)
-        return None
-
     @staticmethod
-    def _match_rom_in_entries(entries, save_dir: str, save_stem: str) -> str | None:
-        for ext in ROM_EXTS:
-            candidate = (save_stem + ext).lower()
-            for e in entries:
-                if e.is_file and e.name.lower() == candidate:
-                    return save_dir.rstrip("/") + "/" + e.name
-        return None
+    def _full_slug(save_path: str) -> str:
+        """`Chrono Trigger (U) [!].srm` → `chrono_trigger_u`. Used as a
+        collision fallback when two saves share a title slug."""
+        stem = PurePosixPath(save_path).stem
+        slug = _NON_ALNUM_RE.sub("_", stem.lower()).strip("_")
+        return slug or "unnamed"
 
-    async def _ensure_rom_index(self, cart: Usb2SnesClient) -> dict[str, str]:
-        if self._rom_index is not None:
-            return self._rom_index
-        async with self._rom_index_lock:
-            if self._rom_index is not None:
-                return self._rom_index
-            log.info("FXPak %s: indexing ROMs under %s (one-time scan)",
-                     self.id, self._cfg.rom_root)
-            paths = await cart.list_recursive(self._cfg.rom_root)
-            index: dict[str, str] = {}
-            for p in paths:
-                if p.lower().endswith(ROM_EXTS):
-                    stem = PurePosixPath(p).stem.lower()
-                    # First match wins; collisions across regions/revisions
-                    # are unavoidable without filename normalization, but
-                    # the slug differentiates in the final game-id anyway.
-                    index.setdefault(stem, p)
-            log.info("FXPak %s: indexed %d ROM(s) from %s",
-                     self.id, len(index), self._cfg.rom_root)
-            self._rom_index = index
-            return index
+    def _compute_slug_assignments(self, paths: list[str]) -> dict[str, str]:
+        """Map each cart path to its game-id slug, with deterministic
+        collision handling (alphabetically-first cart path wins the clean
+        slug; others fall back to their full filename slug).
+        """
+        by_title: dict[str, list[str]] = {}
+        for p in paths:
+            by_title.setdefault(self._title_slug(p), []).append(p)
+
+        out: dict[str, str] = {}
+        for title, group in by_title.items():
+            if len(group) == 1:
+                out[group[0]] = title
+                continue
+            group.sort()
+            log.warning(
+                "FXPak %s: %d cart paths share game-id %r — first one keeps "
+                "the clean slug; the rest fall back to their full filename "
+                "slug. Paths: %s",
+                self.id, len(group), title, group)
+            out[group[0]] = title
+            for p in group[1:]:
+                out[p] = self._full_slug(p)
+        return out
 
 
 def _build(*, id: str, sni_url: str = "ws://127.0.0.1:23074",
            sd_root: str = "/",
            save_extensions: list[str] | None = None,
-           cache_dir: str = "/var/lib/retrosync/fxpak-cache",
-           rom_root: str = "/") -> FXPakSource:
+           # Accepted but ignored — older config.yaml files may still set
+           # these. Kept here so an upgrade doesn't crash on stale options.
+           cache_dir: str | None = None,
+           rom_root: str | None = None) -> FXPakSource:
     return FXPakSource(FXPakConfig(
         id=id, sni_url=sni_url, sd_root=sd_root,
         save_extensions=tuple(save_extensions or [SRM_SUFFIX]),
-        cache_dir=cache_dir, rom_root=rom_root,
     ))
 
 
