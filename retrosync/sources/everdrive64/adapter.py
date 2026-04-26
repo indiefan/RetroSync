@@ -41,7 +41,12 @@ log = logging.getLogger(__name__)
 @dataclass
 class EverDrive64Config:
     id: str
-    transport: str = "pyftdi"  # | unfloader | mock
+    # Default `serial` matches the FT232 / kernel-bound case verified
+    # on the operator's EverDrive 64 X7. Use `pyftdi` only for
+    # FT245R-equipped carts where the kernel hasn't claimed the device.
+    transport: str = "serial"  # | pyftdi | unfloader | mock
+    serial_path: str = "/dev/ttyUSB0"
+    serial_baud: int = 9600
     ftdi_url: str = "ftdi://ftdi:0x6001/1"
     sd_saves_root: str = "/ED64/SAVES"
     sd_roms_root: str = "/ED64/ROMS"
@@ -86,7 +91,10 @@ class EverDrive64Source:
     def _ensure_transport(self) -> KrikzzFtdiTransport:
         if self._transport is None:
             opts: dict = {}
-            if self._cfg.transport == "pyftdi":
+            if self._cfg.transport == "serial":
+                opts["serial_path"] = self._cfg.serial_path
+                opts["baud"] = self._cfg.serial_baud
+            elif self._cfg.transport == "pyftdi":
                 opts["ftdi_url"] = self._cfg.ftdi_url
             elif self._cfg.transport == "unfloader":
                 opts["unfloader_path"] = self._cfg.unfloader_path
@@ -341,7 +349,9 @@ def _pick_by_region(names: list[str],
     return sorted(names, key=lambda n: (rank(n), n))[0]
 
 
-def _build(*, id: str, transport: str = "pyftdi",
+def _build(*, id: str, transport: str = "serial",
+           serial_path: str = "/dev/ttyUSB0",
+           serial_baud: int = 9600,
            ftdi_url: str = "ftdi://ftdi:0x6001/1",
            sd_saves_root: str = "/ED64/SAVES",
            sd_roms_root: str = "/ED64/ROMS",
@@ -352,7 +362,9 @@ def _build(*, id: str, transport: str = "pyftdi",
            unfloader_path: str = "/usr/local/bin/UNFLoader",
            ) -> EverDrive64Source:
     cfg = EverDrive64Config(
-        id=id, transport=transport, ftdi_url=ftdi_url,
+        id=id, transport=transport,
+        serial_path=serial_path, serial_baud=serial_baud,
+        ftdi_url=ftdi_url,
         sd_saves_root=sd_saves_root, sd_roms_root=sd_roms_root,
         game_aliases=dict(game_aliases or {}),
         system=system, unfloader_path=unfloader_path,

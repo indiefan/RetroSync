@@ -1,32 +1,59 @@
-"""Krikzz EverDrive USB protocol — FT245-based.
+"""Krikzz EverDrive USB protocol.
 
-Shared by every Krikzz EverDrive product that exposes a USB Type-B
-Mini port backed by the FTDI FT245R chip: EverDrive 64 X7, Mega
-EverDrive Pro / X7 / X3 (Genesis), and others. The wire framing and
-SD-file commands are common across the OS64 v3.x firmware family.
+Common to several Krikzz flash carts that expose a USB Type-B Mini
+port. Hardware varies — older carts use FT245R (USB FIFO), newer
+revisions / variants use FT232 (USB UART). Both are bulk-USB underneath
+and accept the same 16-byte command frame; what changes is how the
+host-side OS surfaces the device:
 
-This module ships three transport backends behind one common
+  - FT245R → libusb-direct via `pyftdi` (bypasses kernel driver).
+  - FT232  → kernel auto-binds `ftdi_sio` and exposes a serial port
+            at `/dev/ttyUSB*`; talk to it with `pyserial`.
+
+This module ships four transport backends behind one common
 interface (`KrikzzFtdiTransport`):
 
-  - `PyFtdiKrikzzTransport`  — direct USB via libusb / pyftdi. The
-                               primary path. **Wire-byte specifics
-                               are marked TBD pending verification
-                               against UNFLoader source.**
+  - `SerialKrikzzTransport`  — pyserial-based. Works against the
+                               FT232 / kernel-bound case (verified on
+                               operator's EverDrive 64 X7 hardware).
+                               Handshake confirmed; SD-file ops
+                               stubbed pending Krikzz-USB-tool
+                               source review.
+  - `PyFtdiKrikzzTransport`  — direct USB via libusb / pyftdi for
+                               FT245R hardware. Wire bytes are the
+                               same 16-byte frame as the serial
+                               transport; the framing helper is
+                               shared. open() + handshake stubbed
+                               pending pyftdi-on-FT245R verification.
   - `UnfloaderKrikzzTransport` — subprocess wrapper around the
-                                  UNFLoader binary. Fallback for when
-                                  pyftdi has driver issues. **Also
-                                  TBD: UNFLoader's CLI doesn't
-                                  natively expose SD ops; needs a
-                                  small wrapper or patch.**
+                                  UNFLoader binary. UNFLoader source
+                                  has only ROM-upload / debug / PIFboot
+                                  commands; SD-file ops aren't there,
+                                  so this backend is stubbed beyond
+                                  health().
   - `MockKrikzzTransport`    — in-memory implementation for unit
                                 tests. Fully functional.
 
-Per the n64-sync-design doc §3.3, the live-hardware backends'
-wire format is best-effort here and needs to be confirmed against
-UNFLoader's `device_everdrive3.c` (e.g. `cmd_test`, `cmd_dir_open`,
-`cmd_file_read`, etc.) on real hardware before shipping. The
-adapter built on top of this transport is fully complete and
-tested via the Mock backend.
+The 16-byte command frame layout (verified against UNFLoader's
+`device_everdrive.cpp::device_sendcmd_everdrive`):
+
+    byte 0..2  : ASCII "cmd" magic
+    byte 3     : command code ('t' = test, 'W' = ROM write, 's' =
+                 PIFboot, others undocumented in UNFLoader)
+    byte 4..7  : address (uint32 big-endian)
+    byte 8..11 : size in 512-byte blocks (uint32 big-endian)
+    byte 12..15: arg (uint32 big-endian)
+
+Response is also 16 bytes for most commands; `recv[3] == 'r'` after a
+test command is the EverDrive identification check.
+
+SD-file operations (`CMD_DIR_OPEN`, `CMD_FILE_READ` etc. that the
+n64-sync-design doc referenced) are NOT in UNFLoader's source. The
+v3.x OS64 firmware exposes them but the Python implementation needs
+to be derived from Krikzz's separate USB tool (referenced in
+UNFLoader as krikzz.com/pub/support/everdrive-64/x-series/dev/).
+Until that's done the SD-op methods raise NotImplementedError with
+a pointer.
 """
 from __future__ import annotations
 
@@ -60,6 +87,32 @@ CMD_FILE_CLOSE = ord("C")  # TBD
 class KrikzzFtdiError(Exception):
     """Raised on protocol-level failures (timeout, bad response,
     SD I/O error reported by the cart)."""
+
+
+# 16-byte command frame size — fixed by the firmware protocol.
+COMMAND_FRAME_SIZE = 16
+RESPONSE_FRAME_SIZE = 16
+
+
+def build_command_frame(cmd: int, address: int = 0, size_bytes: int = 0,
+                        arg: int = 0) -> bytes:
+    """Construct a 16-byte command frame matching UNFLoader's layout.
+
+    `size_bytes` is the actual byte size of any payload that follows
+    the frame; we encode it in 512-byte blocks per the firmware
+    convention (UNFLoader's `device_sendcmd_everdrive` does
+    `size /= 512` before encoding).
+    """
+    if not 0 <= cmd <= 0xff:
+        raise ValueError(f"cmd byte out of range: {cmd}")
+    blocks = size_bytes // 512
+    frame = bytearray(COMMAND_FRAME_SIZE)
+    frame[0:3] = b"cmd"
+    frame[3] = cmd
+    frame[4:8] = address.to_bytes(4, "big", signed=False)
+    frame[8:12] = blocks.to_bytes(4, "big", signed=False)
+    frame[12:16] = arg.to_bytes(4, "big", signed=False)
+    return bytes(frame)
 
 
 @dataclass(frozen=True)
@@ -110,6 +163,136 @@ class KrikzzFtdiTransport(ABC):
     @abstractmethod
     async def file_exists(self, path: str) -> bool:
         """Cheap existence check (CMD_DIR_OPEN + lookup)."""
+
+
+# -------------------------------------------------------------------- #
+# pyserial backend — kernel-bound FT232 / ftdi_sio at /dev/ttyUSB*.    #
+# -------------------------------------------------------------------- #
+
+class SerialKrikzzTransport(KrikzzFtdiTransport):
+    """pyserial-based transport for FT232-equipped Krikzz carts.
+
+    On Linux, the FT232 is auto-bound by the kernel `ftdi_sio` driver
+    and exposed as `/dev/ttyUSB*`. We talk to it with `pyserial` —
+    no libusb / detach-kernel-driver dance needed.
+
+    Verified against the operator's EverDrive 64 X7: the test command
+    handshake (`cmdt` + 12 zeros → `cmdr` + status bytes) round-trips
+    cleanly. The 16-byte command framing matches UNFLoader's
+    `device_sendcmd_everdrive`.
+
+    SD-file operations are stubbed — see module docstring.
+    """
+
+    def __init__(self, *, serial_path: str = "/dev/ttyUSB0",
+                 baud: int = 9600, timeout_sec: float = 2.0):
+        # FT232 over USB does bulk transfers regardless of the "baud
+        # rate" the host sets, so 9600 / 115200 / 921600 are all
+        # functionally equivalent. 9600 is the kernel default; leave
+        # it unless the operator has a reason to change it.
+        self._path = serial_path
+        self._baud = baud
+        self._timeout = timeout_sec
+        self._port = None  # serial.Serial handle
+
+    async def open(self) -> None:
+        try:
+            import serial  # noqa: F401
+        except ImportError as exc:
+            raise KrikzzFtdiError(
+                "pyserial not installed; "
+                "`sudo apt install python3-serial` "
+                "or `pip install pyserial`") from exc
+        try:
+            import serial as _serial
+            self._port = _serial.Serial(
+                self._path, self._baud, timeout=self._timeout,
+                write_timeout=self._timeout)
+            # Drain any junk left from prior sessions.
+            self._port.reset_input_buffer()
+            self._port.reset_output_buffer()
+        except Exception as exc:  # noqa: BLE001
+            raise KrikzzFtdiError(
+                f"opening {self._path}: {exc}") from exc
+
+    async def close(self) -> None:
+        if self._port is not None:
+            try:
+                self._port.close()
+            except Exception:  # noqa: BLE001
+                pass
+            self._port = None
+
+    async def health(self) -> tuple[bool, str]:
+        if self._port is None:
+            return False, "transport not open"
+        # CMD_TEST: send 'cmdt' + 12 zero-bytes, expect 16 bytes back.
+        # Per UNFLoader: recv[3] == 'r' identifies an EverDrive.
+        try:
+            resp = await self._send_recv(ord("t"))
+        except KrikzzFtdiError as exc:
+            return False, str(exc)
+        if len(resp) < 4 or resp[3:4] != b"r":
+            return False, (
+                f"unexpected handshake response: {resp[:8]!r} "
+                "(expected b'cmdr...')")
+        # The trailing 12 bytes encode firmware version + status. We
+        # surface them in the detail string so `retrosync test-cart`
+        # output is informative; format may evolve.
+        status = resp[4:].hex()
+        return True, f"EverDrive 64 (handshake ok, status={status})"
+
+    # ----- 16-byte framing helper -----
+
+    async def _send_recv(self, cmd: int, *, address: int = 0,
+                         size_bytes: int = 0, arg: int = 0,
+                         response_size: int = RESPONSE_FRAME_SIZE,
+                         ) -> bytes:
+        """Send a 16-byte command frame and read the response."""
+        if self._port is None:
+            raise KrikzzFtdiError("transport not open")
+        frame = build_command_frame(cmd, address=address,
+                                    size_bytes=size_bytes, arg=arg)
+        try:
+            self._port.reset_input_buffer()
+            written = self._port.write(frame)
+            self._port.flush()
+        except Exception as exc:  # noqa: BLE001
+            raise KrikzzFtdiError(f"write failed: {exc}") from exc
+        if written != COMMAND_FRAME_SIZE:
+            raise KrikzzFtdiError(
+                f"short write: {written}/{COMMAND_FRAME_SIZE} bytes")
+        try:
+            resp = self._port.read(response_size)
+        except Exception as exc:  # noqa: BLE001
+            raise KrikzzFtdiError(f"read failed: {exc}") from exc
+        if len(resp) < response_size:
+            raise KrikzzFtdiError(
+                f"short read: {len(resp)}/{response_size} bytes "
+                f"(timeout? cart in wrong state?)")
+        return resp
+
+    # ----- SD operations: stubbed pending Krikzz USB tool review ------
+
+    async def dir_list(self, path: str) -> list[FileEntry]:
+        raise NotImplementedError(
+            "SerialKrikzzTransport.dir_list: SD-file ops are not in "
+            "UNFLoader's source. Need to derive from Krikzz's USB tool "
+            "(krikzz.com/pub/support/everdrive-64/x-series/dev/) or a "
+            "ROM-side debug print of the OS64 protocol. Handshake "
+            "works; this is the next byte-level work.")
+
+    async def file_read(self, path: str) -> bytes:
+        raise NotImplementedError("see SerialKrikzzTransport.dir_list")
+
+    async def file_write(self, path: str, data: bytes) -> None:
+        raise NotImplementedError("see SerialKrikzzTransport.dir_list")
+
+    async def file_delete(self, path: str) -> None:
+        raise NotImplementedError("see SerialKrikzzTransport.dir_list")
+
+    async def file_exists(self, path: str) -> bool:
+        raise NotImplementedError("see SerialKrikzzTransport.dir_list")
 
 
 # -------------------------------------------------------------------- #
@@ -340,9 +523,21 @@ class MockKrikzzTransport(KrikzzFtdiTransport):
 def build_transport(*, kind: str, **opts) -> KrikzzFtdiTransport:
     """Construct a transport from a config string.
 
-    `kind` is one of `pyftdi`, `unfloader`, `mock`. Extra kwargs are
-    passed through to the chosen backend's constructor.
+    `kind` is one of `serial`, `pyftdi`, `unfloader`, `mock`. Extra
+    kwargs are passed through to the chosen backend's constructor.
+
+    Picking a backend:
+      - `serial`    — FT232 carts where the kernel's `ftdi_sio`
+                      auto-bound and exposed `/dev/ttyUSB*`. Most
+                      EverDrive 64 X7s ship like this. Default.
+      - `pyftdi`    — FT245R carts via libusb-direct. Requires
+                      `pip install pyftdi` and that the kernel
+                      driver isn't bound to the device.
+      - `unfloader` — UNFLoader subprocess. Stubbed.
+      - `mock`      — in-memory; tests only.
     """
+    if kind == "serial":
+        return SerialKrikzzTransport(**opts)
     if kind == "pyftdi":
         return PyFtdiKrikzzTransport(**opts)
     if kind == "unfloader":
@@ -351,4 +546,4 @@ def build_transport(*, kind: str, **opts) -> KrikzzFtdiTransport:
         return MockKrikzzTransport(**opts)
     raise ValueError(
         f"unknown transport kind {kind!r}; "
-        "use one of: pyftdi, unfloader, mock")
+        "use one of: serial, pyftdi, unfloader, mock")

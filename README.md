@@ -288,44 +288,57 @@ Each plug-in fires a one-shot sync. Watch progress with
 ### EverDrive 64 X7 setup
 
 Plugs into the same Pi as the FXPak Pro (separate USB port; no
-conflict — different protocols). The udev rule for instant-sync
-ships ready-to-use against stock OS64 v3.x firmware.
+conflict — different protocols). The cart enumerates as an FT232
+serial UART; the kernel auto-binds `ftdi_sio` and exposes it at
+`/dev/ttyUSB*`. RetroSync talks to it via `pyserial` over that
+serial port.
 
-1. Install `pyftdi` for the direct-USB transport:
+1. Install pyserial (one-time):
 
    ```bash
-   sudo apt install -y libusb-1.0-0
-   sudo -u retrosync /opt/retrosync/.venv/bin/pip install pyftdi
+   sudo apt install -y python3-serial
    ```
 
-2. Add a stanza to `/etc/retrosync/config.yaml`:
+2. Confirm the cart enumerates and find its serial port:
+
+   ```bash
+   ls -l /dev/ttyUSB*               # expect /dev/ttyUSB0 or similar
+   sudo dmesg | grep -i ftdi | tail -5
+   ```
+
+3. Add a stanza to `/etc/retrosync/config.yaml`:
 
    ```yaml
    sources:
      - id: everdrive64-1
        adapter: everdrive64
        options:
-         transport: pyftdi
-         ftdi_url: ftdi://ftdi:0x6001/1
+         transport: serial
+         serial_path: /dev/ttyUSB0     # or whatever ttyUSB* came up
+         serial_baud: 9600             # FT232 baud is largely cosmetic
          sd_saves_root: /ED64/SAVES
          sd_roms_root: /ED64/ROMS
          rom_extensions: [.z64, .n64, .v64]
          system: n64
    ```
 
-3. Restart and verify:
+4. Restart and verify the handshake:
 
    ```bash
    sudo systemctl restart retrosync
    retrosync test-cart everdrive64-1
-   journalctl -u retrosync.service -f
+   # Expect: health: OK - EverDrive 64 (handshake ok, status=...)
    ```
 
-**Heads up:** the pyftdi backend's wire-level USB protocol is still
-pending verification against UNFLoader's source on real hardware.
-Until that pass lands, run with `transport: mock` in dev / use the
-in-memory transport for tests; a follow-up will fill in the byte-
-level details once the cart's been exercised.
+**Status:** the handshake (CMD_TEST) is verified end-to-end on real
+hardware. SD-file operations (`dir_list`, `file_read`, etc.) are
+**stubbed pending Krikzz USB tool source review** — UNFLoader's
+source only contains ROM upload + debug + PIFboot, not the SD-file
+commands the OS64 firmware also exposes. The 16-byte command frame
+layout, the test-command identification, and the `EverDrive64Source`
+adapter on top are all done; what's missing is the byte-level format
+of the SD operations themselves. Until that's in, `retrosync test-
+cart` works but `retrosync sync-status` won't show N64 saves.
 
 ### Steam Deck (EmuDeck) setup
 
