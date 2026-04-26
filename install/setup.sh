@@ -152,9 +152,14 @@ install_retrosync_app() {
     cp -a "${RETROSYNC_LOCAL_SOURCE}" "${RETROSYNC_DIR}"
   elif [[ -d "${RETROSYNC_DIR}/.git" ]]; then
     log "updating existing checkout at ${RETROSYNC_DIR}"
-    git -C "${RETROSYNC_DIR}" fetch --quiet origin
-    git -C "${RETROSYNC_DIR}" checkout --quiet "${RETROSYNC_REF}"
-    git -C "${RETROSYNC_DIR}" pull --quiet --ff-only origin "${RETROSYNC_REF}"
+    # The checkout is owned by retrosync; running git as root against it
+    # trips git's "dubious ownership" check. Run as the owning user.
+    sudo -u "${RETROSYNC_USER}" git -C "${RETROSYNC_DIR}" \
+       fetch --quiet origin
+    sudo -u "${RETROSYNC_USER}" git -C "${RETROSYNC_DIR}" \
+       checkout --quiet "${RETROSYNC_REF}"
+    sudo -u "${RETROSYNC_USER}" git -C "${RETROSYNC_DIR}" \
+       pull --quiet --ff-only origin "${RETROSYNC_REF}"
   else
     log "cloning ${RETROSYNC_REPO} (${RETROSYNC_REF}) -> ${RETROSYNC_DIR}"
     git clone --quiet --branch "${RETROSYNC_REF}" \
