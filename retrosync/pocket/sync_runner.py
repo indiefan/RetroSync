@@ -42,7 +42,10 @@ class PocketSyncSummary:
     errors: int = 0
 
     def add(self, result: SyncResult) -> None:
-        if result in (SyncResult.UPLOADED, SyncResult.BOOTSTRAP_UPLOADED):
+        if result in (SyncResult.UPLOADED, SyncResult.BOOTSTRAP_UPLOADED,
+                      SyncResult.CONFLICT_RESOLVED):
+            # CONFLICT_RESOLVED is a divergence we auto-resolved by uploading
+            # the device's bytes — net effect on cloud is the same as UPLOADED.
             self.uploaded += 1
         elif result in (SyncResult.DOWNLOADED, SyncResult.BOOTSTRAP_DOWNLOADED):
             self.downloaded += 1
@@ -132,7 +135,8 @@ async def run_pocket_sync(*, source: PocketSource, config: Config,
                         config_path=config.cloud.rclone_config_path)
     state.upsert_source(id=source.id, system=source.system,
                         adapter="PocketSource", config_json="{}")
-    sync_cfg = SyncConfig(cloud_to_device=config.cloud_to_device)
+    sync_cfg = SyncConfig(cloud_to_device=config.cloud_to_device,
+                          conflict_winner=config.conflict_winner)
     ctx = SyncContext(state=state, cloud=cloud, cfg=sync_cfg)
     summary = PocketSyncSummary()
     refresh_targets: dict[str, tuple[str, str, object]] = {}
@@ -161,7 +165,7 @@ async def run_pocket_sync(*, source: PocketSource, config: Config,
         if outcome.paths is not None and outcome.result in (
                 SyncResult.UPLOADED, SyncResult.BOOTSTRAP_UPLOADED,
                 SyncResult.DOWNLOADED, SyncResult.BOOTSTRAP_DOWNLOADED,
-                SyncResult.CONFLICT):
+                SyncResult.CONFLICT, SyncResult.CONFLICT_RESOLVED):
             refresh_targets[outcome.game_id] = (
                 outcome.game_id, outcome.save_path, outcome.paths)
 

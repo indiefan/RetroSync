@@ -74,6 +74,15 @@ class Config:
     # has confirmed the bytes round-trip correctly. See pocket-sync-design
     # §10.
     cloud_to_device: bool = False
+    # How divergences (device != cloud, with no prior agreement OR both
+    # moved since last sync) are handled.
+    #   "device" (default): the device's bytes win. Become a new versions/
+    #     entry and the cloud's `current.<ext>`. The previous cloud bytes
+    #     stay in `versions/<previous-hash>.<ext>` for recovery.
+    #   "preserve": don't auto-pick. Park the device's bytes in
+    #     `conflicts/`, leave cloud current alone, require an operator
+    #     `retrosync conflicts resolve` decision.
+    conflict_winner: str = "device"
 
     # ----------- loading -----------
 
@@ -105,6 +114,7 @@ class Config:
             cloud=cloud, orchestrator=orch, state=state, sources=sources,
             game_aliases=aliases,
             cloud_to_device=bool(raw.get("cloud_to_device", False)),
+            conflict_winner=str(raw.get("conflict_winner", "device")),
         )
 
     @staticmethod
@@ -133,6 +143,14 @@ state:
 # Default false; flip on after verifying byte-for-byte round-tripping
 # between FXPak Pro and Pocket SNES core. See docs/pocket-sync-design.md §10.
 cloud_to_device: false
+
+# How divergences are handled (device and cloud disagree).
+#   "device"  : device's bytes auto-win, become the new current. The
+#               previous cloud bytes stay in versions/ for recovery.
+#               Recommended default — no manual intervention required.
+#   "preserve": park device bytes in conflicts/, leave cloud current
+#               alone, require operator `retrosync conflicts resolve`.
+conflict_winner: device
 
 # Optional manual alias table for cases where slug normalization can't
 # collapse two filenames on its own. Each entry maps a canonical id to
