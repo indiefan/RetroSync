@@ -256,6 +256,17 @@ cloud_to_device: true
 # in versions/ for recovery.
 conflict_winner: device
 
+# Safer default for a fresh Deck joining an existing cloud-synced fleet:
+# when this device shows up with bytes that differ from cloud's current
+# AND don't match any known historical version (case 4 — no prior
+# agreement), preserve the device's bytes as a versions/* entry but
+# let cloud's current win. With cloud_to_device=true above, cloud's
+# bytes are also written back to the Deck so the next launch resumes
+# from the cloud-side save state. Without this, the first sync of a
+# game on a new Deck will overwrite cloud with whatever the Deck had
+# at boot (which is "nothing" for a never-played game → empty save).
+cloud_wins_on_unknown_device: true
+
 # Active-device lease — soft mode is the default. Switch to hard once
 # every other device in the fleet is also lease-aware (i.e. running
 # v0.3+).
