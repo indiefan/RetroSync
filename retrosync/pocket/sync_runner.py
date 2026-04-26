@@ -176,6 +176,7 @@ async def run_pocket_sync(*, source: PocketSource, config: Config,
         cloud_to_device=config.cloud_to_device,
         conflict_winner=config.conflict_winner,
         cloud_wins_on_unknown_device=config.cloud_wins_on_unknown_device,
+        cloud_wins_on_diverged_device=config.cloud_wins_on_diverged_device,
         drift_threshold=dict(config.drift_threshold))
     ctx = SyncContext(state=state, cloud=cloud, cfg=sync_cfg)
     summary = PocketSyncSummary()

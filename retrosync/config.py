@@ -128,6 +128,16 @@ class Config:
     # and which now look "unknown" but actually have stale data. Default
     # false (current behavior: device wins).
     cloud_wins_on_unknown_device: bool = False
+    # Like cloud_wins_on_unknown_device but for case 7 (both moved
+    # since last agreed hash). True is recommended on the Pi/FXPak
+    # side: cart-side bytes diverging from h_last are usually session
+    # noise (a different game's autosave leftover, a hot-swap
+    # artifact, etc.) rather than a deliberate save. Letting cloud
+    # win on case 7 means another device's deliberate save survives
+    # instead of being overwritten by cart-side noise. Device bytes
+    # are still preserved as a versions/* entry for recovery via
+    # `retrosync promote <game> <hash>`.
+    cloud_wins_on_diverged_device: bool = False
     # Per-device-kind byte-count threshold for the "drift filter" — when
     # the engine sees a fast-forward upload AND the device's bytes differ
     # from cloud by ≤ this many bytes, treat as in-sync rather than
@@ -178,6 +188,8 @@ class Config:
             conflict_winner=str(raw.get("conflict_winner", "device")),
             cloud_wins_on_unknown_device=bool(raw.get(
                 "cloud_wins_on_unknown_device", False)),
+            cloud_wins_on_diverged_device=bool(raw.get(
+                "cloud_wins_on_diverged_device", False)),
             drift_threshold=drift,
             lease=lease,
         )
@@ -226,6 +238,17 @@ conflict_winner: device
 #         source_id changed (per-physical-device UUID migration) and
 #         which now look "unknown" but actually have stale data.
 cloud_wins_on_unknown_device: false
+
+# Like cloud_wins_on_unknown_device but for case 7 (both sides moved
+# since the last agreed hash). True is RECOMMENDED on the Pi/FXPak
+# side: a cart's bytes that diverged from the last agreed hash are
+# usually session noise (a different game's autosave leftover, a
+# hot-swap artifact, etc.) rather than a deliberate user save.
+# Letting cloud win on case 7 means another device's deliberate save
+# survives instead of being overwritten by cart-side noise. Device
+# bytes are preserved as a versions/* entry for recovery via
+# `retrosync promote <game> <hash>`.
+cloud_wins_on_diverged_device: false
 
 # Per-device-kind byte-count threshold for the "drift filter". When the
 # engine sees a fast-forward upload (cloud unchanged since last sync,

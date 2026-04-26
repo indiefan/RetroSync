@@ -187,6 +187,7 @@ async def _async_wrap_pre(*, source_id: str, system: str, game_id: str,
                 cloud_to_device=config.cloud_to_device,
                 conflict_winner=config.conflict_winner,
                 cloud_wins_on_unknown_device=config.cloud_wins_on_unknown_device,
+                cloud_wins_on_diverged_device=config.cloud_wins_on_diverged_device,
                 drift_threshold=dict(config.drift_threshold))
             ctx = SyncContext(state=state, cloud=cloud, cfg=sync_cfg)
             try:
@@ -290,6 +291,7 @@ async def _async_wrap_post(*, source_id: str, system: str, game_id: str,
                     cloud_to_device=config.cloud_to_device,
                     conflict_winner=config.conflict_winner,
                     cloud_wins_on_unknown_device=config.cloud_wins_on_unknown_device,
+            cloud_wins_on_diverged_device=config.cloud_wins_on_diverged_device,
                     drift_threshold=dict(config.drift_threshold))
                 ctx = SyncContext(state=state, cloud=cloud, cfg=sync_cfg)
                 await asyncio.wait_for(_sync_for_game(
