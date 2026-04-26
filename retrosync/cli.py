@@ -180,12 +180,16 @@ def cmd_load(ctx: click.Context, game_id: str, target: str,
                    f"(this overwrites the device's save).")
         if not click.confirm("proceed?", default=True):
             return
+    def _on_wait():
+        click.echo("Plug in the Pocket and enable Tools → USB → Mount as "
+                   "USB Drive. Auto-sync is paused for this load.")
     try:
         result = load_mod.load(
             cfg=cfg, game_id=game_id, target=target,
             device=device,
             mount_path=mount_path or load_mod.DEFAULT_POCKET_MOUNT,
             system=system,
+            on_wait=_on_wait,
         )
     except (FileNotFoundError, ValueError, PermissionError) as exc:
         raise click.ClickException(str(exc))

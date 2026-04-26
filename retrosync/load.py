@@ -15,6 +15,7 @@ import asyncio
 import glob
 import logging
 import os
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -31,6 +32,18 @@ log = logging.getLogger(__name__)
 
 TARGET_POCKET = "pocket"
 DEFAULT_POCKET_MOUNT = "/run/retrosync/load-mount"
+
+# When this file exists, the udev-fired pocket-sync unit exits without
+# doing anything. `load <game> pocket` creates it before waiting for
+# the Pocket to appear, so the auto-sync doesn't mount/sync/unmount the
+# device out from under the manual load.
+SKIP_AUTO_SYNC_FLAG = Path("/run/retrosync/skip-auto-sync")
+
+# How long to block waiting for the Pocket to appear after telling the
+# operator to plug it in. Generous — a slow USB enumeration on a fresh
+# kernel can take 5–10s; the Pocket also needs the operator to flip
+# `Tools → USB → Mount as USB Drive`.
+DEFAULT_DEVICE_WAIT_SEC = 90.0
 
 
 @dataclass
@@ -107,8 +120,14 @@ async def _load_to_cart(source: SaveSource, cart_path: str,
 
 
 def _ensure_mounted(*, device: str | None,
-                    mount_path: str) -> tuple[str, bool]:
+                    mount_path: str,
+                    wait_seconds: float = DEFAULT_DEVICE_WAIT_SEC,
+                    on_wait: callable = None) -> tuple[str, bool]:
     """Mount the Pocket at `mount_path` if not already mounted.
+
+    If the device isn't currently attached, sets the auto-sync skip flag
+    and waits up to `wait_seconds` for it to appear. The skip flag stops
+    the udev-fired pocket-sync unit from racing the manual mount.
 
     Returns (mount_path, did_mount). did_mount tells the caller whether
     they own the unmount.
@@ -119,9 +138,25 @@ def _ensure_mounted(*, device: str | None,
     if device is None:
         device = find_pocket_device()
     if device is None:
-        raise FileNotFoundError(
-            "no Pocket attached. Plug it in via 'Tools → USB → Mount as USB "
-            "Drive', or pass --device /dev/sdX1 explicitly.")
+        # Block the auto-sync that would otherwise mount + immediately
+        # unmount the Pocket the moment it gets plugged in.
+        SKIP_AUTO_SYNC_FLAG.parent.mkdir(parents=True, exist_ok=True)
+        SKIP_AUTO_SYNC_FLAG.touch()
+        if on_wait is not None:
+            on_wait()
+        log.info("waiting up to %.0fs for the Pocket to be plugged in...",
+                 wait_seconds)
+        deadline = time.time() + wait_seconds
+        while time.time() < deadline:
+            time.sleep(0.5)
+            device = find_pocket_device()
+            if device is not None:
+                break
+        if device is None:
+            raise FileNotFoundError(
+                "Pocket didn't appear within "
+                f"{wait_seconds:.0f}s. Plug it in via 'Tools → USB → "
+                "Mount as USB Drive' and re-run.")
     mount_pocket(device=device, mount_path=mount_path)
     return mount_path, True
 
@@ -129,11 +164,15 @@ def _ensure_mounted(*, device: str | None,
 def load(*, cfg: Config, game_id: str, target: str,
          device: str | None = None,
          mount_path: str = DEFAULT_POCKET_MOUNT,
-         system: str | None = None) -> LoadResult:
+         system: str | None = None,
+         on_wait: callable = None) -> LoadResult:
     """Load cloud's current save for game_id onto target.
 
     `target` is "pocket" or a system name ("snes", etc.). When loading to
-    the Pocket and `device` is None, we auto-detect via /dev/disk/by-id.
+    the Pocket and `device` is None, we auto-detect via /dev/disk/by-id;
+    if the Pocket isn't currently attached, we set the auto-sync skip
+    flag, call `on_wait` (if any) so the CLI can prompt the user, and
+    block until the device shows up.
     """
     state = StateStore(cfg.state.db_path)
     cloud = RcloneCloud(remote=cfg.cloud.rclone_remote,
@@ -165,7 +204,8 @@ def load(*, cfg: Config, game_id: str, target: str,
     if target == TARGET_POCKET:
         result = _load_pocket(cfg=cfg, game_id=game_id, data=data, h=h,
                               cloud_path=paths.current,
-                              device=device, mount_path=mount_path)
+                              device=device, mount_path=mount_path,
+                              on_wait=on_wait)
     else:
         result = _load_cart(cfg=cfg, system=target_system, game_id=game_id,
                             data=data, h=h, cloud_path=paths.current,
@@ -176,7 +216,8 @@ def load(*, cfg: Config, game_id: str, target: str,
 
 def _load_pocket(*, cfg: Config, game_id: str, data: bytes, h: str,
                  cloud_path: str, device: str | None,
-                 mount_path: str) -> LoadResult:
+                 mount_path: str,
+                 on_wait: callable = None) -> LoadResult:
     # Mounting is a privileged operation. We need to be root by the time
     # we call _ensure_mounted; the wrapper at /usr/local/bin/retrosync
     # only stays root for `load <game> pocket` if the caller already has
@@ -186,8 +227,13 @@ def _load_pocket(*, cfg: Config, game_id: str, data: bytes, h: str,
             "loading to the Pocket needs root for the mount step. "
             "Re-run as: sudo retrosync load " + game_id + " pocket")
     actual_mount, owned = _ensure_mounted(device=device,
-                                          mount_path=mount_path)
+                                          mount_path=mount_path,
+                                          on_wait=on_wait)
     try:
+        # find_pocket_device may have set the device after the wait —
+        # re-resolve so unmount can power it off cleanly.
+        if device is None:
+            device = find_pocket_device()
         source = build_pocket_source(
             source_id=_pocket_source_id(cfg),
             mount_path=actual_mount, config=cfg)
@@ -197,6 +243,8 @@ def _load_pocket(*, cfg: Config, game_id: str, data: bytes, h: str,
     finally:
         if owned:
             unmount_pocket(mount_path=actual_mount, device=device)
+        # Always clear the skip flag so the next plug-in does normal sync.
+        SKIP_AUTO_SYNC_FLAG.unlink(missing_ok=True)
     return LoadResult(
         target=TARGET_POCKET, game_id=game_id,
         source_id=_pocket_source_id(cfg),
