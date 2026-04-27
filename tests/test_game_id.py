@@ -42,6 +42,59 @@ def test_canonical_slug() -> bool:
     return ok
 
 
+def test_goodtools_revision_tag_does_not_leak_into_slug() -> bool:
+    """Regression: PurePosixPath.stem mis-fired on filenames like
+    `Foo (V1.2) [!]` (no explicit extension) — it'd treat `.2) [!]`
+    as the extension, chop the name to `Foo (V1`, and produce slugs
+    ending in a stray `_v1`. This is the failure mode that produced
+    duplicate cloud folders like `star_wars_shadows_of_the_empire_v1`
+    next to `star_wars_shadows_of_the_empire`.
+
+    Both forms of input must collapse to the canonical slug:
+      - filename with extension: `Foo (V1.2) [!].srm`
+      - bare stem (some adapters pre-strip): `Foo (V1.2) [!]`
+    """
+    cases = [
+        ("Star Wars - Shadows of the Empire (U) (V1.2) [!].srm",
+         "star_wars_shadows_of_the_empire"),
+        ("Star Wars - Shadows of the Empire (U) (V1.2) [!]",
+         "star_wars_shadows_of_the_empire"),
+        ("Cruis_n USA (U) (V1.2) [!].eep",      "cruis_n_usa"),
+        ("Cruis_n USA (U) (V1.2) [!]",          "cruis_n_usa"),
+        ("Star Fox 64 (U) (V1.1) [!].eep",      "star_fox_64"),
+        ("Star Fox 64 (U) (V1.1) [!]",          "star_fox_64"),
+        ("Wave Race 64 (U) (V1.1) [!].eep",     "wave_race_64"),
+    ]
+    ok = True
+    for name, want in cases:
+        ok &= _check(canonical_slug(name), want, f"slug({name!r})")
+    return ok
+
+
+def test_cart_and_no_intro_collapse_to_same_slug() -> bool:
+    """Real-world cross-source case: cart writes GoodTools-named
+    saves, Deck has No-Intro ROMs. They MUST resolve to the same
+    canonical slug or cloud sync routes them to different folders."""
+    cart_save = "Star Wars - Shadows of the Empire (U) (V1.2) [!].srm"
+    deck_rom  = "Star Wars - Shadows of the Empire (USA).z64"
+    return _check(canonical_slug(cart_save), canonical_slug(deck_rom),
+                  "cart save and Deck ROM resolve to same slug")
+
+
+def test_unknown_extension_treated_as_part_of_name() -> bool:
+    """Conservative behavior: only known save/ROM extensions are
+    stripped. A `.bak` or other unknown suffix stays in the name to
+    avoid false-positive stripping of dotted tags."""
+    cases = [
+        ("Star Wars (USA).z64.bak",  "star_wars_z64_bak"),
+        ("Some Game",                "some_game"),
+    ]
+    ok = True
+    for name, want in cases:
+        ok &= _check(canonical_slug(name), want, f"slug({name!r})")
+    return ok
+
+
 def test_aliases() -> bool:
     aliases = {
         "super_metroid": [
@@ -72,6 +125,12 @@ def main() -> int:
     ok = True
     print("--- canonical_slug ---")
     ok &= test_canonical_slug()
+    print("--- goodtools_revision_tag_does_not_leak_into_slug ---")
+    ok &= test_goodtools_revision_tag_does_not_leak_into_slug()
+    print("--- cart_and_no_intro_collapse_to_same_slug ---")
+    ok &= test_cart_and_no_intro_collapse_to_same_slug()
+    print("--- unknown_extension_treated_as_part_of_name ---")
+    ok &= test_unknown_extension_treated_as_part_of_name()
     print("--- aliases ---")
     ok &= test_aliases()
     return 0 if ok else 1
