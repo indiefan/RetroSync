@@ -2,10 +2,19 @@
 
 The N64 had five distinct save formats (4-Kbit EEPROM, 16-Kbit EEPROM,
 SRAM, FlashRAM, Controller Pak). The EverDrive 64 X7 stores them as
-separate per-format files (`.eep`, `.sra`, `.fla`, `.mpk`/`.mp1`–`.mp4`)
-under `/ED64/SAVES/`. Mupen64Plus (the libretro core RetroArch on the
+separate per-format files (`.eep`, `.srm`/`.sra`, `.fla`,
+`.mpk`/`.mp1`–`.mp4`) under `/ED64/gamedata/` (older firmware:
+`/ED64/SAVES/`). Mupen64Plus (the libretro core RetroArch on the
 Deck uses) stores them packed into a single 296,960-byte combined
 `.srm` at fixed offsets.
+
+Note the SRAM extension collision: real EverDrive X7 firmware writes
+SRAM as `.srm` (NOT the `.sra` documented in some open-source
+references). On the cart side, a `.srm` is a raw 32 KB SRAM dump for
+one game; on the cloud side, `.srm` is the combined 296,960-byte
+mupen64plus blob. They live in different namespaces (per-game cart
+file vs. canonical cloud format) so the overload doesn't actually
+collide in code.
 
 This module translates between the two layouts. Cloud's canonical
 storage is the combined form (matches `SYSTEM_CANONICAL_EXTENSION`'s
@@ -71,13 +80,19 @@ EEPROM_16KBIT_BYTES = 0x800      # 2 KB
 
 # Per-format file extensions on the EverDrive's SD card.
 EXT_EEPROM    = ".eep"
-EXT_SRAM      = ".sra"
+# Real EverDrive 64 X7 firmware writes SRAM as `.srm`. Some older
+# firmware (and a number of open-source references) use `.sra`. We
+# accept both on read and default to `.srm` on write — see
+# `EverDrive64Config.sram_extension` for the override.
+EXT_SRAM      = ".srm"
+EXT_SRAM_LEGACY = ".sra"
+ALL_SRAM_EXTENSIONS = (EXT_SRAM, EXT_SRAM_LEGACY)
 EXT_FLASHRAM  = ".fla"
 EXT_CPAK_GENERIC = ".mpk"        # ports collapsed; older firmware
 EXT_CPAK_PER_PORT = (".mp1", ".mp2", ".mp3", ".mp4")  # newer firmware
 
 ALL_N64_SAVE_EXTENSIONS = (
-    EXT_EEPROM, EXT_SRAM, EXT_FLASHRAM,
+    EXT_EEPROM, EXT_SRAM, EXT_SRAM_LEGACY, EXT_FLASHRAM,
     EXT_CPAK_GENERIC, *EXT_CPAK_PER_PORT,
 )
 

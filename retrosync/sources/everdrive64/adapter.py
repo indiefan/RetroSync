@@ -1,8 +1,8 @@
 """EverDrive 64 X7 SaveSource adapter.
 
 The EverDrive's SD card stores N64 saves as one file per format
-(`.eep`, `.sra`, `.fla`, `.mp1`–`.mp4`) under `/ED64/SAVES/`. The
-adapter:
+(`.eep`, `.srm`/`.sra`, `.fla`, `.mp1`–`.mp4`) under
+`/ED64/gamedata/` (older firmware: `/ED64/SAVES/`). The adapter:
 
   - Lists every per-format file as a separate `SaveRef`.
   - `group_refs` groups refs by canonical game-id (so all of
@@ -48,9 +48,16 @@ class EverDrive64Config:
     serial_path: str = "/dev/ttyUSB0"
     serial_baud: int = 9600
     ftdi_url: str = "ftdi://ftdi:0x6001/1"
-    sd_saves_root: str = "/ED64/SAVES"
+    # Real EverDrive 64 X7 OS firmware writes saves to /ED64/gamedata/,
+    # NOT the /ED64/SAVES/ that some open-source references mention.
+    # Operator can override if their firmware variant differs.
+    sd_saves_root: str = "/ED64/gamedata"
     sd_roms_root: str = "/ED64/ROMS"
     rom_extensions: tuple[str, ...] = (".z64", ".n64", ".v64")
+    # SRAM extension to use when writing fresh SRAM saves. EverDrive
+    # OS firmware writes `.srm`; some older / open-source variants
+    # write `.sra`. Reads accept both regardless of this setting.
+    sram_write_extension: str = n64.EXT_SRAM
     region_preference: tuple[str, ...] = (
         "usa", "world", "europe", "japan")
     game_aliases: dict[str, list[str]] = field(default_factory=dict)
@@ -252,8 +259,8 @@ class EverDrive64Source:
                     probed, len(out))
                 break
             stem = PurePosixPath(rom_name).stem
-            for ext in (n64.EXT_EEPROM, n64.EXT_SRAM, n64.EXT_FLASHRAM,
-                        *n64.EXT_CPAK_PER_PORT):
+            for ext in (n64.EXT_EEPROM, n64.EXT_SRAM, n64.EXT_SRAM_LEGACY,
+                        n64.EXT_FLASHRAM, *n64.EXT_CPAK_PER_PORT):
                 if _time.monotonic() > deadline:
                     break
                 path = f"{self._cfg.sd_saves_root}/{stem}{ext}"
@@ -398,7 +405,7 @@ class EverDrive64Source:
                     f"reading {ref.path}: {exc}") from exc
             if ext == n64.EXT_EEPROM:
                 eeprom = data
-            elif ext == n64.EXT_SRAM:
+            elif ext in n64.ALL_SRAM_EXTENSIONS:
                 sram = data
             elif ext == n64.EXT_FLASHRAM:
                 flashram = data
@@ -423,23 +430,51 @@ class EverDrive64Source:
         t = await self._open()
         present = {ref.path for ref in current_refs}
 
-        async def write_or_delete(ext: str, payload: bytes | None) -> None:
+        async def delete_if_present(path: str, reason: str) -> None:
+            if path not in present:
+                return
+            try:
+                await t.file_delete(path)
+                log.info("EverDrive 64: %s %s", reason, path)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("delete %s failed: %s", path, exc)
+
+        async def write_or_delete(ext: str, payload: bytes | None,
+                                  also_delete_exts: tuple[str, ...] = ()
+                                  ) -> None:
             path = f"{self._cfg.sd_saves_root}/{stem}{ext}"
+            alt_paths = tuple(
+                f"{self._cfg.sd_saves_root}/{stem}{alt}"
+                for alt in also_delete_exts if alt != ext)
             if payload is None:
-                if path in present:
-                    try:
-                        await t.file_delete(path)
-                        log.info("EverDrive 64: deleted empty %s", path)
-                    except Exception as exc:  # noqa: BLE001
-                        log.warning("delete %s failed: %s", path, exc)
+                await delete_if_present(path, "deleted empty")
+                for alt_path in alt_paths:
+                    await delete_if_present(alt_path, "deleted empty alt")
                 return
             try:
                 await t.file_write(path, payload)
             except Exception as exc:  # noqa: BLE001
                 raise SourceError(f"writing {path}: {exc}") from exc
+            for alt_path in alt_paths:
+                await delete_if_present(
+                    alt_path, f"removed stale alt (superseded by {ext})")
 
         await write_or_delete(n64.EXT_EEPROM, ss.eeprom)
-        await write_or_delete(n64.EXT_SRAM, ss.sram)
+        # Pick whichever SRAM extension already exists on the cart so
+        # we don't accidentally write `.srm` next to an existing `.sra`
+        # (or vice versa). Falls back to configured `sram_write_extension`
+        # (default `.srm` to match real EverDrive firmware).
+        sram_ext = self._cfg.sram_write_extension
+        for ref in current_refs:
+            ref_ext = ("." + ref.path.rsplit(".", 1)[-1].lower()
+                       if "." in ref.path else "")
+            if ref_ext in n64.ALL_SRAM_EXTENSIONS:
+                sram_ext = ref_ext
+                break
+        # The "other" SRAM extension we want to clean up if we wrote one.
+        sram_alts = tuple(e for e in n64.ALL_SRAM_EXTENSIONS if e != sram_ext)
+        await write_or_delete(sram_ext, ss.sram,
+                              also_delete_exts=sram_alts)
         await write_or_delete(n64.EXT_FLASHRAM, ss.flashram)
         for idx, cpak_bytes in enumerate(ss.cpak):
             await write_or_delete(n64.EXT_CPAK_PER_PORT[idx], cpak_bytes)
@@ -493,9 +528,10 @@ class EverDrive64Source:
         # write_saveset will only actually write the ones the saveset
         # has bytes for. Including the empty slots gives the caller
         # full visibility.
+        sram_ext = self._cfg.sram_write_extension
         out: dict[str, str | list[str]] = {
             "eep":  f"{self._cfg.sd_saves_root}/{stem}{n64.EXT_EEPROM}",
-            "sra":  f"{self._cfg.sd_saves_root}/{stem}{n64.EXT_SRAM}",
+            "sra":  f"{self._cfg.sd_saves_root}/{stem}{sram_ext}",
             "fla":  f"{self._cfg.sd_saves_root}/{stem}{n64.EXT_FLASHRAM}",
             "mpk": [f"{self._cfg.sd_saves_root}/{stem}{ext}"
                     for ext in n64.EXT_CPAK_PER_PORT],
@@ -527,8 +563,9 @@ def _build(*, id: str, transport: str = "serial",
            serial_path: str = "/dev/ttyUSB0",
            serial_baud: int = 9600,
            ftdi_url: str = "ftdi://ftdi:0x6001/1",
-           sd_saves_root: str = "/ED64/SAVES",
+           sd_saves_root: str = "/ED64/gamedata",
            sd_roms_root: str = "/ED64/ROMS",
+           sram_write_extension: str = n64.EXT_SRAM,
            rom_extensions: list[str] | None = None,
            region_preference: list[str] | None = None,
            game_aliases: dict[str, list[str]] | None = None,
@@ -543,6 +580,7 @@ def _build(*, id: str, transport: str = "serial",
         serial_path=serial_path, serial_baud=serial_baud,
         ftdi_url=ftdi_url,
         sd_saves_root=sd_saves_root, sd_roms_root=sd_roms_root,
+        sram_write_extension=sram_write_extension,
         game_aliases=dict(game_aliases or {}),
         rom_filenames=tuple(rom_filenames or ()),
         local_rom_dir=local_rom_dir,
