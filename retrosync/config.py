@@ -369,6 +369,23 @@ sources:
   #     # on the cart's SD. Merged with local_rom_dir scan results.
   #     # rom_filenames:
   #     #   - "Cart-Only Game (USA).z64"
+  #     #
+  #     # OPTIONAL: path to a plain-text listing of the cart's
+  #     # gamedata save filenames (one basename per line). Use this
+  #     # when your cart's saves use a different naming convention
+  #     # than your local ROMs (e.g. cart has GoodTools
+  #     # `Foo (U) [!].srm` but local_rom_dir has No-Intro
+  #     # `Foo (USA).z64`). Generate with:
+  #     #
+  #     #   ls /path/to/sd/ED64/gamedata > \\
+  #     #       /etc/retrosync/everdrive64-1-saves.txt
+  #     #
+  #     # Re-run that command whenever you start a new game on the
+  #     # cart so the listing stays in sync. The adapter trusts the
+  #     # listing and uses it as the source of save names; falls
+  #     # back to local_rom_dir / rom_filenames probing if the file
+  #     # isn't set or is missing.
+  #     # saves_listing_path: /etc/retrosync/everdrive64-1-saves.txt
   #
   # And a corresponding Deck-side EmuDeck source for N64 (separate
   # from the SNES one above):

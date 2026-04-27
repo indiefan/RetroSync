@@ -81,6 +81,26 @@ class EverDrive64Config:
     # and the cart self-enumerates.
     local_rom_dir: str | None = None
     rom_filenames: tuple[str, ...] = ()
+    # Path to a plain-text file listing the cart's gamedata save
+    # filenames (one per line, basename only — no directory prefix).
+    # The operator generates this once via:
+    #
+    #   ls /path/to/sd/ED64/gamedata > /etc/retrosync/everdrive64-saves.txt
+    #
+    # The adapter trusts the listing and uses it as the source of
+    # save filenames (same role dir_list would play if the firmware
+    # supported it). This handles the case where the cart's saves
+    # use a naming convention that differs from the operator's local
+    # ROMs (e.g. cart has GoodTools `Foo (U) [!].srm`, ROM library
+    # has No-Intro `Foo (USA).z64`) — canonical-slug matching alone
+    # can't bridge the gap because we don't know what filenames to
+    # try.
+    #
+    # Falls back to local_rom_dir / rom_filenames probing if this
+    # path isn't set or the file doesn't exist. The listing should
+    # be re-generated whenever the operator starts a new game on
+    # the cart.
+    saves_listing_path: str | None = None
     # Maximum seconds the rom_filenames-fallback enumeration can spend
     # probing file_exists across the full ROM × per-format-extension
     # space. For 200+ ROMs × 7 extensions, an unbounded scan can take
@@ -164,11 +184,28 @@ class EverDrive64Source:
 
     async def list_saves(self) -> list[SaveRef]:
         t = await self._open()
-        # Try dir_list first. Mock + (future) firmware-supported
-        # dir_list backends use this fast path.
+        # Strategy chain (most authoritative first):
+        #   1. dir_list  — only Mock and future firmware-supported
+        #      backends can do this; gives us the cart's directory
+        #      directly.
+        #   2. saves_listing_path sidecar — operator-supplied list
+        #      of cart-side save filenames. Trusted as-is. Useful
+        #      when the cart's naming convention doesn't match the
+        #      operator's local ROMs (e.g. GoodTools vs No-Intro).
+        #   3. ROM-stem probing — derive expected save filenames
+        #      from local_rom_dir / rom_filenames and probe each
+        #      with file_exists. Only works if cart's save names
+        #      match ROM stems byte-for-byte.
         try:
             entries = await t.dir_list(self._cfg.sd_saves_root)
         except NotImplementedError:
+            sidecar = self._read_sidecar_listing()
+            if sidecar:
+                log.info("EverDrive 64 %s: using sidecar listing (%d "
+                         "entries from %s)",
+                         self.id, len(sidecar),
+                         self._cfg.saves_listing_path)
+                return sidecar
             return await self._list_saves_via_rom_filenames()
         except Exception as exc:  # noqa: BLE001
             raise SourceError(
@@ -185,6 +222,39 @@ class EverDrive64Source:
                 path=f"{self._cfg.sd_saves_root}/{e.name}",
                 size_bytes=e.size,
             ))
+        return out
+
+    def _read_sidecar_listing(self) -> list[SaveRef]:
+        """Read the operator-supplied sidecar listing. Each non-blank,
+        non-`#` line is a basename like `Mario Golf (U) [!].srm`.
+        Returns [] if the path isn't configured or the file is
+        missing — caller falls back to ROM-stem probing.
+        """
+        if not self._cfg.saves_listing_path:
+            return []
+        from pathlib import Path
+        path = Path(self._cfg.saves_listing_path)
+        if not path.exists():
+            log.debug("EverDrive 64 %s: saves_listing_path %s not found",
+                      self.id, path)
+            return []
+        try:
+            lines = path.read_text().splitlines()
+        except OSError as exc:
+            log.warning("EverDrive 64 %s: reading sidecar %s failed: %s",
+                        self.id, path, exc)
+            return []
+        out: list[SaveRef] = []
+        for line in lines:
+            name = line.strip()
+            if not name or name.startswith("#"):
+                continue
+            ext = ("." + name.rsplit(".", 1)[-1].lower()
+                   if "." in name else "")
+            if ext not in n64.ALL_N64_SAVE_EXTENSIONS:
+                continue
+            out.append(SaveRef(
+                path=f"{self._cfg.sd_saves_root}/{name}"))
         return out
 
     def _resolved_rom_names(self) -> list[str]:
@@ -481,17 +551,29 @@ class EverDrive64Source:
 
     async def target_save_paths_for(self,
                                     game_id: str) -> dict[str, str | list[str]]:
-        """Per the design's generalized API. Walks `/ED64/ROMS/` to
-        find a ROM whose canonical slug matches `game_id`, returns
-        the per-format save paths under the matched stem.
+        """Per the design's generalized API. Returns the per-format
+        save paths the cart uses (or would use) for `game_id`.
 
-        Returns an empty dict when no matching ROM is found — caller
-        skips the bootstrap-pull and logs a warning.
+        Strategy chain:
+          1. Sidecar listing — if any entry's basename resolves to
+             `game_id`, use its actual stem (cart's existing filename).
+             This is the only way to hit the right path when the cart
+             uses GoodTools naming and the local ROMs use No-Intro.
+          2. ROM-stem derivation — find a ROM in /ED64/ROMS or
+             local_rom_dir whose canonical slug matches `game_id`,
+             use its stem. Used for fresh games with no save yet.
 
-        When dir_list isn't available, falls back to scanning the
-        configured `rom_filenames` list for a slug match (no SD
-        listing required).
+        Returns an empty dict when no match is found — caller skips
+        the bootstrap-pull and logs a warning.
         """
+        sidecar = self._read_sidecar_listing()
+        for ref in sidecar:
+            name = PurePosixPath(ref.path).name
+            stem = PurePosixPath(name).stem
+            if resolve_game_id(stem,
+                               aliases=self._cfg.game_aliases) == game_id:
+                self._rom_stem_cache[game_id] = stem
+                return self._target_paths_from_stem(stem)
         t = await self._open()
         try:
             entries = await t.dir_list(self._cfg.sd_roms_root)
@@ -524,19 +606,22 @@ class EverDrive64Source:
         chosen = _pick_by_region(matches, self._cfg.region_preference)
         stem = PurePosixPath(chosen).stem
         self._rom_stem_cache[game_id] = stem
-        # The dict returned covers EVERY possible save format —
-        # write_saveset will only actually write the ones the saveset
-        # has bytes for. Including the empty slots gives the caller
-        # full visibility.
+        return self._target_paths_from_stem(stem)
+
+    def _target_paths_from_stem(
+            self, stem: str) -> dict[str, str | list[str]]:
+        """Build the per-format save-paths dict for a given filename
+        stem. Covers every possible N64 save format — write_saveset
+        will only actually write the ones the saveset has bytes for.
+        """
         sram_ext = self._cfg.sram_write_extension
-        out: dict[str, str | list[str]] = {
+        return {
             "eep":  f"{self._cfg.sd_saves_root}/{stem}{n64.EXT_EEPROM}",
             "sra":  f"{self._cfg.sd_saves_root}/{stem}{sram_ext}",
             "fla":  f"{self._cfg.sd_saves_root}/{stem}{n64.EXT_FLASHRAM}",
             "mpk": [f"{self._cfg.sd_saves_root}/{stem}{ext}"
                     for ext in n64.EXT_CPAK_PER_PORT],
         }
-        return out
 
 
 _SINGLE_LETTER_REGIONS = {"u": "usa", "e": "europe", "j": "japan",
@@ -571,6 +656,7 @@ def _build(*, id: str, transport: str = "serial",
            game_aliases: dict[str, list[str]] | None = None,
            rom_filenames: list[str] | None = None,
            local_rom_dir: str | None = None,
+           saves_listing_path: str | None = None,
            enumerate_budget_sec: int = 60,
            system: str = "n64",
            unfloader_path: str = "/usr/local/bin/UNFLoader",
@@ -584,6 +670,7 @@ def _build(*, id: str, transport: str = "serial",
         game_aliases=dict(game_aliases or {}),
         rom_filenames=tuple(rom_filenames or ()),
         local_rom_dir=local_rom_dir,
+        saves_listing_path=saves_listing_path,
         enumerate_budget_sec=enumerate_budget_sec,
         system=system, unfloader_path=unfloader_path,
     )

@@ -268,6 +268,108 @@ async def test_target_save_paths_for_no_rom() -> bool:
                   "no matching ROM → empty dict (skip bootstrap)")
 
 
+async def test_list_saves_via_sidecar_listing() -> bool:
+    """Sidecar listing trumps ROM-stem probing when configured. Cart's
+    actual filenames (GoodTools) get used directly; the operator's
+    No-Intro ROM library doesn't have to match."""
+    from retrosync.transport.krikzz_ftdi import KrikzzFtdiTransport
+
+    class NoDirListTransport(KrikzzFtdiTransport):
+        def __init__(self, files):
+            self._files = files
+        async def open(self): pass
+        async def close(self): pass
+        async def health(self): return True, "fake"
+        async def dir_list(self, path): raise NotImplementedError
+        async def file_read(self, path): return self._files[path]
+        async def file_write(self, path, data): self._files[path] = bytes(data)
+        async def file_delete(self, path): self._files.pop(path, None)
+        async def file_exists(self, path): return path in self._files
+
+    workdir = Path(tempfile.mkdtemp(prefix="retrosync-sidecar-"))
+    listing = workdir / "saves.txt"
+    listing.write_text(
+        "# operator-supplied listing of cart save filenames\n"
+        "Mario Golf (U) [!].srm\n"
+        "Super Mario 64 (U) [!].eep\n"
+        "1080 Snowboarding (E) (M4) [!].srm\n"
+        "\n"
+        "notes.txt\n"   # non-N64 extension; should be filtered
+    )
+    files = {
+        "/ED64/gamedata/Mario Golf (U) [!].srm":
+            b"\x00" * n64.SRAM_SIZE,
+        "/ED64/gamedata/Super Mario 64 (U) [!].eep":
+            b"\x00" * n64.EEPROM_4KBIT_BYTES,
+        "/ED64/gamedata/1080 Snowboarding (E) (M4) [!].srm":
+            b"\x00" * n64.SRAM_SIZE,
+    }
+    transport = NoDirListTransport(files)
+    cfg = EverDrive64Config(
+        id="everdrive64-1", transport="mock",
+        sd_saves_root="/ED64/gamedata", sd_roms_root="/ED64/ROMS",
+        saves_listing_path=str(listing),
+        # Local ROMs would NOT match the cart's GoodTools naming;
+        # if sidecar weren't winning we'd find 0 saves.
+        rom_filenames=("Mario Golf (USA).z64",
+                       "Super Mario 64 (USA).z64",
+                       "1080 Snowboarding (USA).z64"),
+        transport_instance=transport,
+    )
+    src = EverDrive64Source(cfg)
+    refs = await src.list_saves()
+    paths = sorted(r.path for r in refs)
+    return _check(paths, [
+        "/ED64/gamedata/1080 Snowboarding (E) (M4) [!].srm",
+        "/ED64/gamedata/Mario Golf (U) [!].srm",
+        "/ED64/gamedata/Super Mario 64 (U) [!].eep",
+    ], "sidecar listing produces SaveRefs for cart's actual filenames")
+
+
+async def test_target_save_paths_for_uses_sidecar() -> bool:
+    """When the cart already has a save for `game_id` in the sidecar
+    listing, target_save_paths_for picks the cart's actual stem
+    (not the ROM-derived stem). Critical for write-back: we must
+    overwrite the cart's existing file, not create a sibling at a
+    different filename."""
+    from retrosync.transport.krikzz_ftdi import KrikzzFtdiTransport
+
+    class NoDirListTransport(KrikzzFtdiTransport):
+        def __init__(self, files):
+            self._files = files
+        async def open(self): pass
+        async def close(self): pass
+        async def health(self): return True, "fake"
+        async def dir_list(self, path): raise NotImplementedError
+        async def file_read(self, path): return self._files[path]
+        async def file_write(self, path, data): self._files[path] = bytes(data)
+        async def file_delete(self, path): self._files.pop(path, None)
+        async def file_exists(self, path): return path in self._files
+
+    workdir = Path(tempfile.mkdtemp(prefix="retrosync-tgt-"))
+    listing = workdir / "saves.txt"
+    # GoodTools-named save on the cart.
+    listing.write_text("Mario Golf (U) [!].srm\n")
+    files = {
+        "/ED64/gamedata/Mario Golf (U) [!].srm":
+            b"\x00" * n64.SRAM_SIZE,
+    }
+    transport = NoDirListTransport(files)
+    cfg = EverDrive64Config(
+        id="everdrive64-1", transport="mock",
+        sd_saves_root="/ED64/gamedata", sd_roms_root="/ED64/ROMS",
+        saves_listing_path=str(listing),
+        # Local ROM library uses No-Intro naming.
+        rom_filenames=("Mario Golf (USA).z64",),
+        transport_instance=transport,
+    )
+    src = EverDrive64Source(cfg)
+    paths = await src.target_save_paths_for("mario_golf")
+    return _check(paths.get("sra"),
+                  "/ED64/gamedata/Mario Golf (U) [!].srm",
+                  "sidecar match wins over ROM-stem derivation")
+
+
 async def test_list_saves_via_local_rom_dir_scan() -> bool:
     """When dir_list isn't supported, the adapter scans local_rom_dir
     for ROM filenames and uses file_exists to enumerate per-format
@@ -474,6 +576,10 @@ def main() -> int:
          test_target_save_paths_for_no_rom),
         ("list_saves_via_rom_filenames_fallback",
          test_list_saves_via_rom_filenames_fallback),
+        ("list_saves_via_sidecar_listing",
+         test_list_saves_via_sidecar_listing),
+        ("target_save_paths_for_uses_sidecar",
+         test_target_save_paths_for_uses_sidecar),
         ("list_saves_via_local_rom_dir_scan",
          test_list_saves_via_local_rom_dir_scan),
         ("list_saves_local_dir_plus_explicit_filenames",
