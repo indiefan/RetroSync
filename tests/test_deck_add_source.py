@@ -166,6 +166,39 @@ def test_unknown_system_errors() -> bool:
     return False
 
 
+def test_hint_from_existing_source_when_root_undetected() -> bool:
+    """When the EmuDeck root isn't in any standard location BUT an
+    existing emudeck source has a saves_root we can mine, derive the
+    root from it. This is the 'add N64 to a Deck whose SNES already
+    works but EmuDeck is in an unusual path' scenario."""
+    tmp = Path(tempfile.mkdtemp(prefix="retrosync-hint-"))
+    # Build a fake EmuDeck under a non-standard path.
+    weird_root = tmp / "weird" / "Emulation"
+    (weird_root / "saves" / "retroarch" / "saves").mkdir(parents=True)
+    (weird_root / "roms" / "n64").mkdir(parents=True)
+    cfg = tmp / "config.yaml"
+    # Pre-existing SNES source pointing at the weird root — this is
+    # what `add-source --system n64` should mine.
+    cfg.write_text(
+        "cloud: {rclone_remote: gdrive:retro-saves}\n"
+        "sources:\n"
+        "  - id: deck-1-snes\n"
+        "    adapter: emudeck\n"
+        "    options:\n"
+        f"      saves_root: {weird_root}/saves/retroarch/saves\n"
+        f"      roms_root: {weird_root}/roms/snes\n"
+        "      save_extension: .srm\n"
+        "      rom_extensions: ['.sfc']\n"
+        "      system: snes\n")
+
+    # No --emudeck-root, no env var — must derive from the SNES source.
+    result = add_source_mod.add_source(
+        config_path=cfg, system="n64")
+    return _check(str(result.roms_root),
+                  str(weird_root / "roms" / "n64"),
+                  "roms_root derived via existing-source hint")
+
+
 def test_render_format_is_yaml_compatible() -> bool:
     """The rendered block parses cleanly as YAML when concatenated to
     a list — covers the spacing / indent contract."""
@@ -194,6 +227,8 @@ def main() -> int:
         ("missing_emudeck_root_errors", test_missing_emudeck_root_errors),
         ("missing_roms_dir_errors", test_missing_roms_dir_errors),
         ("unknown_system_errors", test_unknown_system_errors),
+        ("hint_from_existing_source_when_root_undetected",
+         test_hint_from_existing_source_when_root_undetected),
         ("render_format_is_yaml_compatible",
          test_render_format_is_yaml_compatible),
     ]:
