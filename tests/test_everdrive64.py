@@ -195,6 +195,105 @@ async def test_target_save_paths_for_no_rom() -> bool:
                   "no matching ROM → empty dict (skip bootstrap)")
 
 
+async def test_list_saves_via_local_rom_dir_scan() -> bool:
+    """When dir_list isn't supported, the adapter scans local_rom_dir
+    for ROM filenames and uses file_exists to enumerate per-format
+    saves. No manual rom_filenames entry needed."""
+    from retrosync.transport.krikzz_ftdi import KrikzzFtdiTransport
+
+    class NoDirListTransport(KrikzzFtdiTransport):
+        def __init__(self, files: dict[str, bytes]):
+            self._files = files
+        async def open(self): pass
+        async def close(self): pass
+        async def health(self): return True, "fake"
+        async def dir_list(self, path):
+            raise NotImplementedError
+        async def file_read(self, path):
+            return self._files[path]
+        async def file_write(self, path, data):
+            self._files[path] = bytes(data)
+        async def file_delete(self, path):
+            self._files.pop(path, None)
+        async def file_exists(self, path):
+            return path in self._files
+
+    workdir = Path(tempfile.mkdtemp(prefix="retrosync-localrom-"))
+    rom_dir = workdir / "n64-roms"
+    rom_dir.mkdir()
+    # Operator's local ROM library — adapter discovers these.
+    (rom_dir / "Super Mario 64 (USA).z64").write_bytes(b"rom")
+    (rom_dir / "Paper Mario (USA).z64").write_bytes(b"rom")
+    (rom_dir / "notes.txt").write_bytes(b"ignored")
+
+    files = {
+        # The cart's SD: only some saves exist.
+        "/ED64/SAVES/Super Mario 64 (USA).eep":
+            b"\x00" * n64.EEPROM_4KBIT_BYTES,
+        "/ED64/SAVES/Paper Mario (USA).fla":
+            b"\x00" * n64.FLASHRAM_SIZE,
+    }
+    transport = NoDirListTransport(files)
+    cfg = EverDrive64Config(
+        id="everdrive64-1", transport="mock",
+        sd_saves_root="/ED64/SAVES", sd_roms_root="/ED64/ROMS",
+        local_rom_dir=str(rom_dir),
+        transport_instance=transport,
+    )
+    src = EverDrive64Source(cfg)
+    refs = await src.list_saves()
+    paths = sorted(r.path for r in refs)
+    return _check(paths, [
+        "/ED64/SAVES/Paper Mario (USA).fla",
+        "/ED64/SAVES/Super Mario 64 (USA).eep",
+    ], "local_rom_dir scan + file_exists enumerates correctly")
+
+
+async def test_list_saves_local_dir_plus_explicit_filenames() -> bool:
+    """local_rom_dir + rom_filenames merge cleanly (deduplicated).
+    Useful when some ROMs only live on the cart's SD."""
+    from retrosync.transport.krikzz_ftdi import KrikzzFtdiTransport
+
+    class NoDirListTransport(KrikzzFtdiTransport):
+        def __init__(self, files):
+            self._files = files
+        async def open(self): pass
+        async def close(self): pass
+        async def health(self): return True, "fake"
+        async def dir_list(self, path): raise NotImplementedError
+        async def file_read(self, path): return self._files[path]
+        async def file_write(self, path, data): self._files[path] = bytes(data)
+        async def file_delete(self, path): self._files.pop(path, None)
+        async def file_exists(self, path): return path in self._files
+
+    workdir = Path(tempfile.mkdtemp(prefix="retrosync-merged-"))
+    rom_dir = workdir / "roms"
+    rom_dir.mkdir()
+    (rom_dir / "Super Mario 64 (USA).z64").write_bytes(b"rom")
+
+    files = {
+        "/ED64/SAVES/Super Mario 64 (USA).eep":
+            b"\x00" * n64.EEPROM_4KBIT_BYTES,
+        # Only-on-cart game (operator declared explicitly).
+        "/ED64/SAVES/Cart Only Game.sra":
+            b"\x00" * n64.SRAM_SIZE,
+    }
+    transport = NoDirListTransport(files)
+    cfg = EverDrive64Config(
+        id="everdrive64-1", transport="mock",
+        sd_saves_root="/ED64/SAVES", sd_roms_root="/ED64/ROMS",
+        local_rom_dir=str(rom_dir),
+        rom_filenames=("Cart Only Game.z64",),
+        transport_instance=transport,
+    )
+    src = EverDrive64Source(cfg)
+    refs = await src.list_saves()
+    return _check(sorted(r.path for r in refs), [
+        "/ED64/SAVES/Cart Only Game.sra",
+        "/ED64/SAVES/Super Mario 64 (USA).eep",
+    ], "local_rom_dir + rom_filenames merge into one enumeration")
+
+
 async def test_list_saves_via_rom_filenames_fallback() -> bool:
     """When the transport doesn't support dir_list (real Krikzz
     serial transport), the adapter enumerates by checking
@@ -294,6 +393,10 @@ def main() -> int:
          test_target_save_paths_for_no_rom),
         ("list_saves_via_rom_filenames_fallback",
          test_list_saves_via_rom_filenames_fallback),
+        ("list_saves_via_local_rom_dir_scan",
+         test_list_saves_via_local_rom_dir_scan),
+        ("list_saves_local_dir_plus_explicit_filenames",
+         test_list_saves_local_dir_plus_explicit_filenames),
         ("end_to_end_upload_via_engine",
          test_end_to_end_upload_via_engine),
     ]:

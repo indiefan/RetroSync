@@ -335,23 +335,33 @@ serial port.
 verified against real hardware. The remaining gap is **directory
 listing** — Krikzz's tool requires explicit paths and doesn't expose
 a dir-list command, so the adapter can't auto-enumerate saves on the
-SD. Workaround: declare ROM filenames in config under
-`options.rom_filenames` (one per game you care about), and the
-adapter uses `file_exists` to enumerate per-format save files for
-each. Once an OS64 dir-list byte is reverse-engineered, this becomes
-optional.
+SD. Workaround: point the adapter at a local copy of your N64 ROM
+library; it scans that directory once per pass and uses `file_exists`
+to find matching saves on the cart's SD.
 
 ```yaml
 options:
   ...
-  rom_filenames:
-    - "Super Mario 64 (USA).z64"
-    - "The Legend of Zelda - Ocarina of Time (USA).z64"
-    - "Paper Mario (USA).z64"
+  local_rom_dir: /var/lib/retrosync/n64-roms
 ```
 
-Add filenames as they appear on your SD card; the adapter strips the
-extension and probes for `<stem>.eep / .sra / .fla / .mp1..mp4`.
+Just `cp` (or `rclone copy`, or whatever) your N64 ROMs into that
+directory once. The adapter strips each ROM's extension and probes
+the cart for `<stem>.eep / .sra / .fla / .mp1..mp4`. No manual list
+maintenance per game.
+
+For ROMs that exist only on the cart's SD (no local copy), you can
+combine with an explicit list — both sources merge:
+
+```yaml
+options:
+  local_rom_dir: /var/lib/retrosync/n64-roms
+  rom_filenames:
+    - "Cart-Only Game (USA).z64"
+```
+
+Once an OS64 dir-list byte is reverse-engineered both options become
+optional and the cart self-enumerates.
 
 ### Steam Deck (EmuDeck) setup
 

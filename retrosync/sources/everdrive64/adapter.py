@@ -55,12 +55,24 @@ class EverDrive64Config:
         "usa", "world", "europe", "japan")
     game_aliases: dict[str, list[str]] = field(default_factory=dict)
     # Workaround for the missing dir-list operation in Krikzz's USB
-    # tool source: operator declares the ROM filenames they care
-    # about, the adapter enumerates expected save files for each via
-    # file_info / file_exists. Once an OS64 dir-list cmd byte is
-    # discovered, this can be auto-populated from the SD card.
-    # Format: list of ROM filenames (with extension) as they appear
-    # under /ED64/ROMS.
+    # tool source. Two ways to feed the adapter the ROM names it
+    # needs to derive save filenames:
+    #
+    #   local_rom_dir: a directory ON THE PI (or wherever the daemon
+    #     runs) containing a copy of the operator's N64 ROMs. Most
+    #     setups have this anyway. The adapter `os.listdir`s it once
+    #     per pass and uses the discovered filenames the same way it
+    #     would if dir_list were available. Cheap, zero ongoing
+    #     maintenance.
+    #
+    #   rom_filenames: explicit list. Tedious for big libraries; only
+    #     useful when local_rom_dir isn't available (e.g. headless
+    #     setup with ROMs only on the cart's SD).
+    #
+    # Both can be combined — the adapter merges them. Once an OS64
+    # dir-list cmd byte is reverse-engineered, both become optional
+    # and the cart self-enumerates.
+    local_rom_dir: str | None = None
     rom_filenames: tuple[str, ...] = ()
     system: str = "n64"
     # When transport=mock, callers can pass an already-constructed
@@ -161,25 +173,63 @@ class EverDrive64Source:
             ))
         return out
 
+    def _resolved_rom_names(self) -> list[str]:
+        """Combine local_rom_dir scan + explicit rom_filenames into
+        a deduplicated list of ROM filenames whose extensions match
+        rom_extensions. Used as the de-facto ROM listing whenever the
+        cart's transport doesn't support dir_list.
+        """
+        names: list[str] = []
+        seen: set[str] = set()
+        rom_exts = tuple(e.lower() for e in self._cfg.rom_extensions)
+        if self._cfg.local_rom_dir:
+            from pathlib import Path
+            try:
+                for entry in Path(self._cfg.local_rom_dir).iterdir():
+                    if not entry.is_file():
+                        continue
+                    if not entry.name.lower().endswith(rom_exts):
+                        continue
+                    if entry.name not in seen:
+                        names.append(entry.name)
+                        seen.add(entry.name)
+            except OSError as exc:
+                log.warning(
+                    "%s: scanning local_rom_dir %s failed: %s",
+                    self.id, self._cfg.local_rom_dir, exc)
+        for name in self._cfg.rom_filenames:
+            if name not in seen:
+                names.append(name)
+                seen.add(name)
+        return names
+
     async def _list_saves_via_rom_filenames(self) -> list[SaveRef]:
         """Fallback enumeration when dir_list isn't available.
 
-        For each configured ROM filename, derive the per-format save
-        filenames (Foo.z64 → Foo.eep, Foo.sra, Foo.fla, Foo.mp1..mp4)
-        and probe each with file_info/file_exists. Emit SaveRef for
-        the ones that exist. Useful until an OS64 dir-list command
-        byte is reverse-engineered.
+        Source of ROM names: `_resolved_rom_names()` (local_rom_dir
+        scan + explicit rom_filenames). For each ROM, derive the
+        per-format save filenames (Foo.z64 → Foo.eep / .sra / .fla /
+        .mp1..mp4) and probe each with file_exists. Emit SaveRef
+        for the ones that exist. One file_exists call per
+        rom × format combination — cheap (sub-100ms each over
+        serial); 10 ROMs × 7 formats = 70 calls = ~5s on a fresh
+        cart-on. Cached after the first pass.
         """
-        if not self._cfg.rom_filenames:
+        rom_names = self._resolved_rom_names()
+        if not rom_names:
             log.warning(
-                "EverDrive 64 %s: no rom_filenames configured and the "
-                "transport doesn't support dir_list. Add ROM filenames "
-                "to options.rom_filenames to enable enumeration.",
+                "EverDrive 64 %s: no ROMs visible. Set "
+                "options.local_rom_dir to a directory containing "
+                "your N64 ROMs, OR list filenames under "
+                "options.rom_filenames. Either makes the adapter "
+                "able to enumerate saves on the cart's SD without "
+                "an explicit dir-list (which Krikzz's USB tool "
+                "doesn't expose).",
                 self.id)
             return []
         t = await self._open()
         out: list[SaveRef] = []
-        for rom_name in self._cfg.rom_filenames:
+        for rom_name in rom_names:
             stem = PurePosixPath(rom_name).stem
             for ext in (n64.EXT_EEPROM, n64.EXT_SRAM, n64.EXT_FLASHRAM,
                         *n64.EXT_CPAK_PER_PORT):
@@ -347,12 +397,12 @@ class EverDrive64Source:
             rom_names_iter: list[str] = [
                 e.name for e in entries if not e.is_dir]
         except NotImplementedError:
-            rom_names_iter = list(self._cfg.rom_filenames)
+            rom_names_iter = self._resolved_rom_names()
             if not rom_names_iter:
                 log.warning(
-                    "%s: dir_list unsupported and no rom_filenames "
-                    "configured; can't derive save paths for %s",
-                    self.id, game_id)
+                    "%s: dir_list unsupported and no local_rom_dir / "
+                    "rom_filenames configured; can't derive save paths "
+                    "for %s", self.id, game_id)
                 return {}
         except Exception as exc:  # noqa: BLE001
             log.warning("listing %s for game-id lookup failed: %s",
@@ -417,6 +467,7 @@ def _build(*, id: str, transport: str = "serial",
            region_preference: list[str] | None = None,
            game_aliases: dict[str, list[str]] | None = None,
            rom_filenames: list[str] | None = None,
+           local_rom_dir: str | None = None,
            system: str = "n64",
            unfloader_path: str = "/usr/local/bin/UNFLoader",
            ) -> EverDrive64Source:
@@ -427,6 +478,7 @@ def _build(*, id: str, transport: str = "serial",
         sd_saves_root=sd_saves_root, sd_roms_root=sd_roms_root,
         game_aliases=dict(game_aliases or {}),
         rom_filenames=tuple(rom_filenames or ()),
+        local_rom_dir=local_rom_dir,
         system=system, unfloader_path=unfloader_path,
     )
     if rom_extensions:
