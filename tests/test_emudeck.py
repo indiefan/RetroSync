@@ -137,6 +137,65 @@ def test_emudeck_paths_parses_savefile_directory() -> bool:
                   "savefile_directory parsed")
 
 
+def _make_resolve_config(sources: list[dict]):
+    """Tiny config-shaped object for resolve_source_id tests — has
+    just enough surface area for the function to introspect."""
+    from retrosync.config import SourceConfig
+
+    class _Cfg:
+        pass
+
+    cfg = _Cfg()
+    cfg.sources = [SourceConfig(id=s["id"], adapter=s["adapter"],
+                                options=s.get("options", {}))
+                   for s in sources]
+    return cfg
+
+
+def test_resolve_source_id_uses_matching_system() -> bool:
+    """The wrap dispatcher hardcodes SOURCE_ID=deck-1, but in a
+    multi-system config that's the SNES source. When N64 launches,
+    resolve_source_id picks the N64 source instead."""
+    cfg = _make_resolve_config([
+        {"id": "deck-1-snes", "adapter": "emudeck",
+         "options": {"system": "snes"}},
+        {"id": "deck-1-n64", "adapter": "emudeck",
+         "options": {"system": "n64"}},
+    ])
+    out = wrap.resolve_source_id(
+        source_id="deck-1", system="n64", config=cfg)
+    return _check(out, "deck-1-n64",
+                  "wrong source_id auto-corrected by system match")
+
+
+def test_resolve_source_id_keeps_correct_source() -> bool:
+    """If the passed source_id already matches the system, leave it
+    alone — don't switch to a different source for the same system."""
+    cfg = _make_resolve_config([
+        {"id": "deck-2-n64", "adapter": "emudeck",
+         "options": {"system": "n64"}},
+        {"id": "deck-1-n64", "adapter": "emudeck",
+         "options": {"system": "n64"}},
+    ])
+    out = wrap.resolve_source_id(
+        source_id="deck-2-n64", system="n64", config=cfg)
+    return _check(out, "deck-2-n64",
+                  "correct source_id preserved")
+
+
+def test_resolve_source_id_no_match_passes_through() -> bool:
+    """No emudeck source for `system` → return source_id unchanged so
+    the caller can fail-open and just launch the emulator."""
+    cfg = _make_resolve_config([
+        {"id": "deck-1-snes", "adapter": "emudeck",
+         "options": {"system": "snes"}},
+    ])
+    out = wrap.resolve_source_id(
+        source_id="deck-1", system="genesis", config=cfg)
+    return _check(out, "deck-1",
+                  "no match → original source_id passed through")
+
+
 def test_check_core_save_overrides_flags_footgun() -> bool:
     """savefiles_in_content_dir=true triggers a warning."""
     workdir = Path(tempfile.mkdtemp(prefix="retrosync-cfg-"))
@@ -159,6 +218,12 @@ def main() -> int:
         ("emudeck_remember_filename", test_emudeck_remember_filename),
         ("extract_rom_from_args", test_extract_rom_from_args),
         ("derive_from_rom_emudeck_path", test_derive_from_rom_emudeck_path),
+        ("resolve_source_id_uses_matching_system",
+         test_resolve_source_id_uses_matching_system),
+        ("resolve_source_id_keeps_correct_source",
+         test_resolve_source_id_keeps_correct_source),
+        ("resolve_source_id_no_match_passes_through",
+         test_resolve_source_id_no_match_passes_through),
         ("emudeck_paths_parses_savefile_directory",
          test_emudeck_paths_parses_savefile_directory),
         ("check_core_save_overrides_flags_footgun",
