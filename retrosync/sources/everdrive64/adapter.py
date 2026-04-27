@@ -74,6 +74,13 @@ class EverDrive64Config:
     # and the cart self-enumerates.
     local_rom_dir: str | None = None
     rom_filenames: tuple[str, ...] = ()
+    # Maximum seconds the rom_filenames-fallback enumeration can spend
+    # probing file_exists across the full ROM × per-format-extension
+    # space. For 200+ ROMs × 7 extensions, an unbounded scan can take
+    # many minutes; this caps it at a reasonable value and returns
+    # whatever was found. Bump if you have a large library AND a
+    # responsive cart; lower if you want test-cart to fail fast.
+    enumerate_budget_sec: int = 60
     system: str = "n64"
     # When transport=mock, callers can pass an already-constructed
     # MockKrikzzTransport via dependency injection rather than via
@@ -206,42 +213,101 @@ class EverDrive64Source:
     async def _list_saves_via_rom_filenames(self) -> list[SaveRef]:
         """Fallback enumeration when dir_list isn't available.
 
-        Source of ROM names: `_resolved_rom_names()` (local_rom_dir
-        scan + explicit rom_filenames). For each ROM, derive the
-        per-format save filenames (Foo.z64 → Foo.eep / .sra / .fla /
-        .mp1..mp4) and probe each with file_exists. Emit SaveRef
-        for the ones that exist. One file_exists call per
-        rom × format combination — cheap (sub-100ms each over
-        serial); 10 ROMs × 7 formats = 70 calls = ~5s on a fresh
-        cart-on. Cached after the first pass.
+        Source of ROM names: `_resolved_rom_names()`. For each ROM,
+        derive per-format save filenames and probe each with
+        file_exists. Emit SaveRef for the ones that exist.
+
+        Resilient to "USB Timeout" cart wedges: if N consecutive
+        probes error out, close + reopen + handshake the transport
+        and continue. Bounds total enumeration time at
+        `enumerate_budget_sec` (default 60s). For large libraries
+        (200+ ROMs × 7 extensions), the budget cuts an open-ended
+        full scan short and returns whatever it found.
         """
+        import time as _time
+
         rom_names = self._resolved_rom_names()
         if not rom_names:
             log.warning(
                 "EverDrive 64 %s: no ROMs visible. Set "
                 "options.local_rom_dir to a directory containing "
                 "your N64 ROMs, OR list filenames under "
-                "options.rom_filenames. Either makes the adapter "
-                "able to enumerate saves on the cart's SD without "
-                "an explicit dir-list (which Krikzz's USB tool "
-                "doesn't expose).",
+                "options.rom_filenames.",
                 self.id)
             return []
         t = await self._open()
         out: list[SaveRef] = []
+        consecutive_errors = 0
+        max_consecutive = 5
+        deadline = _time.monotonic() + self._cfg.enumerate_budget_sec
+        probed = 0
         for rom_name in rom_names:
+            if _time.monotonic() > deadline:
+                log.warning(
+                    "EverDrive 64 %s: enumeration budget (%ds) "
+                    "exhausted after %d probes; returning %d "
+                    "save(s) discovered so far. Bump "
+                    "options.enumerate_budget_sec to scan more.",
+                    self.id, self._cfg.enumerate_budget_sec,
+                    probed, len(out))
+                break
             stem = PurePosixPath(rom_name).stem
             for ext in (n64.EXT_EEPROM, n64.EXT_SRAM, n64.EXT_FLASHRAM,
                         *n64.EXT_CPAK_PER_PORT):
+                if _time.monotonic() > deadline:
+                    break
                 path = f"{self._cfg.sd_saves_root}/{stem}{ext}"
+                probed += 1
                 try:
                     exists = await t.file_exists(path)
+                    consecutive_errors = 0
                 except Exception as exc:  # noqa: BLE001
-                    log.debug("file_exists(%s) failed: %s", path, exc)
+                    consecutive_errors += 1
+                    log.debug("file_exists(%s) failed (%d in a row): %s",
+                              path, consecutive_errors, exc)
+                    if consecutive_errors >= max_consecutive:
+                        log.warning(
+                            "%s: %d consecutive file_exists errors — "
+                            "cart likely in USB Timeout state; "
+                            "attempting recovery", self.id,
+                            consecutive_errors)
+                        if not await self._reopen_transport():
+                            log.warning(
+                                "%s: recovery failed; returning %d "
+                                "save(s) discovered so far",
+                                self.id, len(out))
+                            return out
+                        t = self._transport  # type: ignore[assignment]
+                        consecutive_errors = 0
                     continue
                 if exists:
                     out.append(SaveRef(path=path))
+        log.info("EverDrive 64 %s: enumerated %d save(s) from %d probes "
+                 "across %d ROM(s)", self.id, len(out), probed,
+                 len(rom_names))
         return out
+
+    async def _reopen_transport(self) -> bool:
+        """Close and reopen the transport, run a handshake. Used to
+        recover from cart "USB Timeout" wedges. Returns True iff the
+        cart is back. Resets `_opened` so the next operation
+        re-acquires cleanly."""
+        import asyncio as _asyncio
+        try:
+            if self._transport is not None:
+                await self._transport.close()
+        except Exception:  # noqa: BLE001
+            pass
+        self._transport = None
+        self._opened = False
+        await _asyncio.sleep(0.5)
+        try:
+            t = await self._open()
+            ok, _ = await t.health()
+            return ok
+        except Exception as exc:  # noqa: BLE001
+            log.warning("EverDrive 64 reopen failed: %s", exc)
+            return False
 
     async def read_save(self, ref: SaveRef) -> bytes:
         """Read a single per-format file. The engine never calls this
@@ -468,6 +534,7 @@ def _build(*, id: str, transport: str = "serial",
            game_aliases: dict[str, list[str]] | None = None,
            rom_filenames: list[str] | None = None,
            local_rom_dir: str | None = None,
+           enumerate_budget_sec: int = 60,
            system: str = "n64",
            unfloader_path: str = "/usr/local/bin/UNFLoader",
            ) -> EverDrive64Source:
@@ -479,6 +546,7 @@ def _build(*, id: str, transport: str = "serial",
         game_aliases=dict(game_aliases or {}),
         rom_filenames=tuple(rom_filenames or ()),
         local_rom_dir=local_rom_dir,
+        enumerate_budget_sec=enumerate_budget_sec,
         system=system, unfloader_path=unfloader_path,
     )
     if rom_extensions:
