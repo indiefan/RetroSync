@@ -1114,6 +1114,173 @@ def cmd_ed64_probe(ctx: click.Context, source_id: str,
     asyncio.run(_go())
 
 
+@cmd_ed64.command("probe-file-variants")
+@click.argument("source_id")
+@click.argument("path")
+@click.option("--timeout", type=float, default=2.0, show_default=True)
+@click.pass_context
+def cmd_ed64_probe_file_variants(ctx: click.Context, source_id: str,
+                                 path: str, timeout: float) -> None:
+    """Try the file_info ('4') command with several payload-format
+    variants in one pass; report which (if any) returned data.
+
+    \b
+    Variants tested:
+      A. raw path, length=path.length, 0xff pad to 4 (current default)
+      B. raw path, length=path.length, NULL pad to 4
+      C. NULL-terminated path, length=path.length+1, NULL pad to 4
+      D. raw path, length=path.length, fixed 256-byte NULL buffer
+      E. raw path, length=512, NULL-padded to 512
+      F. file_open ('0') first w/ READ mode, then file_info ('4')
+      G. cmd 'i' (lowercase) instead of '4'
+
+    Recovers between variants by reopening the port and re-handshaking.
+    Run with the cart powered on AND the OS64 menu showing.
+    """
+    cfg: Config = ctx.obj["config"]
+    src_cfg = next((s for s in cfg.sources if s.id == source_id), None)
+    if src_cfg is None:
+        raise click.ClickException(f"unknown source {source_id!r}")
+    if src_cfg.adapter != "everdrive64":
+        raise click.ClickException(
+            f"source {source_id!r} is not an everdrive64 adapter")
+
+    async def _go():
+        from .transport.krikzz_ftdi import (
+            build_command_frame, build_transport,
+        )
+
+        def _build_t():
+            opts: dict = {}
+            if src_cfg.options.get("transport", "serial") == "serial":
+                opts["serial_path"] = src_cfg.options.get(
+                    "serial_path", "/dev/ttyUSB0")
+                opts["baud"] = src_cfg.options.get("serial_baud", 9600)
+                opts["timeout_sec"] = timeout
+            return build_transport(
+                kind=src_cfg.options.get("transport", "serial"), **opts)
+
+        t = _build_t()
+        await t.open()
+        ok, detail = await t.health()
+        if not ok:
+            await t.close()
+            raise click.ClickException(f"cart not healthy: {detail}")
+        click.echo(f"cart OK: {detail}")
+        click.echo(f"path: {path!r} ({len(path)}B)\n")
+
+        path_bytes = path.encode("ascii")
+        n = len(path_bytes)
+
+        async def _recover():
+            nonlocal t
+            try:
+                await t.close()
+            except Exception:  # noqa: BLE001
+                pass
+            await asyncio.sleep(0.5)
+            t = _build_t()
+            await t.open()
+            ok, _ = await t.health()
+            return ok
+
+        async def _send(label: str, frames: list[bytes],
+                        expect_first_byte: bytes = b"cmd") -> bool:
+            """Send each frame in `frames` back-to-back, then read up
+            to 64 bytes. Returns True if got >0 bytes back."""
+            port = t._port  # type: ignore[attr-defined]
+            port.timeout = timeout
+            try:
+                port.reset_input_buffer()
+                for fr in frames:
+                    port.write(fr)
+                port.flush()
+                resp = port.read(64)
+            except Exception as exc:  # noqa: BLE001
+                click.echo(f"{label}: port error: {exc}")
+                return False
+            if not resp:
+                click.echo(f"{label}: NO RESPONSE")
+                return False
+            ascii_str = "".join(
+                chr(b) if 0x20 <= b < 0x7f else "."
+                for b in resp)
+            click.echo(f"{label}: {len(resp)}B  hex={resp.hex()}  "
+                       f"ascii={ascii_str}")
+            return True
+
+        # Variant A: raw path, length=n, 0xff pad to 4
+        pad = (4 - n % 4) % 4
+        await _send(
+            "A. 0xff-pad-to-4",
+            [build_command_frame(ord("4"), length=n),
+             path_bytes + b"\xff" * pad])
+        if not await _recover():
+            click.echo("recovery failed; abort"); return
+
+        # Variant B: raw path, length=n, NULL pad to 4
+        await _send(
+            "B. null-pad-to-4",
+            [build_command_frame(ord("4"), length=n),
+             path_bytes + b"\x00" * pad])
+        if not await _recover():
+            click.echo("recovery failed; abort"); return
+
+        # Variant C: NULL-terminated path, length=n+1
+        await _send(
+            "C. null-term + null-pad-to-4",
+            [build_command_frame(ord("4"), length=n + 1),
+             path_bytes + b"\x00" + b"\x00" * ((4 - (n + 1) % 4) % 4)])
+        if not await _recover():
+            click.echo("recovery failed; abort"); return
+
+        # Variant D: 256-byte fixed buffer (NULL-padded)
+        buff_d = path_bytes + b"\x00" * (256 - n)
+        await _send(
+            "D. 256B-buffer",
+            [build_command_frame(ord("4"), length=n),
+             buff_d])
+        if not await _recover():
+            click.echo("recovery failed; abort"); return
+
+        # Variant E: 512-byte payload (length=512)
+        buff_e = path_bytes + b"\x00" * (512 - n)
+        await _send(
+            "E. length=512 + 512B-buffer",
+            [build_command_frame(ord("4"), length=512),
+             buff_e])
+        if not await _recover():
+            click.echo("recovery failed; abort"); return
+
+        # Variant F: file_open ('0') first w/ READ mode, then file_info
+        # FAT_READ = 0x01
+        await _send(
+            "F. file_open(READ) then file_info",
+            [build_command_frame(ord("0"), length=n, arg=0x01),
+             path_bytes + b"\xff" * pad,
+             build_command_frame(ord("4"))])
+        if not await _recover():
+            click.echo("recovery failed; abort"); return
+
+        # Variant G: cmd 'i' (lowercase) instead of '4'
+        await _send(
+            "G. cmd 'i' (lowercase)",
+            [build_command_frame(ord("i"), length=n),
+             path_bytes + b"\xff" * pad])
+        if not await _recover():
+            click.echo("recovery failed; abort"); return
+
+        click.echo("\nDone. If any variant returned bytes starting "
+                   "'cmd', that's likely the right framing — read the "
+                   "ASCII column for status hints.")
+        try:
+            await t.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+    asyncio.run(_go())
+
+
 @cmd_ed64.command("probe-file")
 @click.argument("source_id")
 @click.argument("path")
