@@ -932,41 +932,38 @@ def cmd_ed64() -> None:
 
 @cmd_ed64.command("probe-cmd-bytes")
 @click.argument("source_id")
+@click.option("--bytes", "byte_range", default="5-9",
+              help="Range or list of cmd bytes to probe (e.g. "
+                   "'5-9' or 'a-z' or '5,6,7,D,L'). Default '5-9' "
+                   "covers the file-op family slot most likely to "
+                   "contain dir-list / mkdir / delete.")
 @click.option("--with-path", default="/",
-              help="Path payload to send after the cmd frame, in case "
-                   "the byte expects one (like file_open does). Default "
-                   "is '/' which makes sense for dir-list-shaped commands.")
-@click.option("--timeout", type=float, default=0.4, show_default=True,
-              help="Per-byte response timeout. Bytes the firmware "
-                   "doesn't recognize typically time out silently.")
+              help="Path payload sent after the cmd frame for byte's "
+                   "second probe attempt.")
+@click.option("--timeout", type=float, default=0.5, show_default=True)
+@click.option("--read-bytes", type=int, default=128, show_default=True,
+              help="How many bytes to attempt reading from the cart "
+                   "after each probe. Bigger catches dir-list-shaped "
+                   "payloads; smaller is faster.")
 @click.pass_context
 def cmd_ed64_probe(ctx: click.Context, source_id: str,
-                   with_path: str, timeout: float) -> None:
+                   byte_range: str, with_path: str, timeout: float,
+                   read_bytes: int) -> None:
     """Probe the OS64 firmware for undocumented command bytes.
 
-    Krikzz's USB tool source (https://krikzz.com/pub/support/everdrive-
-    64/x-series/dev/) only documents 't', 'W', 'R', 'c', 'r', 'f', 's',
-    and '0'-'4'. The firmware almost certainly has more commands —
-    notably a directory-list operation (the on-cart menu has to
-    enumerate files somehow). This subcommand sends every printable
-    ASCII cmd byte we don't already know and reports what comes back.
+    Krikzz's USB tool source documents 't', 'W', 'R', 'c', 'r', 'f',
+    's', and '0'-'4'. The firmware almost certainly has more —
+    notably a directory-list operation. This subcommand sweeps a
+    configurable range, sending each byte twice (bare + with-path)
+    and reporting what comes back. Recovers between probes by
+    reopening the serial port and sending a known-good 't' to verify
+    the cart's still talking.
 
     \b
-    Run with the cart powered on AND the OS64 menu showing (NOT mid-
-    game). Sends each byte twice: once bare, once with `--with-path`
-    appended (since dir-list probably takes a path arg the way
-    file_open does).
-
-    \b
-    Output: one line per cmd byte that returns ANYTHING. Look for:
-      - cmd<X> response headers — the byte is recognized, X is the
-        command's reply tag.
-      - Long responses (>16 bytes) — likely a directory listing.
-      - Non-empty hex but no 'cmd' header — the byte does something
-        but in a different framing.
-
-    Then paste the output back to me / file an issue and we'll
-    implement dir_list properly using the discovered byte.
+    Run with the cart powered on AND the OS64 menu showing (NOT
+    mid-game). Output: one line per byte+mode that returned anything.
+    Look for hex starting with 636d64 ('cmd') — those are recognized
+    commands. Long responses (>16 bytes) likely contain payload data.
     """
     cfg: Config = ctx.obj["config"]
     src_cfg = next((s for s in cfg.sources if s.id == source_id), None)
@@ -974,88 +971,163 @@ def cmd_ed64_probe(ctx: click.Context, source_id: str,
         raise click.ClickException(f"unknown source {source_id!r}")
     if src_cfg.adapter != "everdrive64":
         raise click.ClickException(
-            f"source {source_id!r} is not an everdrive64 adapter "
-            f"(got {src_cfg.adapter!r})")
+            f"source {source_id!r} is not an everdrive64 adapter")
+
+    bytes_to_probe = _parse_byte_range(byte_range)
+    if not bytes_to_probe:
+        raise click.ClickException(
+            f"no bytes parsed from --bytes {byte_range!r}")
 
     async def _go():
         from .transport.krikzz_ftdi import (
-            COMMAND_FRAME_SIZE, MIN_BLOCK_SIZE, build_command_frame,
-            build_transport, pad_to_min_block,
+            build_command_frame, build_transport, pad_to_min_block,
         )
-        # Build a transport directly so we can poke at the raw serial port.
-        opts: dict = {}
-        if src_cfg.options.get("transport", "serial") == "serial":
-            opts["serial_path"] = src_cfg.options.get(
-                "serial_path", "/dev/ttyUSB0")
-            opts["baud"] = src_cfg.options.get("serial_baud", 9600)
-        t = build_transport(
-            kind=src_cfg.options.get("transport", "serial"), **opts)
+
+        def _build_t():
+            opts: dict = {}
+            if src_cfg.options.get("transport", "serial") == "serial":
+                opts["serial_path"] = src_cfg.options.get(
+                    "serial_path", "/dev/ttyUSB0")
+                opts["baud"] = src_cfg.options.get("serial_baud", 9600)
+            return build_transport(
+                kind=src_cfg.options.get("transport", "serial"), **opts)
+
+        # Initial open + handshake to confirm the cart's responsive.
+        t = _build_t()
         await t.open()
-        try:
-            ok, detail = await t.health()
-        except Exception as exc:  # noqa: BLE001
-            await t.close()
-            raise click.ClickException(f"health check failed: {exc}")
+        ok, detail = await t.health()
         if not ok:
             await t.close()
             raise click.ClickException(f"cart not healthy: {detail}")
         click.echo(f"cart OK: {detail}")
-        click.echo(f"probing cmd bytes (timeout {timeout}s, "
-                   f"path arg = {with_path!r})\n")
-        # Bytes we already know — skip them.
-        known = {ord(c) for c in "tWRcrfs01234"}
-        # Try printable ASCII range, excluding known.
-        candidates = [b for b in range(0x20, 0x7f) if b not in known]
-        port = t._port  # type: ignore[attr-defined]
-        original_timeout = port.timeout
-        port.timeout = timeout
+        click.echo(f"probing bytes {byte_range!r} (timeout {timeout}s, "
+                   f"path arg = {with_path!r})")
+        click.echo("If you see 'USB Timeout' on the cart screen, that "
+                   "byte expected more data than we sent — informative "
+                   "either way.\n")
+
         any_response = False
+        port = t._port  # type: ignore[attr-defined]
+        port.timeout = timeout
+
+        async def _recover():
+            """Reopen the port and send 't' to verify the cart is
+            back. Returns True on success."""
+            nonlocal t, port
+            try:
+                await t.close()
+            except Exception:  # noqa: BLE001
+                pass
+            await asyncio.sleep(0.5)
+            try:
+                t = _build_t()
+                await t.open()
+                port = t._port  # type: ignore[attr-defined]
+                port.timeout = timeout
+                ok, _ = await t.health()
+                return ok
+            except Exception as exc:  # noqa: BLE001
+                click.echo(f"    (recover failed: {exc})")
+                return False
+
         try:
-            for cmd in candidates:
-                ch = chr(cmd)
-                for label, payload in (
-                        ("bare", b""),
-                        (f"with path {with_path!r}",
-                         pad_to_min_block(with_path.encode())),
+            for cmd in bytes_to_probe:
+                ch = chr(cmd) if 0x20 <= cmd < 0x7f else "?"
+                for label, payload, length_arg in (
+                        ("bare", b"", 0),
+                        (f"+path {with_path!r}",
+                         pad_to_min_block(with_path.encode()),
+                         len(with_path)),
                 ):
-                    port.reset_input_buffer()
-                    frame = build_command_frame(
-                        cmd, length=len(with_path) if payload else 0)
                     try:
+                        port.reset_input_buffer()
+                        frame = build_command_frame(cmd, length=length_arg)
                         port.write(frame + payload)
                         port.flush()
+                        resp = port.read(read_bytes)
                     except Exception as exc:  # noqa: BLE001
                         click.echo(
                             f"  cmd 0x{cmd:02x} ({ch!r}) {label}: "
-                            f"write error: {exc}")
+                            f"port error ({exc.__class__.__name__}); "
+                            f"recovering...")
+                        ok = await _recover()
+                        if not ok:
+                            click.echo("  cart not recovering — abort. "
+                                       "Power-cycle the cart and re-run.")
+                            return
                         continue
-                    # Try to read up to 64 bytes. dir-list-shaped responses
-                    # would likely be the 16-byte cmd frame + payload.
-                    resp = port.read(64)
-                    if not resp:
-                        continue
-                    any_response = True
-                    hex_str = resp.hex()
-                    ascii_str = "".join(
-                        chr(b) if 0x20 <= b < 0x7f else "." for b in resp)
-                    click.echo(
-                        f"  cmd 0x{cmd:02x} ({ch!r}) {label} → "
-                        f"{len(resp)}B  hex={hex_str}  ascii={ascii_str}")
+                    if resp:
+                        any_response = True
+                        hex_str = resp.hex()
+                        ascii_str = "".join(
+                            chr(b) if 0x20 <= b < 0x7f else "."
+                            for b in resp)
+                        click.echo(
+                            f"  cmd 0x{cmd:02x} ({ch!r}) {label} → "
+                            f"{len(resp)}B  hex={hex_str}  "
+                            f"ascii={ascii_str}")
+                    # ALWAYS run a recovery 't' between probes so a
+                    # silent USB-timeout from this byte doesn't poison
+                    # the next one.
+                    try:
+                        port.reset_input_buffer()
+                        port.write(build_command_frame(ord("t")))
+                        port.flush()
+                        recovery = port.read(16)
+                        if not recovery or recovery[:4] != b"cmdr":
+                            ok = await _recover()
+                            if not ok:
+                                click.echo(
+                                    "  cart unresponsive after probe — "
+                                    "abort. Power-cycle + re-run.")
+                                return
+                    except Exception:  # noqa: BLE001
+                        ok = await _recover()
+                        if not ok:
+                            click.echo(
+                                "  recovery failed after probe — abort.")
+                            return
         finally:
-            port.timeout = original_timeout
-            await t.close()
+            try:
+                await t.close()
+            except Exception:  # noqa: BLE001
+                pass
+
         if not any_response:
-            click.echo("\nNo cmd byte returned anything. Possible causes:")
-            click.echo("  - Cart is in mid-game, not OS64 menu")
-            click.echo("  - Probe timeout too short (try --timeout 1.0)")
-            click.echo("  - Firmware variant doesn't expose other cmd bytes")
+            click.echo("\nNo response from any probed byte.")
+            click.echo("Try: --bytes a-z  (lowercase letters)")
+            click.echo("     --bytes A-Z  (uppercase letters)")
+            click.echo("     --timeout 1.5 (slower cart)")
         else:
-            click.echo("\nResponses logged above. Look for entries whose")
-            click.echo("hex starts with 636d64 ('cmd') — those are recognized")
-            click.echo("commands. Paste the output back so we can implement")
-            click.echo("dir_list using the right cmd byte.")
+            click.echo("\nLook for entries with hex prefix 636d64 ('cmd')")
+            click.echo("— those are recognized commands. Long responses")
+            click.echo("(>16 bytes) likely contain payload data.")
 
     asyncio.run(_go())
+
+
+def _parse_byte_range(spec: str) -> list[int]:
+    """Parse '5-9' / '5,6,7' / 'a-z' / '5,A,B,9' into a list of cmd
+    byte values. Single chars become their ASCII code."""
+    out: list[int] = []
+    for piece in spec.split(","):
+        piece = piece.strip()
+        if not piece:
+            continue
+        if "-" in piece and len(piece) >= 3:
+            lo, hi = piece.split("-", 1)
+            lo_b = ord(lo) if len(lo) == 1 else int(lo, 16) if lo.startswith("0x") else ord(lo[0])
+            hi_b = ord(hi) if len(hi) == 1 else int(hi, 16) if hi.startswith("0x") else ord(hi[0])
+            for b in range(min(lo_b, hi_b), max(lo_b, hi_b) + 1):
+                if b not in out:
+                    out.append(b)
+        else:
+            b = (int(piece, 16) if piece.startswith("0x")
+                 else ord(piece) if len(piece) == 1
+                 else int(piece))
+            if b not in out:
+                out.append(b)
+    return out
 
 
 @main.command("dump-config")
