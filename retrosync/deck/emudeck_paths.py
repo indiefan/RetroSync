@@ -3,6 +3,7 @@
 EmuDeck installs everything under either:
   - ~/Emulation/                              (default; internal SSD)
   - /run/media/mmcblk0p1/Emulation/           (SD-card mirror)
+  - /run/media/<user>/<label>/Emulation/      (any SD-card mount)
 
 Within that root, the conventions we lean on are:
   - ROMs:        <root>/roms/<system>/<game>.<rom-ext>
@@ -21,6 +22,7 @@ Flatpak by default.
 """
 from __future__ import annotations
 
+import glob
 import logging
 import os
 import re
@@ -33,6 +35,14 @@ EMUDECK_ROOT_CANDIDATES = (
     Path.home() / "Emulation",
     Path("/run/media/mmcblk0p1/Emulation"),
     Path("/run/media/deck/mmcblk0p1/Emulation"),
+)
+
+# Glob patterns for SD-card mounts whose mountpoint isn't the
+# canonical `mmcblk0p1` (e.g. SteamOS sometimes uses the volume
+# label, KDE Plasma re-mounts under /run/media/<user>/<label>/).
+SD_CARD_GLOBS = (
+    "/run/media/*/Emulation",
+    "/run/media/*/*/Emulation",
 )
 
 RETROARCH_CFG_CANDIDATES = (
@@ -58,9 +68,26 @@ class CoreOverrideWarning:
 def detect_emudeck_root(extra: list[Path] | None = None) -> Path | None:
     """Return the first existing root, or None.
 
-    `extra` is for tests / operator overrides — the caller can pass a
-    custom path that gets checked first."""
-    for candidate in (extra or []) + list(EMUDECK_ROOT_CANDIDATES):
+    Probe order:
+      1. `extra` (operator/test overrides — `--emudeck-root` lands here)
+      2. `EMUDECK_ROOT` env var
+      3. fixed candidates (`~/Emulation`, the two canonical SD mounts)
+      4. `/run/media/*/Emulation` and `/run/media/*/*/Emulation` globs
+         for arbitrary SD-card mounts (volume label / multi-user setups)
+    """
+    candidates: list[Path] = list(extra or [])
+    env = os.environ.get("EMUDECK_ROOT")
+    if env:
+        candidates.append(Path(env))
+    candidates.extend(EMUDECK_ROOT_CANDIDATES)
+    for pattern in SD_CARD_GLOBS:
+        for match in sorted(glob.glob(pattern)):
+            candidates.append(Path(match))
+    seen: set[Path] = set()
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
         if candidate.is_dir():
             log.info("EmuDeck root detected: %s", candidate)
             return candidate
