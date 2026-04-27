@@ -278,17 +278,18 @@ roms_dir_for_system() {
   done
 }
 
-# Hand a system off to `retrosync deck add-source`, which is idempotent
-# and handles its own path detection. No-op (with a log line) if the
-# system already has a source configured. Honors ROMS_ROOT_<SYS>
-# env-var overrides per system, e.g. ROMS_ROOT_SNES=/foo.
+# Hand a system off to `retrosync deck add-source`. Output:
+#   "appended source ..."  → counted as ADDED
+#   "skipped: source ..."  → counted as ALREADY (idempotent re-run)
+#   anything else (exit≠0) → ERROR
+# Honors ROMS_ROOT_<SYS> env-var overrides per system, e.g.
+# ROMS_ROOT_SNES=/foo.
 add_source_for_system() {
   local system="$1"
   local cfg="${ETC_DIR}/config.yaml"
   local upper="$(echo "${system}" | tr '[:lower:]' '[:upper:]')"
   local override_var="ROMS_ROOT_${upper}"
-  local args=(--config "${cfg}" deck add-source --system "${system}"
-              --config-path "${cfg}")
+  local args=(--config "${cfg}" deck add-source --system "${system}")
   if [[ -n "${EMUDECK_ROOT:-}" ]]; then
     args+=(--emudeck-root "${EMUDECK_ROOT}")
   fi
@@ -298,34 +299,39 @@ add_source_for_system() {
     # Backwards compat with the v1 single-system installer's env var.
     args+=(--roms-root "${ROMS_ROOT}")
   fi
-  if "${USER_BIN}/retrosync" "${args[@]}" 2>&1 | tee /tmp/.retrosync-add-source.$$; then
-    rm -f /tmp/.retrosync-add-source.$$
-  else
-    rm -f /tmp/.retrosync-add-source.$$
-    return 1
+  local out
+  if out="$("${USER_BIN}/retrosync" "${args[@]}" 2>&1)"; then
+    echo "${out}"
+    if [[ "${out}" == skipped:* ]]; then
+      return 2  # idempotent skip — distinct from genuine failure
+    fi
+    return 0
   fi
+  echo "${out}" >&2
+  return 1
 }
 
 write_config() {
   write_config_scaffold
-  local added=0
-  local skipped=0
+  local added=0 already=0 failed=0 missing=0
   for system in "${SUPPORTED_SYSTEMS[@]}"; do
     local roms_dir
     roms_dir="$(roms_dir_for_system "${system}")"
     if [[ -z "${roms_dir}" ]]; then
-      log "no roms/${system}/ found; skipping ${system} source"
-      skipped=$((skipped + 1))
+      log "no roms/${system}/ found; ${system} not configured"
+      missing=$((missing + 1))
       continue
     fi
     log "configuring ${system} source (ROMs: ${roms_dir})"
-    if add_source_for_system "${system}"; then
-      added=$((added + 1))
-    else
-      warn "  add-source for ${system} failed; continue"
-    fi
+    add_source_for_system "${system}"
+    case $? in
+      0) added=$((added + 1)) ;;
+      2) already=$((already + 1)) ;;
+      *) warn "  add-source for ${system} FAILED"; failed=$((failed + 1)) ;;
+    esac
   done
-  if (( added == 0 )); then
+  log "sources: ${added} added, ${already} already configured, ${missing} missing ROMs, ${failed} failed"
+  if (( added == 0 && already == 0 )); then
     warn "no sources configured. Drop ROMs under <emudeck>/roms/<system>/"
     warn "and re-run setup-deck.sh, or run:"
     warn "  retrosync deck add-source --system <sys>"
@@ -344,11 +350,30 @@ install_systemd_units() {
                   "${USER_SYSTEMD}/retrosync-reconnect.service"
   systemctl --user daemon-reload
   systemctl --user enable retrosyncd-deck.service retrosyncd-suspend.service
-  systemctl --user restart retrosyncd-deck.service
+  # --no-block so a slow/failing daemon doesn't hang the installer.
+  # Check status afterwards and surface the journal if it failed.
+  systemctl --user restart --no-block retrosyncd-deck.service
+  sleep 2
+  if ! systemctl --user is-active --quiet retrosyncd-deck.service; then
+    warn "retrosyncd-deck.service is not active. Recent journal:"
+    journalctl --user -u retrosyncd-deck.service -n 20 --no-pager 2>&1 \
+      | sed 's/^/  /' || true
+    warn "Continuing — fix the service config and:  systemctl --user restart retrosyncd-deck"
+  fi
 
-  # enable-linger requires root. Use sudo if available; otherwise warn.
-  if command -v sudo >/dev/null 2>&1; then
-    log "enabling linger for ${USER} so services run in Game Mode"
+  # Linger lets the user-mode daemon run when no one is logged in
+  # graphically (e.g. Game Mode). Idempotent: skip the sudo call if
+  # linger's already enabled, so re-running setup never prompts for a
+  # password unnecessarily.
+  local linger_state
+  linger_state="$(loginctl show-user "${USER}" --property=Linger --value 2>/dev/null || echo no)"
+  if [[ "${linger_state}" == "yes" ]]; then
+    log "linger already enabled for ${USER}"
+  elif command -v sudo >/dev/null 2>&1; then
+    log "enabling linger for ${USER} (sudo will prompt if creds aren't cached)"
+    if ! sudo -n true 2>/dev/null; then
+      warn "  >>> sudo password prompt is below — type your password and press Enter"
+    fi
     sudo loginctl enable-linger "${USER}" || warn "loginctl enable-linger failed"
   else
     warn "loginctl not invoked (no sudo). Run manually as root:"

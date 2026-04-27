@@ -44,6 +44,10 @@ class AddSourceResult:
     roms_root: Path
     appended_to: Path
     block_text: str
+    # False when the system was already configured and we left the
+    # config alone. Lets callers distinguish "added a new source" from
+    # "no-op, already done" without having to check exception types.
+    was_added: bool = True
 
 
 def resolve_roms_root(system: str, default: Path,
@@ -154,9 +158,13 @@ def add_source(*, config_path: Path, system: str,
     for sid, sdict in existing.items():
         if sdict.get("adapter") == "emudeck" \
                 and (sdict.get("options") or {}).get("system") == system:
-            raise AddSourceError(
-                f"source {sid!r} already configured for system "
-                f"{system!r}; nothing to do")
+            opts = sdict.get("options") or {}
+            return AddSourceResult(
+                source_id=sid, system=system,
+                saves_root=Path(opts.get("saves_root", "")),
+                roms_root=Path(opts.get("roms_root", "")),
+                appended_to=config_path, block_text="",
+                was_added=False)
 
     # If an existing emudeck source has paths we can mine, use them as
     # hints — far more reliable than re-detecting on a Deck where the
@@ -227,4 +235,5 @@ def add_source(*, config_path: Path, system: str,
     return AddSourceResult(
         source_id=sid, system=system,
         saves_root=saves_root, roms_root=roms_root,
-        appended_to=config_path, block_text=block)
+        appended_to=config_path, block_text=block,
+        was_added=True)
