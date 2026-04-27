@@ -114,6 +114,32 @@ class AddSourceError(Exception):
     pass
 
 
+def _hints_from_existing_sources(
+        existing: dict[str, dict]) -> tuple[Path | None, Path | None]:
+    """Mine an existing config for an `emudeck` source we can use as a
+    path hint. Returns (saves_root, emudeck_root) where emudeck_root
+    is derived by walking up from saves_root to the `Emulation` dir.
+    Either may be None if nothing usable is found.
+    """
+    saves_root: Path | None = None
+    for sdict in existing.values():
+        if sdict.get("adapter") != "emudeck":
+            continue
+        opts = sdict.get("options") or {}
+        sr = opts.get("saves_root")
+        if sr:
+            saves_root = Path(sr)
+            break
+    if saves_root is None:
+        return None, None
+    emudeck_root: Path | None = None
+    for parent in saves_root.parents:
+        if parent.name == "Emulation":
+            emudeck_root = parent
+            break
+    return saves_root, emudeck_root
+
+
 def add_source(*, config_path: Path, system: str,
                emudeck_root_override: Path | None = None,
                saves_root_override: Path | None = None,
@@ -132,13 +158,27 @@ def add_source(*, config_path: Path, system: str,
                 f"source {sid!r} already configured for system "
                 f"{system!r}; nothing to do")
 
+    # If an existing emudeck source has paths we can mine, use them as
+    # hints — far more reliable than re-detecting on a Deck where the
+    # operator already proved EmuDeck works for SNES.
+    hint_saves, hint_root = _hints_from_existing_sources(existing)
     paths = emudeck_paths.detect_paths(
         system=system,
-        emudeck_root_override=emudeck_root_override)
+        emudeck_root_override=emudeck_root_override or hint_root)
+    if paths is None and hint_saves is not None:
+        log.info("EmuDeck root not auto-detected; using existing "
+                 "source's saves_root as hint")
+        # Build a minimal EmuDeckPaths from the hint so the rest of the
+        # function can proceed. roms_root may still need SD-card fallback.
+        paths = emudeck_paths.EmuDeckPaths(
+            emudeck_root=hint_root or hint_saves.parent,
+            saves_root=hint_saves,
+            roms_root=(hint_root / "roms" / system) if hint_root else None)
     if paths is None:
         raise AddSourceError(
-            "EmuDeck install not detected. Set EMUDECK_ROOT to your "
-            "Emulation/ directory, or pass --emudeck-root.")
+            "EmuDeck install not detected. Set EMUDECK_ROOT, pass "
+            "--emudeck-root, or add a working `emudeck` source to "
+            f"{config_path} first so we can mine its paths.")
 
     saves_root = saves_root_override or paths.saves_root
     if not saves_root.is_dir():
