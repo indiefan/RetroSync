@@ -141,6 +141,39 @@ def cmd_derive_game_id(rom_path_str: str, *,
     return 0
 
 
+def resolve_source_id(*, source_id: str, system: str,
+                      config: Config) -> str:
+    """Pick the right source_id for `system`.
+
+    The wrap dispatcher passes a single SOURCE_ID env var (default
+    `deck-1`, which predates multi-system support). With multi-system
+    configs (`deck-1-snes`, `deck-1-n64`, ...) the dispatcher's
+    hardcoded value is wrong for any system except the one it was
+    set for. Auto-correct by:
+
+      1. If `source_id` exists AND its emudeck system matches, use it.
+      2. Otherwise find the first emudeck source whose
+         `options.system` matches `system` and use that.
+      3. If no source matches, return `source_id` unchanged — the
+         caller will see "no source in config" and skip the sync,
+         which is the right "fail open" behavior for the wrap path.
+    """
+    by_id = {s.id: s for s in config.sources}
+    s = by_id.get(source_id)
+    if s is not None and s.adapter == "emudeck" \
+            and s.options.get("system") == system:
+        return source_id
+    for cand in config.sources:
+        if cand.adapter == "emudeck" \
+                and cand.options.get("system") == system:
+            log.info("wrap: source_id %r doesn't fit system %r; "
+                     "using %r instead", source_id, system, cand.id)
+            return cand.id
+    log.warning("wrap: no emudeck source configured for system %r; "
+                "lease/sync will be skipped", system)
+    return source_id
+
+
 def cmd_wrap_pre(*, source_id: str, system: str, game_id: str,
                  config: Config, timeout_sec: float = 10.0) -> int:
     """Pre-launch sync + lease grab for one game.
@@ -158,6 +191,8 @@ def cmd_wrap_pre(*, source_id: str, system: str, game_id: str,
 
 async def _async_wrap_pre(*, source_id: str, system: str, game_id: str,
                           config: Config, timeout_sec: float) -> int:
+    source_id = resolve_source_id(source_id=source_id, system=system,
+                                  config=config)
     state = StateStore(config.state.db_path)
     try:
         cloud = RcloneCloud(remote=config.cloud.rclone_remote,
@@ -274,6 +309,8 @@ def cmd_wrap_post(*, source_id: str, system: str, game_id: str,
 
 async def _async_wrap_post(*, source_id: str, system: str, game_id: str,
                            config: Config, timeout_sec: float) -> int:
+    source_id = resolve_source_id(source_id=source_id, system=system,
+                                  config=config)
     state = StateStore(config.state.db_path)
     try:
         cloud = RcloneCloud(remote=config.cloud.rclone_remote,
