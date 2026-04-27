@@ -323,7 +323,9 @@ install_systemd_units() {
                   /etc/systemd/system/retrosync-pocket-sync@.service
   systemctl daemon-reload
   systemctl enable sni.service retrosync.service
-  systemctl restart sni.service
+  # --no-block matches the daemon-restart in start_daemon — see that
+  # function for rationale (don't let a slow start hang the installer).
+  systemctl restart --no-block sni.service
   # Templated pocket-sync units don't need to be enabled — they're
   # triggered via udev's SYSTEMD_WANTS.
 }
@@ -442,9 +444,19 @@ EOF
 # -------- step 9: start daemon ------------------------------------------
 start_daemon() {
   log "starting retrosync.service"
-  systemctl restart retrosync.service
-  sleep 1
-  systemctl --no-pager --full status retrosync.service || true
+  # --no-block so a slow / failing daemon doesn't hang the installer
+  # (e.g. stuck on cloud OAuth refresh). Status check after the sleep
+  # prints recent journal entries when the unit failed to come up.
+  systemctl restart --no-block retrosync.service
+  sleep 2
+  if systemctl is-active --quiet retrosync.service; then
+    systemctl --no-pager --full status retrosync.service || true
+  else
+    warn "retrosync.service did not come up cleanly. Recent journal:"
+    journalctl -u retrosync.service -n 20 --no-pager 2>&1 \
+      | sed 's/^/  /' || true
+    warn "Continuing — fix the issue and: sudo systemctl restart retrosync"
+  fi
 }
 
 # -------- main -----------------------------------------------------------
