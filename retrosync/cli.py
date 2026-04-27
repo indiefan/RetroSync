@@ -923,6 +923,88 @@ def cmd_deck_detect_paths(ctx: click.Context, system: str,
             click.echo(f"WARNING: {w.detail}")
 
 
+@cmd_deck.command("add-source")
+@click.option("--system", required=True,
+              help="System name (snes, n64, gba, genesis). The catalog "
+                   "in retrosync/deck/systems.py is the source of truth.")
+@click.option("--config-path", default="/etc/retrosync/config.yaml",
+              show_default=True,
+              help="Config to append to. Must already exist (run "
+                   "setup-deck.sh first).")
+@click.option("--source-id", default=None,
+              help="Override the auto-derived source id. Default: "
+                   "deck-1-<system>, deck-2-<system>, etc.")
+@click.option("--emudeck-root", default=None,
+              help="Override auto-detected EmuDeck root.")
+@click.option("--saves-root", default=None,
+              help="Override auto-detected saves dir.")
+@click.option("--roms-root", default=None,
+              help="Override auto-detected ROMs dir.")
+@click.option("--dry-run", is_flag=True,
+              help="Show the block we'd append without writing.")
+def cmd_deck_add_source(system: str, config_path: str,
+                        source_id: str | None,
+                        emudeck_root: str | None,
+                        saves_root: str | None,
+                        roms_root: str | None,
+                        dry_run: bool) -> None:
+    """Append an emudeck source block for SYSTEM to the config.
+
+    Auto-detects saves_root and roms_root using the same logic as
+    setup-deck.sh (RetroArch's savefile_directory + SD-card fallback
+    for ROMs). Idempotent — bails if a source for the same system is
+    already present.
+
+    Restart the daemon afterwards:
+
+      systemctl --user restart retrosyncd-deck    # Steam Deck
+      sudo systemctl restart retrosync            # Pi/server install
+    """
+    from .deck import add_source as add_source_mod
+    try:
+        result = add_source_mod.add_source(
+            config_path=Path(config_path),
+            system=system,
+            emudeck_root_override=Path(emudeck_root) if emudeck_root else None,
+            saves_root_override=Path(saves_root) if saves_root else None,
+            roms_root_override=Path(roms_root) if roms_root else None,
+            source_id=source_id) if not dry_run else None
+    except add_source_mod.AddSourceError as exc:
+        raise click.ClickException(str(exc))
+    if dry_run:
+        # Re-run the detection to print what would happen.
+        from .deck import emudeck_paths, systems as deck_systems
+        sys_def = deck_systems.get(system)
+        paths = emudeck_paths.detect_paths(
+            system=system,
+            emudeck_root_override=Path(emudeck_root) if emudeck_root else None)
+        if paths is None:
+            raise click.ClickException("EmuDeck install not detected.")
+        sr = Path(saves_root) if saves_root else paths.saves_root
+        rr = add_source_mod.resolve_roms_root(
+            system=system,
+            default=paths.roms_root or (paths.emudeck_root / "roms" / system),
+            override=Path(roms_root) if roms_root else None)
+        existing = add_source_mod.existing_source_ids(Path(config_path))
+        sid = source_id or add_source_mod.derive_source_id(system, existing)
+        block = add_source_mod.render_source_block(
+            source_id=sid, system=system,
+            saves_root=sr, roms_root=rr,
+            rom_extensions=sys_def.rom_extensions,
+            save_extension=sys_def.save_extension)
+        click.echo(f"# would append to {config_path}:")
+        click.echo(block, nl=False)
+        return
+    click.echo(f"appended source {result.source_id!r} (system={result.system}) "
+               f"to {result.appended_to}")
+    click.echo(f"  saves_root: {result.saves_root}")
+    click.echo(f"  roms_root:  {result.roms_root}")
+    click.echo()
+    click.echo("Restart the daemon to pick up the new source:")
+    click.echo("  systemctl --user restart retrosyncd-deck   # Steam Deck")
+    click.echo("  sudo systemctl restart retrosync           # Pi/server")
+
+
 # ---------------- everdrive64 (probe + diagnostics) ----------------
 
 @main.group("everdrive64")
