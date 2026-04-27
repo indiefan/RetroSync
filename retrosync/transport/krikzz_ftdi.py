@@ -240,9 +240,25 @@ class SerialKrikzzTransport(KrikzzFtdiTransport):
             self._port = _serial.Serial(
                 self._path, self._baud, timeout=self._timeout,
                 write_timeout=self._timeout)
-            # Drain any junk left from prior sessions.
+            # Aggressive drain of any junk left from prior sessions.
+            # An aborted previous command (e.g. operator Ctrl+C'd
+            # mid-file_info) leaves a 16-byte 'cmd<X>' response in
+            # the FT232's RX buffer that the next health check would
+            # mis-read as its own response. Drain by:
+            #   1. reset_input_buffer (kernel/userland buffer)
+            #   2. brief read with short timeout to consume any bytes
+            #      the FT232 chip is still draining out
             self._port.reset_input_buffer()
             self._port.reset_output_buffer()
+            saved_to = self._port.timeout
+            self._port.timeout = 0.1
+            try:
+                stale = self._port.read(256)
+                if stale:
+                    log.debug("EverDrive 64 open: drained %d stale bytes",
+                              len(stale))
+            finally:
+                self._port.timeout = saved_to
         except Exception as exc:  # noqa: BLE001
             raise KrikzzFtdiError(
                 f"opening {self._path}: {exc}") from exc
@@ -261,16 +277,31 @@ class SerialKrikzzTransport(KrikzzFtdiTransport):
         # CMD_TEST: send 'cmdt' + 12 zero-bytes, expect 16 bytes back
         # with header 'cmdr'. Krikzz's Edio.getStatus reads the byte at
         # offset 4 as the cart's current status (0 = idle/OK).
-        try:
-            resp = await self._cmd_rx_with_send(ord("t"), expect=ord("r"))
-        except KrikzzFtdiError as exc:
-            return False, str(exc)
-        status_byte = resp[4]
-        # Trailing bytes encode firmware metadata; surface them for
-        # debugging — exact format not documented in Krikzz's source.
-        rest = resp[5:].hex()
-        return (True,
-                f"EverDrive 64 (status=0x{status_byte:02x}, meta={rest})")
+        # Self-healing: if we get an unexpected response (typically a
+        # stale cmd<X> queued from a prior aborted run), drain and
+        # retry once.
+        for attempt in range(2):
+            try:
+                resp = await self._cmd_rx_with_send(
+                    ord("t"), expect=ord("r"))
+                status_byte = resp[4]
+                rest = resp[5:].hex()
+                return (True,
+                        f"EverDrive 64 "
+                        f"(status=0x{status_byte:02x}, meta={rest})")
+            except KrikzzFtdiError as exc:
+                if attempt == 0 and "unexpected response" in str(exc):
+                    # Drain and retry — buffer was holding stale bytes.
+                    self._port.reset_input_buffer()
+                    saved = self._port.timeout
+                    self._port.timeout = 0.2
+                    try:
+                        self._port.read(256)
+                    finally:
+                        self._port.timeout = saved
+                    continue
+                return False, str(exc)
+        return False, "health retry exhausted"
 
     # ----- low-level framing primitives -----
 
