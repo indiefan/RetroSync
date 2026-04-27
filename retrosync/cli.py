@@ -923,6 +923,141 @@ def cmd_deck_detect_paths(ctx: click.Context, system: str,
             click.echo(f"WARNING: {w.detail}")
 
 
+# ---------------- everdrive64 (probe + diagnostics) ----------------
+
+@main.group("everdrive64")
+def cmd_ed64() -> None:
+    """EverDrive 64-specific operations + diagnostics."""
+
+
+@cmd_ed64.command("probe-cmd-bytes")
+@click.argument("source_id")
+@click.option("--with-path", default="/",
+              help="Path payload to send after the cmd frame, in case "
+                   "the byte expects one (like file_open does). Default "
+                   "is '/' which makes sense for dir-list-shaped commands.")
+@click.option("--timeout", type=float, default=0.4, show_default=True,
+              help="Per-byte response timeout. Bytes the firmware "
+                   "doesn't recognize typically time out silently.")
+@click.pass_context
+def cmd_ed64_probe(ctx: click.Context, source_id: str,
+                   with_path: str, timeout: float) -> None:
+    """Probe the OS64 firmware for undocumented command bytes.
+
+    Krikzz's USB tool source (https://krikzz.com/pub/support/everdrive-
+    64/x-series/dev/) only documents 't', 'W', 'R', 'c', 'r', 'f', 's',
+    and '0'-'4'. The firmware almost certainly has more commands —
+    notably a directory-list operation (the on-cart menu has to
+    enumerate files somehow). This subcommand sends every printable
+    ASCII cmd byte we don't already know and reports what comes back.
+
+    \b
+    Run with the cart powered on AND the OS64 menu showing (NOT mid-
+    game). Sends each byte twice: once bare, once with `--with-path`
+    appended (since dir-list probably takes a path arg the way
+    file_open does).
+
+    \b
+    Output: one line per cmd byte that returns ANYTHING. Look for:
+      - cmd<X> response headers — the byte is recognized, X is the
+        command's reply tag.
+      - Long responses (>16 bytes) — likely a directory listing.
+      - Non-empty hex but no 'cmd' header — the byte does something
+        but in a different framing.
+
+    Then paste the output back to me / file an issue and we'll
+    implement dir_list properly using the discovered byte.
+    """
+    cfg: Config = ctx.obj["config"]
+    src_cfg = next((s for s in cfg.sources if s.id == source_id), None)
+    if src_cfg is None:
+        raise click.ClickException(f"unknown source {source_id!r}")
+    if src_cfg.adapter != "everdrive64":
+        raise click.ClickException(
+            f"source {source_id!r} is not an everdrive64 adapter "
+            f"(got {src_cfg.adapter!r})")
+
+    async def _go():
+        from .transport.krikzz_ftdi import (
+            COMMAND_FRAME_SIZE, MIN_BLOCK_SIZE, build_command_frame,
+            build_transport, pad_to_min_block,
+        )
+        # Build a transport directly so we can poke at the raw serial port.
+        opts: dict = {}
+        if src_cfg.options.get("transport", "serial") == "serial":
+            opts["serial_path"] = src_cfg.options.get(
+                "serial_path", "/dev/ttyUSB0")
+            opts["baud"] = src_cfg.options.get("serial_baud", 9600)
+        t = build_transport(
+            kind=src_cfg.options.get("transport", "serial"), **opts)
+        await t.open()
+        try:
+            ok, detail = await t.health()
+        except Exception as exc:  # noqa: BLE001
+            await t.close()
+            raise click.ClickException(f"health check failed: {exc}")
+        if not ok:
+            await t.close()
+            raise click.ClickException(f"cart not healthy: {detail}")
+        click.echo(f"cart OK: {detail}")
+        click.echo(f"probing cmd bytes (timeout {timeout}s, "
+                   f"path arg = {with_path!r})\n")
+        # Bytes we already know — skip them.
+        known = {ord(c) for c in "tWRcrfs01234"}
+        # Try printable ASCII range, excluding known.
+        candidates = [b for b in range(0x20, 0x7f) if b not in known]
+        port = t._port  # type: ignore[attr-defined]
+        original_timeout = port.timeout
+        port.timeout = timeout
+        any_response = False
+        try:
+            for cmd in candidates:
+                ch = chr(cmd)
+                for label, payload in (
+                        ("bare", b""),
+                        (f"with path {with_path!r}",
+                         pad_to_min_block(with_path.encode())),
+                ):
+                    port.reset_input_buffer()
+                    frame = build_command_frame(
+                        cmd, length=len(with_path) if payload else 0)
+                    try:
+                        port.write(frame + payload)
+                        port.flush()
+                    except Exception as exc:  # noqa: BLE001
+                        click.echo(
+                            f"  cmd 0x{cmd:02x} ({ch!r}) {label}: "
+                            f"write error: {exc}")
+                        continue
+                    # Try to read up to 64 bytes. dir-list-shaped responses
+                    # would likely be the 16-byte cmd frame + payload.
+                    resp = port.read(64)
+                    if not resp:
+                        continue
+                    any_response = True
+                    hex_str = resp.hex()
+                    ascii_str = "".join(
+                        chr(b) if 0x20 <= b < 0x7f else "." for b in resp)
+                    click.echo(
+                        f"  cmd 0x{cmd:02x} ({ch!r}) {label} → "
+                        f"{len(resp)}B  hex={hex_str}  ascii={ascii_str}")
+        finally:
+            port.timeout = original_timeout
+            await t.close()
+        if not any_response:
+            click.echo("\nNo cmd byte returned anything. Possible causes:")
+            click.echo("  - Cart is in mid-game, not OS64 menu")
+            click.echo("  - Probe timeout too short (try --timeout 1.0)")
+            click.echo("  - Firmware variant doesn't expose other cmd bytes")
+        else:
+            click.echo("\nResponses logged above. Look for entries whose")
+            click.echo("hex starts with 636d64 ('cmd') — those are recognized")
+            click.echo("commands. Paste the output back so we can implement")
+            click.echo("dir_list using the right cmd byte.")
+
+    asyncio.run(_go())
+
+
 @main.command("dump-config")
 @click.pass_context
 def cmd_dump_config(ctx: click.Context) -> None:
