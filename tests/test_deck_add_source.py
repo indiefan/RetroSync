@@ -73,21 +73,27 @@ def test_append_n64_source() -> bool:
 
 
 def test_idempotent_skip_existing_system() -> bool:
+    """Re-running add_source for the same system is a soft skip
+    (was_added=False), not an exception. Lets setup-deck.sh tell
+    'genuine failure' apart from 'already done'."""
     tmp = Path(tempfile.mkdtemp(prefix="retrosync-add-src-"))
     root = _make_emudeck_layout(tmp, ["snes", "n64"])
     cfg = tmp / "config.yaml"
     _scaffold_config(cfg)
 
-    add_source_mod.add_source(
+    first = add_source_mod.add_source(
         config_path=cfg, system="n64", emudeck_root_override=root)
-    try:
-        add_source_mod.add_source(
-            config_path=cfg, system="n64", emudeck_root_override=root)
-    except add_source_mod.AddSourceError as exc:
-        return _check("already configured for system 'n64'" in str(exc),
-                      True, "second add_source for same system raises")
-    print("FAIL: expected AddSourceError on duplicate system")
-    return False
+    second = add_source_mod.add_source(
+        config_path=cfg, system="n64", emudeck_root_override=root)
+    ok = _check(first.was_added, True, "first call: was_added=True")
+    ok &= _check(second.was_added, False, "second call: was_added=False")
+    ok &= _check(second.source_id, first.source_id,
+                 "second call returns existing source id")
+    # And the file shouldn't have grown:
+    parsed = yaml.safe_load(cfg.read_text())
+    ok &= _check(len(parsed["sources"]), 1,
+                 "second call did not append a duplicate")
+    return ok
 
 
 def test_two_systems_coexist() -> bool:

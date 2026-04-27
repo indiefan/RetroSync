@@ -14,7 +14,7 @@ from . import conflicts as conflicts_mod
 from . import leases as leases_mod
 from . import promote as promote_mod
 from .cloud import CloudError, RcloneCloud, compose_paths, hash8, sha256_bytes
-from .config import DEFAULT_CONFIG_PATH, Config
+from .config import DEFAULT_CONFIG_PATH, Config, find_config_path
 from .sources.base import SaveRef
 from .sources.registry import build as build_source
 from .state import StateStore
@@ -29,15 +29,19 @@ def _configure_logging(verbose: bool) -> None:
 
 
 @click.group()
-@click.option("--config", "config_path", default=DEFAULT_CONFIG_PATH,
-              envvar="RETROSYNC_CONFIG", show_default=True,
-              help="Path to config.yaml. Honors RETROSYNC_CONFIG.")
+@click.option("--config", "config_path", default=None,
+              envvar="RETROSYNC_CONFIG",
+              help="Path to config.yaml. Honors RETROSYNC_CONFIG. "
+                   "Default: auto-probe ~/.config/retrosync/config.yaml "
+                   "(Deck install) then /etc/retrosync/config.yaml.")
 @click.option("-v", "--verbose", is_flag=True)
 @click.pass_context
-def main(ctx: click.Context, config_path: str, verbose: bool) -> None:
+def main(ctx: click.Context, config_path: str | None, verbose: bool) -> None:
     """RetroSync operator CLI."""
     _configure_logging(verbose)
     ctx.ensure_object(dict)
+    if config_path is None:
+        config_path = find_config_path()
     ctx.obj["config_path"] = config_path
     ctx.obj["config"] = Config.load(config_path)
 
@@ -927,10 +931,6 @@ def cmd_deck_detect_paths(ctx: click.Context, system: str,
 @click.option("--system", required=True,
               help="System name (snes, n64, gba, genesis). The catalog "
                    "in retrosync/deck/systems.py is the source of truth.")
-@click.option("--config-path", default="/etc/retrosync/config.yaml",
-              show_default=True,
-              help="Config to append to. Must already exist (run "
-                   "setup-deck.sh first).")
 @click.option("--source-id", default=None,
               help="Override the auto-derived source id. Default: "
                    "deck-1-<system>, deck-2-<system>, etc.")
@@ -942,7 +942,9 @@ def cmd_deck_detect_paths(ctx: click.Context, system: str,
               help="Override auto-detected ROMs dir.")
 @click.option("--dry-run", is_flag=True,
               help="Show the block we'd append without writing.")
-def cmd_deck_add_source(system: str, config_path: str,
+@click.pass_context
+def cmd_deck_add_source(ctx: click.Context,
+                        system: str,
                         source_id: str | None,
                         emudeck_root: str | None,
                         saves_root: str | None,
@@ -952,8 +954,11 @@ def cmd_deck_add_source(system: str, config_path: str,
 
     Auto-detects saves_root and roms_root using the same logic as
     setup-deck.sh (RetroArch's savefile_directory + SD-card fallback
-    for ROMs). Idempotent — bails if a source for the same system is
-    already present.
+    for ROMs). Idempotent — already-configured systems print a
+    "skipped" line and exit 0.
+
+    Uses the global --config option (RETROSYNC_CONFIG-aware, auto-
+    probes ~/.config/retrosync/config.yaml then /etc/retrosync/config.yaml).
 
     Restart the daemon afterwards:
 
@@ -961,18 +966,8 @@ def cmd_deck_add_source(system: str, config_path: str,
       sudo systemctl restart retrosync            # Pi/server install
     """
     from .deck import add_source as add_source_mod
-    try:
-        result = add_source_mod.add_source(
-            config_path=Path(config_path),
-            system=system,
-            emudeck_root_override=Path(emudeck_root) if emudeck_root else None,
-            saves_root_override=Path(saves_root) if saves_root else None,
-            roms_root_override=Path(roms_root) if roms_root else None,
-            source_id=source_id) if not dry_run else None
-    except add_source_mod.AddSourceError as exc:
-        raise click.ClickException(str(exc))
+    config_path = ctx.obj["config_path"]
     if dry_run:
-        # Re-run the detection to print what would happen.
         from .deck import emudeck_paths, systems as deck_systems
         sys_def = deck_systems.get(system)
         paths = emudeck_paths.detect_paths(
@@ -994,6 +989,20 @@ def cmd_deck_add_source(system: str, config_path: str,
             save_extension=sys_def.save_extension)
         click.echo(f"# would append to {config_path}:")
         click.echo(block, nl=False)
+        return
+    try:
+        result = add_source_mod.add_source(
+            config_path=Path(config_path),
+            system=system,
+            emudeck_root_override=Path(emudeck_root) if emudeck_root else None,
+            saves_root_override=Path(saves_root) if saves_root else None,
+            roms_root_override=Path(roms_root) if roms_root else None,
+            source_id=source_id)
+    except add_source_mod.AddSourceError as exc:
+        raise click.ClickException(str(exc))
+    if not result.was_added:
+        click.echo(f"skipped: source {result.source_id!r} already "
+                   f"configured for system {result.system!r}")
         return
     click.echo(f"appended source {result.source_id!r} (system={result.system}) "
                f"to {result.appended_to}")

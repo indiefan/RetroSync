@@ -23,6 +23,32 @@ import yaml
 
 DEFAULT_CONFIG_PATH = "/etc/retrosync/config.yaml"
 
+# Per-user config path used by the Deck install (rootless, runs under
+# the user systemd instance). Probed by `find_config_path()` ahead of
+# the system path so a Deck operator running `retrosync ...` doesn't
+# need to set RETROSYNC_CONFIG.
+USER_CONFIG_PATH = str(Path.home() / ".config" / "retrosync" / "config.yaml")
+
+
+def find_config_path() -> str:
+    """Pick a config path by probing the standard locations.
+
+    Order:
+      1. RETROSYNC_CONFIG env var (explicit override)
+      2. ~/.config/retrosync/config.yaml (Deck / per-user install)
+      3. /etc/retrosync/config.yaml (system install)
+
+    Returns the first existing path, or DEFAULT_CONFIG_PATH if none
+    exist (caller will get a FileNotFoundError when it tries to load).
+    """
+    env = os.environ.get("RETROSYNC_CONFIG")
+    if env:
+        return env
+    for cand in (USER_CONFIG_PATH, DEFAULT_CONFIG_PATH):
+        if Path(cand).is_file():
+            return cand
+    return DEFAULT_CONFIG_PATH
+
 
 @dataclass
 class CloudConfig:
