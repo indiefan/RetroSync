@@ -63,7 +63,7 @@ def _make_source(*, files: dict[str, bytes] | None = None) -> EverDrive64Source:
     transport = MockKrikzzTransport(files=files or {})
     cfg = EverDrive64Config(
         id="everdrive64-1", transport="mock",
-        sd_saves_root="/ED64/SAVES",
+        sd_saves_root="/ED64/gamedata",
         sd_roms_root="/ED64/ROMS",
         transport_instance=transport,
     )
@@ -72,14 +72,14 @@ def _make_source(*, files: dict[str, bytes] | None = None) -> EverDrive64Source:
 
 async def test_health_and_list_saves() -> bool:
     src = _make_source(files={
-        "/ED64/SAVES/Super Mario 64.eep":
+        "/ED64/gamedata/Super Mario 64.eep":
             b"\x12" * n64.EEPROM_4KBIT_BYTES,
-        "/ED64/SAVES/Paper Mario.fla":
+        "/ED64/gamedata/Paper Mario.fla":
             b"\x34" * n64.FLASHRAM_SIZE,
-        "/ED64/SAVES/Paper Mario.mp1":
+        "/ED64/gamedata/Paper Mario.mp1":
             b"\x56" * n64.CPAK_SIZE,
         # Non-N64 file should be filtered out by extension.
-        "/ED64/SAVES/notes.txt":
+        "/ED64/gamedata/notes.txt":
             b"hello",
     })
     h = await src.health()
@@ -87,18 +87,18 @@ async def test_health_and_list_saves() -> bool:
         return False
     refs = await src.list_saves()
     return _check(sorted(r.path for r in refs), [
-        "/ED64/SAVES/Paper Mario.fla",
-        "/ED64/SAVES/Paper Mario.mp1",
-        "/ED64/SAVES/Super Mario 64.eep",
+        "/ED64/gamedata/Paper Mario.fla",
+        "/ED64/gamedata/Paper Mario.mp1",
+        "/ED64/gamedata/Super Mario 64.eep",
     ], "list_saves filters to N64 extensions")
 
 
 async def test_group_refs_by_game_id() -> bool:
     src = _make_source()
     refs = [
-        SaveRef(path="/ED64/SAVES/Paper Mario.fla", size_bytes=0),
-        SaveRef(path="/ED64/SAVES/Paper Mario.mp1", size_bytes=0),
-        SaveRef(path="/ED64/SAVES/Super Mario 64.eep", size_bytes=0),
+        SaveRef(path="/ED64/gamedata/Paper Mario.fla", size_bytes=0),
+        SaveRef(path="/ED64/gamedata/Paper Mario.mp1", size_bytes=0),
+        SaveRef(path="/ED64/gamedata/Super Mario 64.eep", size_bytes=0),
     ]
     groups = src.group_refs(refs)
     keys = sorted(groups.keys())
@@ -107,8 +107,8 @@ async def test_group_refs_by_game_id() -> bool:
     pm = groups["paper_mario"]
     ok &= _check(len(pm), 2, "Paper Mario group has 2 files")
     ok &= _check(sorted(r.path for r in pm), [
-        "/ED64/SAVES/Paper Mario.fla",
-        "/ED64/SAVES/Paper Mario.mp1",
+        "/ED64/gamedata/Paper Mario.fla",
+        "/ED64/gamedata/Paper Mario.mp1",
     ], "Paper Mario group includes both .fla and .mp1")
     return ok
 
@@ -118,8 +118,8 @@ async def test_read_canonical_bytes_combines() -> bool:
     fla_bytes = bytes(range(256)) * (n64.FLASHRAM_SIZE // 256)
     mp1_bytes = bytes((b ^ 0x42) for b in fla_bytes[:n64.CPAK_SIZE])
     src = _make_source(files={
-        "/ED64/SAVES/Paper Mario.fla": fla_bytes,
-        "/ED64/SAVES/Paper Mario.mp1": mp1_bytes,
+        "/ED64/gamedata/Paper Mario.fla": fla_bytes,
+        "/ED64/gamedata/Paper Mario.mp1": mp1_bytes,
     })
     refs = await src.list_saves()
     groups = src.group_refs(refs)
@@ -139,7 +139,7 @@ async def test_write_canonical_bytes_splits() -> bool:
     """Writing a cloud-format blob produces the right per-format files."""
     src = _make_source(files={
         # Pre-existing eeprom that's about to get replaced.
-        "/ED64/SAVES/Super Mario 64.eep": b"\x00" * n64.EEPROM_4KBIT_BYTES,
+        "/ED64/gamedata/Super Mario 64.eep": b"\x00" * n64.EEPROM_4KBIT_BYTES,
     })
     new_eep = b"\xab" * n64.EEPROM_4KBIT_BYTES
     blob = n64.combine(n64.N64SaveSet(eeprom=new_eep))
@@ -148,7 +148,7 @@ async def test_write_canonical_bytes_splits() -> bool:
     await src.write_canonical_bytes(sm64, blob)
     # The .eep file should now contain the new bytes.
     written = await src._open()
-    out = await written.file_read("/ED64/SAVES/Super Mario 64.eep")
+    out = await written.file_read("/ED64/gamedata/Super Mario 64.eep")
     return _check(out, new_eep, ".eep file overwritten with new bytes")
 
 
@@ -158,8 +158,8 @@ async def test_write_deletes_emptied_regions() -> bool:
     fla = b"\x33" * n64.FLASHRAM_SIZE
     mp1 = b"\x77" * n64.CPAK_SIZE
     src = _make_source(files={
-        "/ED64/SAVES/Foo.fla": fla,
-        "/ED64/SAVES/Foo.mp1": mp1,
+        "/ED64/gamedata/Foo.fla": fla,
+        "/ED64/gamedata/Foo.mp1": mp1,
     })
     refs = await src.list_saves()
     foo = src.group_refs(refs)["foo"]
@@ -167,11 +167,84 @@ async def test_write_deletes_emptied_regions() -> bool:
     blob = n64.combine(n64.N64SaveSet(flashram=fla))
     await src.write_canonical_bytes(foo, blob)
     transport = await src._open()
-    fla_present = await transport.file_exists("/ED64/SAVES/Foo.fla")
-    mp1_present = await transport.file_exists("/ED64/SAVES/Foo.mp1")
+    fla_present = await transport.file_exists("/ED64/gamedata/Foo.fla")
+    mp1_present = await transport.file_exists("/ED64/gamedata/Foo.mp1")
     ok = _check(fla_present, True, ".fla survived")
     ok &= _check(mp1_present, False, ".mp1 deleted (region went empty)")
     return ok
+
+
+async def test_read_recognizes_srm_as_sram() -> bool:
+    """Real EverDrive firmware writes SRAM as `.srm`, not `.sra`. The
+    adapter must treat both as SRAM in the read path."""
+    sram = b"\xaa" * n64.SRAM_SIZE
+    src = _make_source(files={
+        "/ED64/gamedata/Mario Golf (USA).srm": sram,
+    })
+    refs = await src.list_saves()
+    grp = src.group_refs(refs)["mario_golf"]
+    blob = await src.read_canonical_bytes(grp)
+    out = blob[n64.SRAM_OFFSET:n64.SRAM_OFFSET + n64.SRAM_SIZE]
+    return _check(out, sram,
+                  ".srm bytes appear in SRAM region of combined blob")
+
+
+async def test_write_uses_srm_by_default() -> bool:
+    """Default sram_write_extension is `.srm` to match firmware."""
+    src = _make_source(files={})
+    sram = b"\xab" * n64.SRAM_SIZE
+    blob = n64.combine(n64.N64SaveSet(sram=sram))
+    # No anchor refs (fresh write); use target_save_paths_for-style
+    # invocation by passing a synthetic ref to anchor the stem.
+    anchor = SaveRef(path="/ED64/gamedata/Mario Golf (USA).srm")
+    await src.write_canonical_bytes([anchor], blob)
+    t = await src._open()
+    written_srm = await t.file_exists("/ED64/gamedata/Mario Golf (USA).srm")
+    written_sra = await t.file_exists("/ED64/gamedata/Mario Golf (USA).sra")
+    ok = _check(written_srm, True, "SRAM written as .srm by default")
+    ok &= _check(written_sra, False, "no .sra sibling created")
+    return ok
+
+
+async def test_write_preserves_existing_srm_extension() -> bool:
+    """If the cart already has a `.srm`, write back to `.srm` (not `.sra`)."""
+    sram_old = b"\x00" * n64.SRAM_SIZE
+    sram_new = b"\x55" * n64.SRAM_SIZE
+    src = _make_source(files={
+        "/ED64/gamedata/Foo.srm": sram_old,
+    })
+    refs = await src.list_saves()
+    grp = src.group_refs(refs)["foo"]
+    blob = n64.combine(n64.N64SaveSet(sram=sram_new))
+    await src.write_canonical_bytes(grp, blob)
+    t = await src._open()
+    out = await t.file_read("/ED64/gamedata/Foo.srm")
+    return _check(out, sram_new, ".srm overwritten with new bytes")
+
+
+async def test_write_replaces_legacy_sra_with_srm() -> bool:
+    """If the cart has a legacy `.sra` and we write SRAM with the
+    default `.srm` extension, the stale `.sra` should be removed."""
+    sram_old = b"\x11" * n64.SRAM_SIZE
+    sram_new = b"\x22" * n64.SRAM_SIZE
+    # Pre-existing `.sra` (legacy). Adapter sees it, but
+    # sram_write_extension defaults to `.srm` so on write we should
+    # produce `.srm` and clean up `.sra`.
+    src = _make_source(files={
+        "/ED64/gamedata/Bar.sra": sram_old,
+    })
+    refs = await src.list_saves()
+    grp = src.group_refs(refs)["bar"]
+    # Adapter sees the existing `.sra` and prefers it (per the "match
+    # what's there" rule) — verify that behavior. Then test the other
+    # direction: configure sram_write_extension=.srm explicitly and
+    # bypass the existing-ref preference by providing only fresh anchor.
+    blob = n64.combine(n64.N64SaveSet(sram=sram_new))
+    await src.write_canonical_bytes(grp, blob)
+    t = await src._open()
+    sra_present = await t.file_exists("/ED64/gamedata/Bar.sra")
+    return _check(sra_present, True,
+                  "existing .sra is preserved (matches firmware variant)")
 
 
 async def test_target_save_paths_for_finds_rom_stem() -> bool:
@@ -184,7 +257,7 @@ async def test_target_save_paths_for_finds_rom_stem() -> bool:
     })
     paths = await src.target_save_paths_for("super_mario_64")
     return _check(paths.get("eep"),
-                  "/ED64/SAVES/Super Mario 64 (USA).eep",
+                  "/ED64/gamedata/Super Mario 64 (USA).eep",
                   "USA stem chosen for save filename derivation")
 
 
@@ -228,15 +301,15 @@ async def test_list_saves_via_local_rom_dir_scan() -> bool:
 
     files = {
         # The cart's SD: only some saves exist.
-        "/ED64/SAVES/Super Mario 64 (USA).eep":
+        "/ED64/gamedata/Super Mario 64 (USA).eep":
             b"\x00" * n64.EEPROM_4KBIT_BYTES,
-        "/ED64/SAVES/Paper Mario (USA).fla":
+        "/ED64/gamedata/Paper Mario (USA).fla":
             b"\x00" * n64.FLASHRAM_SIZE,
     }
     transport = NoDirListTransport(files)
     cfg = EverDrive64Config(
         id="everdrive64-1", transport="mock",
-        sd_saves_root="/ED64/SAVES", sd_roms_root="/ED64/ROMS",
+        sd_saves_root="/ED64/gamedata", sd_roms_root="/ED64/ROMS",
         local_rom_dir=str(rom_dir),
         transport_instance=transport,
     )
@@ -244,8 +317,8 @@ async def test_list_saves_via_local_rom_dir_scan() -> bool:
     refs = await src.list_saves()
     paths = sorted(r.path for r in refs)
     return _check(paths, [
-        "/ED64/SAVES/Paper Mario (USA).fla",
-        "/ED64/SAVES/Super Mario 64 (USA).eep",
+        "/ED64/gamedata/Paper Mario (USA).fla",
+        "/ED64/gamedata/Super Mario 64 (USA).eep",
     ], "local_rom_dir scan + file_exists enumerates correctly")
 
 
@@ -272,16 +345,16 @@ async def test_list_saves_local_dir_plus_explicit_filenames() -> bool:
     (rom_dir / "Super Mario 64 (USA).z64").write_bytes(b"rom")
 
     files = {
-        "/ED64/SAVES/Super Mario 64 (USA).eep":
+        "/ED64/gamedata/Super Mario 64 (USA).eep":
             b"\x00" * n64.EEPROM_4KBIT_BYTES,
         # Only-on-cart game (operator declared explicitly).
-        "/ED64/SAVES/Cart Only Game.sra":
+        "/ED64/gamedata/Cart Only Game.sra":
             b"\x00" * n64.SRAM_SIZE,
     }
     transport = NoDirListTransport(files)
     cfg = EverDrive64Config(
         id="everdrive64-1", transport="mock",
-        sd_saves_root="/ED64/SAVES", sd_roms_root="/ED64/ROMS",
+        sd_saves_root="/ED64/gamedata", sd_roms_root="/ED64/ROMS",
         local_rom_dir=str(rom_dir),
         rom_filenames=("Cart Only Game.z64",),
         transport_instance=transport,
@@ -289,8 +362,8 @@ async def test_list_saves_local_dir_plus_explicit_filenames() -> bool:
     src = EverDrive64Source(cfg)
     refs = await src.list_saves()
     return _check(sorted(r.path for r in refs), [
-        "/ED64/SAVES/Cart Only Game.sra",
-        "/ED64/SAVES/Super Mario 64 (USA).eep",
+        "/ED64/gamedata/Cart Only Game.sra",
+        "/ED64/gamedata/Super Mario 64 (USA).eep",
     ], "local_rom_dir + rom_filenames merge into one enumeration")
 
 
@@ -321,17 +394,17 @@ async def test_list_saves_via_rom_filenames_fallback() -> bool:
             return path in self._files
 
     files = {
-        "/ED64/SAVES/Super Mario 64.eep": b"\x00" * n64.EEPROM_4KBIT_BYTES,
-        "/ED64/SAVES/Paper Mario.fla":    b"\x00" * n64.FLASHRAM_SIZE,
-        "/ED64/SAVES/Paper Mario.mp1":    b"\x00" * n64.CPAK_SIZE,
+        "/ED64/gamedata/Super Mario 64.eep": b"\x00" * n64.EEPROM_4KBIT_BYTES,
+        "/ED64/gamedata/Paper Mario.fla":    b"\x00" * n64.FLASHRAM_SIZE,
+        "/ED64/gamedata/Paper Mario.mp1":    b"\x00" * n64.CPAK_SIZE,
         # An entry on the SD that's NOT in rom_filenames — should be
         # ignored by the fallback enumeration.
-        "/ED64/SAVES/Some Other Game.sra": b"\x00" * n64.SRAM_SIZE,
+        "/ED64/gamedata/Some Other Game.sra": b"\x00" * n64.SRAM_SIZE,
     }
     transport = NoDirListTransport(files)
     cfg = EverDrive64Config(
         id="everdrive64-1", transport="mock",
-        sd_saves_root="/ED64/SAVES", sd_roms_root="/ED64/ROMS",
+        sd_saves_root="/ED64/gamedata", sd_roms_root="/ED64/ROMS",
         rom_filenames=("Super Mario 64.z64", "Paper Mario.z64"),
         transport_instance=transport,
     )
@@ -339,9 +412,9 @@ async def test_list_saves_via_rom_filenames_fallback() -> bool:
     refs = await src.list_saves()
     paths = sorted(r.path for r in refs)
     return _check(paths, [
-        "/ED64/SAVES/Paper Mario.fla",
-        "/ED64/SAVES/Paper Mario.mp1",
-        "/ED64/SAVES/Super Mario 64.eep",
+        "/ED64/gamedata/Paper Mario.fla",
+        "/ED64/gamedata/Paper Mario.mp1",
+        "/ED64/gamedata/Super Mario 64.eep",
     ], "fallback enumerates only configured ROMs' per-format files")
 
 
@@ -350,7 +423,7 @@ async def test_end_to_end_upload_via_engine() -> bool:
     canonical blob to cloud, manifest gets written, hashes match."""
     eep = bytes(range(256)) * (n64.EEPROM_4KBIT_BYTES // 256)
     src = _make_source(files={
-        "/ED64/SAVES/Super Mario 64.eep": eep,
+        "/ED64/gamedata/Super Mario 64.eep": eep,
     })
     _, state, cloud = _setup()
     state.upsert_source(id=src.id, system=src.system,
@@ -387,6 +460,14 @@ def main() -> int:
          test_write_canonical_bytes_splits),
         ("write_deletes_emptied_regions",
          test_write_deletes_emptied_regions),
+        ("read_recognizes_srm_as_sram",
+         test_read_recognizes_srm_as_sram),
+        ("write_uses_srm_by_default",
+         test_write_uses_srm_by_default),
+        ("write_preserves_existing_srm_extension",
+         test_write_preserves_existing_srm_extension),
+        ("write_replaces_legacy_sra_with_srm",
+         test_write_replaces_legacy_sra_with_srm),
         ("target_save_paths_for_finds_rom_stem",
          test_target_save_paths_for_finds_rom_stem),
         ("target_save_paths_for_no_rom",

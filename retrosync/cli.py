@@ -1114,6 +1114,109 @@ def cmd_ed64_probe(ctx: click.Context, source_id: str,
     asyncio.run(_go())
 
 
+@cmd_ed64.command("probe-file")
+@click.argument("source_id")
+@click.argument("path")
+@click.option("--timeout", type=float, default=2.0, show_default=True)
+@click.option("--read-bytes", type=int, default=64, show_default=True,
+              help="Bytes to read after the file-info command. The "
+                   "expected response is 16 bytes ('cmd4' header + "
+                   "status + size); a longer read catches firmware "
+                   "variants that send extra trailing data.")
+@click.pass_context
+def cmd_ed64_probe_file(ctx: click.Context, source_id: str, path: str,
+                        timeout: float, read_bytes: int) -> None:
+    """Send a single file_info ('4') command for PATH and dump what
+    the cart returns. Useful when test-cart enumeration times out
+    on every probe and you want to see whether the cart understands
+    the file_info command at all (or just chokes on a specific path
+    encoding).
+
+    \b
+    Sample run:
+      retrosync everdrive64 probe-file everdrive64-1 \\
+          "/ED64/gamedata/Mario Golf (USA).srm"
+
+    Look at the response:
+      - Empty (no bytes): cart didn't recognize the cmd or path. The
+        cart is likely showing 'USB Timeout' on its screen.
+      - 16 bytes starting 'cmd4' + status 0x00: file exists. status
+        byte is at offset 4; size at offset 8 (uint32 BE).
+      - 16 bytes starting 'cmd4' + status 0x04: FR_NO_FILE — file
+        doesn't exist (try a path you know is there).
+      - Different cmd byte returned: firmware uses a different
+        command code for file_info than '4'.
+    """
+    cfg: Config = ctx.obj["config"]
+    src_cfg = next((s for s in cfg.sources if s.id == source_id), None)
+    if src_cfg is None:
+        raise click.ClickException(f"unknown source {source_id!r}")
+    if src_cfg.adapter != "everdrive64":
+        raise click.ClickException(
+            f"source {source_id!r} is not an everdrive64 adapter")
+
+    async def _go():
+        from .transport.krikzz_ftdi import (
+            build_command_frame, build_transport, pad_to_min_block,
+        )
+        opts: dict = {}
+        if src_cfg.options.get("transport", "serial") == "serial":
+            opts["serial_path"] = src_cfg.options.get(
+                "serial_path", "/dev/ttyUSB0")
+            opts["baud"] = src_cfg.options.get("serial_baud", 9600)
+            opts["timeout_sec"] = timeout
+        t = build_transport(
+            kind=src_cfg.options.get("transport", "serial"), **opts)
+        await t.open()
+        ok, detail = await t.health()
+        if not ok:
+            await t.close()
+            raise click.ClickException(f"cart not healthy: {detail}")
+        click.echo(f"cart OK: {detail}")
+        click.echo(f"sending file_info ('4') for path {path!r} "
+                   f"({len(path)} bytes ASCII)")
+        port = t._port  # type: ignore[attr-defined]
+        port.timeout = timeout
+        try:
+            path_bytes = path.encode("ascii")
+            padded = pad_to_min_block(path_bytes)
+            frame = build_command_frame(
+                ord("4"), length=len(path_bytes))
+            click.echo(f"  cmd frame: {frame.hex()}")
+            click.echo(f"  payload  : {padded.hex()} "
+                       f"(unpadded {len(path_bytes)}B → padded {len(padded)}B)")
+            port.reset_input_buffer()
+            port.write(frame)
+            port.write(padded)
+            port.flush()
+            resp = port.read(read_bytes)
+            if not resp:
+                click.echo("  → NO RESPONSE (cart likely waiting for more "
+                           "data; check screen for 'USB Timeout')")
+            else:
+                click.echo(f"  → {len(resp)}B response")
+                click.echo(f"    hex  : {resp.hex()}")
+                click.echo(f"    ascii: " + "".join(
+                    chr(b) if 0x20 <= b < 0x7f else "."
+                    for b in resp))
+                if len(resp) >= 5 and resp[:3] == b"cmd":
+                    click.echo(f"    cmd byte returned: 0x{resp[3]:02x} "
+                               f"({chr(resp[3])!r}) "
+                               f"{'(matches expected ' + chr(0x34) + ')' if resp[3] == ord('4') else '(MISMATCH — firmware may use a different cmd code)'}")
+                    click.echo(f"    status byte (offset 4): 0x{resp[4]:02x} "
+                               f"{'(OK — file exists)' if resp[4] == 0 else '(error: FR_' + {1: 'DISK_ERR', 2: 'INT_ERR', 3: 'NOT_READY', 4: 'NO_FILE', 5: 'NO_PATH'}.get(resp[4], 'UNKNOWN') + ')'}")
+                    if len(resp) >= 12 and resp[4] == 0:
+                        size = int.from_bytes(resp[8:12], "big")
+                        click.echo(f"    size: {size} bytes")
+        finally:
+            try:
+                await t.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    asyncio.run(_go())
+
+
 def _parse_byte_range(spec: str) -> list[int]:
     """Parse '5-9' / '5,6,7' / 'a-z' / '5,A,B,9' into a list of cmd
     byte values. Single chars become their ASCII code."""

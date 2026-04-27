@@ -2,7 +2,7 @@
 
 The cart's USB port (FT245-based) lets us read/write the SD card's
 file system while the N64 is powered on. We use this to sync the
-EverDrive's per-format save files (`.eep` / `.sra` / `.fla` / `.mpk`)
+EverDrive's per-format save files (`.eep` / `.srm` / `.fla` / `.mpk`)
 with the cloud-side combined `.srm` (per `retrosync.formats.n64`).
 
 The actual USB protocol lives in `retrosync.transport.krikzz_ftdi` so

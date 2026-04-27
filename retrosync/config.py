@@ -326,7 +326,7 @@ sources:
   # EverDrive 64 X7 (N64 flash cart over USB). Plugs into the same
   # Pi as the FXPak Pro; same usb-while-running model: continuous
   # polling, instant-sync via udev poke, lease-aware. Per-format
-  # save files (.eep/.sra/.fla/.mp1..mp4) are aggregated into a
+  # save files (.eep/.srm/.fla/.mp1..mp4) are aggregated into a
   # combined Mupen64Plus-format .srm before upload, and split back
   # on download — see `retrosync/formats/n64.py`.
   # - id: everdrive64-1
@@ -344,8 +344,15 @@ sources:
   #     transport: serial
   #     serial_path: /dev/ttyUSB0
   #     serial_baud: 9600        # FT232 baud is largely cosmetic
-  #     sd_saves_root: /ED64/SAVES
+  #     # Real EverDrive OS firmware writes saves under /ED64/gamedata/
+  #     # using `.srm` for SRAM (NOT the `.sra` documented in some
+  #     # open-source references). Override only if your firmware
+  #     # variant differs.
+  #     sd_saves_root: /ED64/gamedata
   #     sd_roms_root: /ED64/ROMS
+  #     # Switch to `.sra` only if your firmware writes that variant.
+  #     # Reads tolerate either regardless of this setting.
+  #     sram_write_extension: ".srm"
   #     rom_extensions: [".z64", ".n64", ".v64"]
   #     system: n64
   #     # Krikzz's USB tool source doesn't expose a directory-list

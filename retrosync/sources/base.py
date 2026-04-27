@@ -86,7 +86,7 @@ def default_group_refs(source: "SaveSource",
                        refs: list[SaveRef]) -> dict[str, list[SaveRef]]:
     """Default `group_refs` for single-file sources: one group per ref.
 
-    Multi-file sources (N64 EverDrive: per-format `.eep` / `.sra` /
+    Multi-file sources (N64 EverDrive: per-format `.eep` / `.srm` /
     `.fla` / `.mpk`) override this to group refs by `game_id` so the
     engine can hand a coherent saveset to the per-system translator.
     The key is opaque — engine treats it as a stable handle for

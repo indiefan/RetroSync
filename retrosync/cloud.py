@@ -101,7 +101,7 @@ SYSTEM_CANONICAL_EXTENSION: dict[str, str] = {
     # N64 cloud blob is the combined Mupen64Plus-format .srm
     # (see retrosync.formats.n64). EverDrive uploads pass through
     # combine() first; downloads pass through split() and write
-    # per-format files (.eep / .sra / .fla / .mpk) to the SD.
+    # per-format files (.eep / .srm / .fla / .mpk) to the SD.
     "n64": ".srm",
 }
 
