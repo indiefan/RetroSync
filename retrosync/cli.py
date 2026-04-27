@@ -932,19 +932,20 @@ def cmd_ed64() -> None:
 
 @cmd_ed64.command("probe-cmd-bytes")
 @click.argument("source_id")
-@click.option("--bytes", "byte_range", default="5-9",
-              help="Range or list of cmd bytes to probe (e.g. "
-                   "'5-9' or 'a-z' or '5,6,7,D,L'). Default '5-9' "
-                   "covers the file-op family slot most likely to "
-                   "contain dir-list / mkdir / delete.")
+@click.option("--bytes", "byte_range",
+              default="5-9,a-z,A-Z",
+              help="Range or list of cmd bytes (e.g. '5-9', 'a-z', "
+                   "'5,6,D,L'). Default sweeps the digit and "
+                   "letter ranges where the dir-list cmd is most "
+                   "plausibly hiding.")
 @click.option("--with-path", default="/",
-              help="Path payload sent after the cmd frame for byte's "
-                   "second probe attempt.")
-@click.option("--timeout", type=float, default=0.5, show_default=True)
-@click.option("--read-bytes", type=int, default=128, show_default=True,
+              help="Path payload sent after the cmd frame for the "
+                   "variable-length-path probe attempt.")
+@click.option("--timeout", type=float, default=1.0, show_default=True)
+@click.option("--read-bytes", type=int, default=512, show_default=True,
               help="How many bytes to attempt reading from the cart "
                    "after each probe. Bigger catches dir-list-shaped "
-                   "payloads; smaller is faster.")
+                   "payloads.")
 @click.pass_context
 def cmd_ed64_probe(ctx: click.Context, source_id: str,
                    byte_range: str, with_path: str, timeout: float,
@@ -1030,6 +1031,11 @@ def cmd_ed64_probe(ctx: click.Context, source_id: str,
                 click.echo(f"    (recover failed: {exc})")
                 return False
 
+        # Build a 256-byte fixed buffer with the path (matches the
+        # `appStart` shape from Krikzz's Edio.cs — uncertain whether
+        # any dir-list-class command uses this layout, but cheap to try).
+        path_bytes = with_path.encode()
+        fixed_256 = path_bytes + b"\x00" * (256 - len(path_bytes))
         try:
             for cmd in bytes_to_probe:
                 ch = chr(cmd) if 0x20 <= cmd < 0x7f else "?"
@@ -1038,6 +1044,8 @@ def cmd_ed64_probe(ctx: click.Context, source_id: str,
                         (f"+path {with_path!r}",
                          pad_to_min_block(with_path.encode()),
                          len(with_path)),
+                        (f"+256B-buffer {with_path!r}",
+                         fixed_256, 0),
                 ):
                     try:
                         port.reset_input_buffer()
