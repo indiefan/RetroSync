@@ -80,9 +80,18 @@ case "${cmd}" in
   lsjson)
     rel="$(strip_remote "$1")"
     path="${FAKE_RCLONE_ROOT}/${rel}"
+    # Helper: emit ISO-8601 mtime in the format real rclone uses
+    # ("2026-04-29T12:34:56.000000000Z"). Tests that want to drive the
+    # manifest-drift check `touch -d ... <file>` to set this.
+    mtime_for() {
+      stat -c '%y' "$1" 2>/dev/null \
+        || stat -f '%Sm' -t '%Y-%m-%dT%H:%M:%SZ' "$1"
+    }
     if [[ -f "${path}" ]]; then
       size=$(stat -c %s "${path}" 2>/dev/null || stat -f %z "${path}")
-      printf '[{"Name":"%s","Size":%s,"IsDir":false}]\n' "$(basename "${rel}")" "${size}"
+      mtime=$(mtime_for "${path}")
+      printf '[{"Name":"%s","Size":%s,"IsDir":false,"ModTime":"%s"}]\n' \
+             "$(basename "${rel}")" "${size}" "${mtime}"
     elif [[ -d "${path}" ]]; then
       first=1
       printf '['
@@ -95,7 +104,9 @@ case "${cmd}" in
           printf '{"Name":"%s","IsDir":true,"Size":0}' "${name}"
         else
           size=$(stat -c %s "${entry}" 2>/dev/null || stat -f %z "${entry}")
-          printf '{"Name":"%s","IsDir":false,"Size":%s}' "${name}" "${size}"
+          mtime=$(mtime_for "${entry}")
+          printf '{"Name":"%s","IsDir":false,"Size":%s,"ModTime":"%s"}' \
+                 "${name}" "${size}" "${mtime}"
         fi
       done
       printf ']\n'

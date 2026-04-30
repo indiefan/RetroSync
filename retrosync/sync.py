@@ -256,8 +256,40 @@ async def sync_one_game(*, source: SaveSource, ref: SaveRef,
 
     # --------- decision matrix per design §7.1 ---------
 
-    # 1. Already in sync.
+    # 1. Already in sync (per the manifest).
     if h_dev is not None and h_dev == h_cloud:
+        # Cheap drift check: the manifest's `current_hash` may have
+        # drifted from the actual `current.<ext>` bytes — happens
+        # when an operator does an rclone-level migration (moves
+        # current.<ext> without updating the manifest), or in a
+        # cross-device manifest write race. The pull path has a
+        # hash-based self-heal but we'd skip silently here if we
+        # trusted the manifest alone. _manifest_drifted does a single
+        # lsjson and compares size + ModTime against the manifest;
+        # if either looks off, force a re-pull via _pull_to_device
+        # (which itself self-heals on hash mismatch).
+        if manifest is not None and await _manifest_drifted(
+                ctx=ctx, paths=paths,
+                expected_size=manifest.current_size,
+                manifest_updated_at=manifest.updated_at):
+            log.warning(
+                "%s on %s: cloud's current.<ext> drifted from manifest "
+                "(claims hash=%s) — forcing re-pull to self-heal",
+                game_id, source.id, hash8(h_cloud))
+            if not ctx.cfg.cloud_to_device:
+                return SyncOutcome(
+                    SyncResult.SKIPPED, game_id, ref.path, paths,
+                    "manifest drift but cloud_to_device disabled")
+            actual = await _pull_to_device(
+                source=source, ref=ref, paths=paths,
+                expected_hash=h_cloud, ctx=ctx)
+            ctx.state.set_sync_state(
+                source_id=source.id, game_id=game_id,
+                last_synced_hash=actual, device_seen_path=ref.path)
+            ctx.invalidate_manifest(paths)
+            return SyncOutcome(SyncResult.DOWNLOADED, game_id,
+                               ref.path, paths,
+                               "manifest drift self-heal")
         ctx.state.set_sync_state(
             source_id=source.id, game_id=game_id,
             last_synced_hash=h_dev, device_seen_path=ref.path)
@@ -619,6 +651,66 @@ async def _is_drift_from_last(*, ctx: SyncContext,
     return False
 
 
+async def _manifest_drifted(*, ctx: SyncContext, paths: CloudPaths,
+                            expected_size: int | None,
+                            manifest_updated_at: str) -> bool:
+    """Cheap drift probe: lsjson the cloud's `current.<ext>` and
+    compare against what the manifest claims.
+
+    Mismatch = the manifest is stale (e.g. an rclone-level migration
+    moved current.<ext> without updating the manifest, or a cross-
+    device manifest write race). Returns True iff drift is confirmed;
+    False on "matches" or "couldn't tell" (transient cloud error).
+    Conservative: on any cloud failure we say "no drift" so a flaky
+    network doesn't pointlessly re-pull every IN_SYNC game.
+
+    Two checks, in order:
+      1. Size — only when the manifest is schema 4+ and recorded
+         `current_size`. Catches drift where the new bytes differ
+         in length (most cross-system migrations).
+      2. ModTime — works on any manifest. The cloud-side ModTime of
+         current.<ext> is set at upload; manifest.updated_at is set
+         right after (always slightly later in normal writes). A
+         current.<ext> ModTime more than 60 seconds NEWER than
+         manifest.updated_at means current.<ext> got rewritten
+         without a matching manifest update — drift. (60s gives
+         clock-skew slack; same-size drift in the user's
+         GoodTools-vs-No-Intro N64 migration was the motivating case.)
+    """
+    try:
+        entries = ctx.cloud.lsjson(paths.current)
+    except CloudError as exc:
+        log.debug("manifest drift check: lsjson failed (%s); skipping",
+                  exc)
+        return False
+    if not entries:
+        log.warning(
+            "manifest drift check: %s missing from cloud — manifest "
+            "references a current.<ext> that doesn't exist",
+            paths.current)
+        return False
+    entry = entries[0]
+    if expected_size is not None:
+        actual_size = entry.get("Size")
+        if isinstance(actual_size, int) and actual_size != expected_size:
+            return True
+    mod_time_str = entry.get("ModTime")
+    if not mod_time_str or not manifest_updated_at:
+        return False
+    try:
+        from datetime import datetime
+        mod_time = datetime.fromisoformat(
+            mod_time_str.replace("Z", "+00:00"))
+        manifest_at = datetime.fromisoformat(
+            manifest_updated_at.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    delta_sec = (mod_time - manifest_at).total_seconds()
+    # >60s newer → drift. Negative or near-zero is the normal case
+    # (manifest is written right after current.<ext>).
+    return delta_sec > 60
+
+
 async def _pull_to_device(*, source: SaveSource, ref: SaveRef,
                           paths: CloudPaths, expected_hash: str,
                           ctx: SyncContext) -> str:
@@ -844,10 +936,25 @@ def refresh_manifest(*, source: SaveSource, save_path: str, game_id: str,
         ))
 
     current_hash = ctx.state.get_current_hash(source.id, save_path)
+    # Find the size of `current_hash` by looking it up in the versions
+    # table — we want the manifest to record (hash, size) so the engine
+    # can spot drift cheaply on the IN_SYNC path. None if the hash isn't
+    # in the versions table for this source/path (e.g. a hash that came
+    # in via a cross-device upload we haven't observed locally).
+    current_size: int | None = None
+    if current_hash is not None:
+        row = ctx.state._conn.execute(
+            "SELECT size_bytes FROM versions "
+            "WHERE source_id=? AND path=? AND hash=? "
+            "ORDER BY id DESC LIMIT 1",
+            (source.id, save_path, current_hash)).fetchone()
+        if row is not None:
+            current_size = row["size_bytes"]
     manifest = build_manifest(
         source_id=source.id, system=source.system, game_id=game_id,
         save_path=save_path, save_filename=save_filename,
-        current_hash=current_hash, versions=entries,
+        current_hash=current_hash, current_size=current_size,
+        versions=entries,
         device_state=device_state, conflicts=conflicts,
     )
     ctx.cloud.write_manifest(paths=paths, manifest=manifest)

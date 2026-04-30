@@ -192,7 +192,7 @@ class ConflictEntry:
 # active_lease addition. Old daemons reading schema-3 manifests treat
 # the unknown `active_lease` field as a no-op (parse_manifest below
 # accepts both shapes).
-MANIFEST_SCHEMA = 3
+MANIFEST_SCHEMA = 4
 
 
 @dataclass
@@ -249,6 +249,14 @@ class Manifest:
     device_state: dict[str, DeviceState] = None  # type: ignore[assignment]
     conflicts: list[ConflictEntry] = None        # type: ignore[assignment]
     active_lease: ActiveLease | None = None
+    # Byte size of the cloud's `current.<ext>` corresponding to
+    # `current_hash`. Used as a cheap drift-check on the IN_SYNC path:
+    # if the actual `current.<ext>` size doesn't match this, the
+    # manifest is stale and we force a re-pull (which routes through
+    # `_pull_to_device`'s self-heal). None on legacy manifests written
+    # before schema 4 — the drift check is skipped in that case so
+    # backwards compat holds.
+    current_size: int | None = None
 
     def __post_init__(self) -> None:
         if self.device_state is None:
@@ -265,6 +273,7 @@ class Manifest:
             "save_filename": self.save_filename,
             "source_id": self.source_id,
             "current_hash": self.current_hash,
+            "current_size": self.current_size,
             "updated_at": self.updated_at,
             "device_state": {sid: ds.to_dict()
                              for sid, ds in self.device_state.items()},
@@ -522,6 +531,7 @@ def parse_manifest(raw: dict) -> Manifest:
         save_path=raw.get("save_path", ""),
         save_filename=raw.get("save_filename"),
         current_hash=raw.get("current_hash"),
+        current_size=raw.get("current_size"),
         updated_at=raw.get("updated_at", utc_iso()),
         versions=versions,
         device_state=device_state,
@@ -536,6 +546,7 @@ def build_manifest(*, source_id: str, system: str, game_id: str,
                    save_filename: str | None = None,
                    device_state: dict[str, DeviceState] | None = None,
                    conflicts: Iterable[ConflictEntry] | None = None,
+                   current_size: int | None = None,
                    ) -> Manifest:
     return Manifest(
         schema=MANIFEST_SCHEMA,
@@ -545,6 +556,7 @@ def build_manifest(*, source_id: str, system: str, game_id: str,
         save_path=save_path,
         save_filename=save_filename,
         current_hash=current_hash,
+        current_size=current_size,
         updated_at=utc_iso(),
         versions=sorted(list(versions), key=lambda v: v.uploaded_at),
         device_state=dict(device_state or {}),
