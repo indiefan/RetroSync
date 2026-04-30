@@ -196,6 +196,68 @@ def test_resolve_source_id_no_match_passes_through() -> bool:
                   "no match → original source_id passed through")
 
 
+async def test_list_saves_filters_by_system_via_roms_root() -> bool:
+    """Multi-system setups share saves_root across adapters. Each
+    adapter must filter to saves whose slug has a matching ROM in
+    ITS own roms_root, otherwise the SNES adapter picks up the N64
+    saves and uploads them to the wrong cloud system."""
+    workdir = Path(tempfile.mkdtemp(prefix="retrosync-multisys-"))
+    saves_root = workdir / "saves"
+    saves_root.mkdir()
+    snes_roms = workdir / "roms" / "snes"
+    snes_roms.mkdir(parents=True)
+    n64_roms = workdir / "roms" / "n64"
+    n64_roms.mkdir(parents=True)
+
+    # Put one ROM per system.
+    (snes_roms / "Super Metroid (USA).sfc").write_bytes(b"x")
+    (n64_roms / "Star Wars - Shadows of the Empire (U) (V1.2) [!].z64"
+     ).write_bytes(b"x")
+
+    # Both saves land in the same shared dir (RetroArch's default).
+    (saves_root / "Super Metroid (USA).srm").write_bytes(b"snes-save")
+    (saves_root / "Star Wars - Shadows of the Empire (U) (V1.2) [!].srm"
+     ).write_bytes(b"n64-save")
+
+    snes = EmuDeckSource(EmuDeckConfig(
+        id="deck-1-snes", saves_root=str(saves_root),
+        roms_root=str(snes_roms), system="snes"))
+    n64 = EmuDeckSource(EmuDeckConfig(
+        id="deck-1-n64", saves_root=str(saves_root),
+        roms_root=str(n64_roms), system="n64",
+        rom_extensions=(".z64", ".n64", ".v64")))
+
+    snes_saves = sorted(s.path for s in await snes.list_saves())
+    n64_saves = sorted(s.path for s in await n64.list_saves())
+
+    ok = _check(snes_saves, [str(saves_root / "Super Metroid (USA).srm")],
+                "SNES adapter sees only SNES save")
+    ok &= _check(n64_saves,
+                 [str(saves_root /
+                      "Star Wars - Shadows of the Empire (U) (V1.2) [!].srm")],
+                 "N64 adapter sees only N64 save")
+    return ok
+
+
+async def test_list_saves_no_roms_root_disables_filter() -> bool:
+    """Single-system setups that haven't populated roms_root yet
+    (or operators using only the cart side) shouldn't get saves
+    filtered out. Empty roms_root → no filtering, keep old behavior."""
+    workdir = Path(tempfile.mkdtemp(prefix="retrosync-noroms-"))
+    saves_root = workdir / "saves"
+    saves_root.mkdir()
+    empty_roms = workdir / "roms" / "snes"
+    empty_roms.mkdir(parents=True)
+    (saves_root / "Some Game.srm").write_bytes(b"save")
+
+    src = EmuDeckSource(EmuDeckConfig(
+        id="deck-1", saves_root=str(saves_root),
+        roms_root=str(empty_roms), system="snes"))
+    saves = sorted(s.path for s in await src.list_saves())
+    return _check(saves, [str(saves_root / "Some Game.srm")],
+                  "empty roms_root preserves all saves")
+
+
 def test_check_core_save_overrides_flags_footgun() -> bool:
     """savefiles_in_content_dir=true triggers a warning."""
     workdir = Path(tempfile.mkdtemp(prefix="retrosync-cfg-"))
@@ -209,6 +271,10 @@ def main() -> int:
     ok = True
     for name, fn in [
         ("emudeck_lists_and_uploads", test_emudeck_lists_and_uploads),
+        ("list_saves_filters_by_system_via_roms_root",
+         test_list_saves_filters_by_system_via_roms_root),
+        ("list_saves_no_roms_root_disables_filter",
+         test_list_saves_no_roms_root_disables_filter),
     ]:
         print(f"--- {name} ---")
         ok &= asyncio.run(fn())
