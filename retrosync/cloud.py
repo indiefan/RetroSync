@@ -562,3 +562,23 @@ def build_manifest(*, source_id: str, system: str, game_id: str,
         device_state=dict(device_state or {}),
         conflicts=sorted(list(conflicts or []), key=lambda c: c.id),
     )
+
+
+def discover_cloud_games(cloud: RcloneCloud, system: str) -> Iterable[tuple[str, CloudPaths]]:
+    """Yield (game_id, paths) for every cloud game under <remote>/<system>/.
+    Cloud paths are composed via the system-canonical extension so they
+    point at the right `current.<ext>` regardless of which adapter
+    originally uploaded.
+    """
+    base = f"{cloud.remote.rstrip('/')}/{system}"
+    try:
+        entries = cloud.lsjson(base)
+    except CloudError:
+        return
+    for e in entries:
+        if not e.get("IsDir"):
+            continue
+        game_id = e["Name"]
+        yield game_id, compose_paths(
+            remote=cloud.remote, system=system,
+            game_id=game_id, save_filename=f"{game_id}.bin")

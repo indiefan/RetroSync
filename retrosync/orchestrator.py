@@ -44,6 +44,8 @@ from .sync import (
     SyncConfig, SyncContext, SyncOutcome, SyncResult, refresh_manifest,
     sync_one_game,
 )
+from .cloud import discover_cloud_games
+import time
 
 log = logging.getLogger(__name__)
 
@@ -86,6 +88,7 @@ class BackupOrchestrator:
         # health → unhealthy transition (proxy for "console powered off").
         self._lease_tracker = LeaseTracker(
             source_id=source.id, cloud=deps.cloud, cfg=deps.lease_cfg)
+        self._last_cloud_discovery_time: float = 0.0
 
     def poke(self) -> None:
         """Signal the orchestrator to interrupt its current wait and run
@@ -164,10 +167,10 @@ class BackupOrchestrator:
             log.info("source %s came back healthy: %s",
                      self._source.id, health.detail)
         self._last_health_ok = True
-        await self._one_pass(health=health)
+        await self._one_pass(health=health, is_health_transition=True)
         return True
 
-    async def _one_pass(self, *, health=None) -> None:
+    async def _one_pass(self, *, health=None, is_health_transition: bool = False) -> None:
         if health is None:
             health = await self._source.health()
             if not health.ok:
@@ -201,9 +204,12 @@ class BackupOrchestrator:
         for group_refs in groups.values():
             for ref in group_refs:
                 path_to_group[ref.path] = group_refs
+        seen_game_ids: set[str] = set()
         for group_key, group_refs in groups.items():
-            await self._poll_one_group(group_key, group_refs, ctx,
-                                       refresh_targets)
+            game_id = await self._poll_one_group(group_key, group_refs, ctx,
+                                                 refresh_targets)
+            if game_id:
+                seen_game_ids.add(game_id)
 
         # Mark files that vanished from the source.
         gone = self._deps.state.tombstone_missing(self._source.id, present_paths)
@@ -226,11 +232,84 @@ class BackupOrchestrator:
                 log.warning("manifest refresh failed for %s; next pass "
                             "will retry: %s", save_path, exc)
 
+        # Bootstrap-pull: check cloud for games missing from device.
+        if self._deps.sync_cfg.cloud_to_device:
+            now = time.monotonic()
+            if is_health_transition or (now - self._last_cloud_discovery_time > 300):
+                self._last_cloud_discovery_time = now
+                await self._discover_and_bootstrap(ctx, seen_game_ids, refresh_targets)
+
+    async def _discover_and_bootstrap(self, ctx: SyncContext,
+                                      seen_game_ids: set[str],
+                                      refresh_targets: dict[str, tuple[str, str, object]]) -> None:
+        """Find cloud games the device has no save for and bootstrap-pull."""
+        try:
+            cloud_games = list(discover_cloud_games(self._deps.cloud, self._source.system))
+        except CloudError as exc:
+            log.warning("cloud discovery failed for %s: %s", self._source.id, exc)
+            return
+
+        for game_id, paths in cloud_games:
+            if game_id in seen_game_ids:
+                continue
+            if not self._lease_tracker.ensure(game_id=game_id, paths=paths):
+                log.info("  bootstrap %s → SKIPPED (lease contention)", game_id)
+                continue
+            
+            target_method = getattr(self._source, "target_save_paths_for", None)
+            if target_method is not None:
+                # Async implementation for EverDrive
+                import inspect
+                if inspect.iscoroutinefunction(target_method):
+                    try:
+                        targets = await target_method(game_id)
+                    except Exception as exc:
+                        log.warning("target_save_paths_for failed for %s: %s", game_id, exc)
+                        continue
+                else:
+                    try:
+                        targets = target_method(game_id)
+                    except Exception as exc:
+                        log.warning("target_save_paths_for failed for %s: %s", game_id, exc)
+                        continue
+                
+                if not targets:
+                    continue
+                # Pick the first path as the canonical key for the orchestrator
+                first_path = list(targets.values())[0]
+                if isinstance(first_path, list):
+                    if not first_path:
+                        continue
+                    first_path = first_path[0]
+            else:
+                # Fallback for single-file sources that haven't migrated
+                target_method_single = getattr(self._source, "target_save_path_for", None)
+                if not target_method_single:
+                    continue
+                try:
+                    first_path = str(target_method_single(game_id))
+                except Exception as exc:
+                    log.warning("target_save_path_for failed for %s: %s", game_id, exc)
+                    continue
+
+            ref = SaveRef(path=first_path)
+            try:
+                outcome = await sync_one_game(source=self._source, ref=ref, ctx=ctx)
+            except CloudError as exc:
+                log.warning("bootstrap-pull %s failed: %s", game_id, exc)
+                continue
+
+            log.info("  bootstrap %s → %s", game_id, outcome.result.value)
+            if outcome.paths is not None and outcome.result in (
+                    SyncResult.DOWNLOADED, SyncResult.BOOTSTRAP_DOWNLOADED):
+                refresh_targets[outcome.game_id] = (
+                    outcome.game_id, outcome.save_path, outcome.paths)
+
     async def _poll_one_group(self, group_key: str,
                               group_refs: list[SaveRef],
                               ctx: SyncContext,
                               refresh_targets: dict[str, tuple[str, str, object]]
-                              ) -> None:
+                              ) -> str | None:
         """Process one logical save (one or more device-side files).
 
         Group_key is opaque (the source's `group_refs` key, default
@@ -240,7 +319,7 @@ class BackupOrchestrator:
         file came first when the source listed them.
         """
         if not group_refs:
-            return
+            return None
         ref = group_refs[0]
         try:
             reader = getattr(self._source, "read_canonical_bytes", None)
@@ -250,7 +329,7 @@ class BackupOrchestrator:
                 data = await default_read_canonical_bytes(self._source, group_refs)
         except SourceError as exc:
             log.warning("read_canonical_bytes failed (%s): %s", ref.path, exc)
-            return
+            return None
 
         h = sha256_bytes(data)
         size = len(data)
@@ -273,7 +352,7 @@ class BackupOrchestrator:
             log.info("hard-mode lease contention for %s on %s; skipping "
                      "this game until the holder releases",
                      game_id, self._source.id)
-            return
+            return game_id
 
         if h == prev_h:
             latest = self._deps.state.latest_active_version(
@@ -291,7 +370,7 @@ class BackupOrchestrator:
                     primed_data=data, primed_hash=h,
                 )
                 self._record_refresh(outcome, refresh_targets)
-            return
+            return game_id
 
         # Hash changed (or first sighting). Supersede any active row, insert pending.
         latest = self._deps.state.latest_active_version(
@@ -315,6 +394,7 @@ class BackupOrchestrator:
 
         # First sighting counts as one stable poll.
         self._deps.state.bump_debounce(vid)
+        return game_id
 
     def _promote_stable(self) -> None:
         threshold = self._deps.cfg.debounce_polls

@@ -21,7 +21,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from ..cloud import CloudError, RcloneCloud, compose_paths
+from ..cloud import CloudError, RcloneCloud, compose_paths, discover_cloud_games
 from ..config import Config
 from ..lease_tracker import LeaseTracker
 from ..sources.base import SaveRef
@@ -225,7 +225,7 @@ async def run_pocket_sync(*, source: PocketSource, config: Config,
 
         # Bootstrap-pull: cloud has games the device doesn't.
         if config.cloud_to_device:
-            for game_id, paths in _cloud_games(cloud, source.system):
+            for game_id, paths in discover_cloud_games(cloud, source.system):
                 if game_id in seen_game_ids:
                     continue
                 if not lease_tracker.ensure(game_id=game_id, paths=paths):
@@ -249,26 +249,6 @@ async def run_pocket_sync(*, source: PocketSource, config: Config,
         state.close()
     log.info("pocket sync complete: %s", summary.render())
     return summary
-
-
-def _cloud_games(cloud: RcloneCloud, system: str):
-    """Yield (game_id, paths) for every cloud game under <remote>/<system>/.
-    Cloud paths are composed via the system-canonical extension so they
-    point at the right `current.<ext>` regardless of which adapter
-    originally uploaded.
-    """
-    base = f"{cloud.remote.rstrip('/')}/{system}"
-    try:
-        entries = cloud.lsjson(base)
-    except CloudError:
-        return
-    for e in entries:
-        if not e.get("IsDir"):
-            continue
-        game_id = e["Name"]
-        yield game_id, compose_paths(
-            remote=cloud.remote, system=system,
-            game_id=game_id, save_filename=f"{game_id}.bin")
 
 
 async def _bootstrap_pull(*, source: PocketSource, game_id: str,
