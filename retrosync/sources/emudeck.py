@@ -102,6 +102,17 @@ class EmuDeckSource:
         if not d.exists():
             return []
         ext = self._cfg.save_extension.lower()
+        # On EmuDeck, RetroArch puts saves for every system into the
+        # same directory by default. With multiple adapters configured
+        # (deck-1-snes, deck-1-n64, ...), each one would see every
+        # other system's `.srm` and try to sync them — uploading N64
+        # saves to `snes/<game>/`, etc. Filter to saves whose slug has
+        # a matching ROM in THIS adapter's roms_root.
+        #
+        # Backwards-compat: if roms_root is missing or empty, don't
+        # filter (single-system setups that haven't populated their
+        # ROM library still work the way they always did).
+        rom_slugs = self._scan_rom_slugs()
         out: list[SaveRef] = []
         try:
             for entry in sorted(d.iterdir()):
@@ -111,6 +122,15 @@ class EmuDeckSource:
                     continue
                 if not entry.name.lower().endswith(ext):
                     continue
+                if rom_slugs:
+                    slug = resolve_game_id(
+                        entry.name, aliases=self._cfg.game_aliases)
+                    if slug not in rom_slugs:
+                        log.debug(
+                            "emudeck %s: skip %s — no %s ROM matches "
+                            "slug %r",
+                            self.id, entry.name, self._cfg.system, slug)
+                        continue
                 stat = entry.stat()
                 out.append(SaveRef(
                     path=str(entry),
@@ -119,6 +139,37 @@ class EmuDeckSource:
         except OSError as exc:
             raise SourceError(f"listing {d}: {exc}") from exc
         return out
+
+    def _scan_rom_slugs(self) -> set[str]:
+        """Build the set of canonical slugs for ROMs present in this
+        adapter's `roms_root`. Used by `list_saves` to filter out
+        saves whose canonical slug has no matching ROM here — those
+        belong to a different system's adapter (which would have its
+        own roms_root pointing at e.g. roms/n64).
+
+        Returns an empty set if `roms_root` is None / missing / empty.
+        Empty result disables filtering (preserve single-system setups
+        that haven't set up roms_root).
+        """
+        if self.roms_root is None or not self.roms_root.exists():
+            return set()
+        rom_exts = tuple(e.lower() for e in self._cfg.rom_extensions)
+        slugs: set[str] = set()
+        try:
+            for entry in self.roms_root.iterdir():
+                if not entry.is_file():
+                    continue
+                if entry.name.startswith("._"):
+                    continue
+                if not entry.name.lower().endswith(rom_exts):
+                    continue
+                slugs.add(resolve_game_id(
+                    entry.name, aliases=self._cfg.game_aliases))
+        except OSError as exc:
+            log.warning("emudeck %s: scanning roms_root %s failed: %s",
+                        self.id, self.roms_root, exc)
+            return set()
+        return slugs
 
     async def read_save(self, ref: SaveRef) -> bytes:
         try:
