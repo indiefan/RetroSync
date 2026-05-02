@@ -21,46 +21,53 @@ storage is the combined form (matches `SYSTEM_CANONICAL_EXTENSION`'s
 `{"snes": ".srm"}` pattern), so EverDrive uploads `combine()` first
 and downloads `split()` first.
 
-Layout (verified against libretro `mupen64plus-libretro-nx` 2.5.x —
-see `mupen64plus-core/src/main/savestates.c`):
+Layout (verified against `libretro_memory.h` in `mupen64plus-libretro-nx`):
 
     Offset      Size        Format
     0x00000     0x00800     EEPROM (16 Kbit max; 4 Kbit games use first 0x200)
-    0x00800     0x08000     SRAM (32 KB)
-    0x08800     0x20000     FlashRAM (128 KB)
-    0x28800     0x08000     Controller Pak port 1
-    0x30800     0x08000     Controller Pak port 2
-    0x38800     0x08000     Controller Pak port 3
-    0x40800     0x08000     Controller Pak port 4
+    0x00800     0x08000     Controller Pak port 1
+    0x08800     0x08000     Controller Pak port 2
+    0x10800     0x08000     Controller Pak port 3
+    0x18800     0x08000     Controller Pak port 4
+    0x20800     0x08000     SRAM (32 KB)
+    0x28800     0x20000     FlashRAM (128 KB)
     [end at 0x48800 = 296,960]
 
-Empty regions are zero-filled. A game that uses only EEPROM has
-0x00000–0x007FF populated and zeros for the remaining 296 KB.
+The struct field order is: eeprom, mempack (4 ports), sram, flashram.
 
-Real-world `.srm` files in the wild may be **truncated** to exactly
-the bytes a game uses (some emulator builds do this). `split()` is
-tolerant — it pads short inputs with zeros for missing regions and
-returns `None` for any region whose bytes are entirely zero, so
-callers don't write empty per-format files to the EverDrive.
-`combine()` always emits exactly 296,960 bytes.
+Note on byte order: the N64 is big-endian, while the emulator host
+(x86/ARM Steam Deck) is little-endian. The emulator's DMA routines
+apply a per-byte XOR swap (^S8) within 32-bit words during transfers.
+As a result, SRAM and FlashRAM data in the .srm file are in the host's
+byte order (little-endian) and must be 32-bit byte-reversed to produce
+native N64 big-endian files for the EverDrive. EEPROM uses 16-bit
+byte-swapped format. Controller Pak data is NOT byte-swapped (it uses
+a different transfer mechanism).
+
+Empty regions are zero-filled (EEPROM, MemPak) or 0xFF-filled (SRAM,
+FlashRAM — see format_sram() and format_flashram() in the mupen64plus
+core source). A game that uses only EEPROM has 0x00000–0x007FF
+populated and the rest filled with format-specific initial values.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 
+import struct
+
 # Region offsets and sizes per the libretro layout above.
 EEPROM_OFFSET   = 0x00000
 EEPROM_SIZE     = 0x00800   # 2 KB (covers 4-Kbit and 16-Kbit)
 
-SRAM_OFFSET     = 0x00800
-SRAM_SIZE       = 0x08000   # 32 KB
-
-FLASHRAM_OFFSET = 0x08800
-FLASHRAM_SIZE   = 0x20000   # 128 KB
-
-CPAK_BASE_OFFSET = 0x28800
+CPAK_BASE_OFFSET = 0x00800
 CPAK_SIZE        = 0x08000  # 32 KB per port
 CPAK_PORTS       = 4
+
+SRAM_OFFSET     = 0x20800
+SRAM_SIZE       = 0x08000   # 32 KB
+
+FLASHRAM_OFFSET = 0x28800
+FLASHRAM_SIZE   = 0x20000   # 128 KB
 
 # Per-port Controller Pak offsets, derived from the base + index.
 CPAK_OFFSETS = tuple(
@@ -68,7 +75,7 @@ CPAK_OFFSETS = tuple(
 
 # Total combined-srm size. Sanity-asserted at module load.
 COMBINED_SIZE = 0x48800
-assert COMBINED_SIZE == CPAK_BASE_OFFSET + CPAK_PORTS * CPAK_SIZE
+assert COMBINED_SIZE == FLASHRAM_OFFSET + FLASHRAM_SIZE
 assert COMBINED_SIZE == 296_960
 
 # Native sizes the EverDrive's per-format files use. EEPROM is special:
@@ -126,6 +133,28 @@ def empty_set() -> N64SaveSet:
     return N64SaveSet()
 
 
+def _swap16(data: bytes) -> bytes:
+    """16-bit byte swap (used for EEPROM)."""
+    words = len(data) // 2
+    return struct.pack('<' + 'H'*words, *struct.unpack('>' + 'H'*words, data))
+
+
+def _swap32(data: bytes) -> bytes:
+    """32-bit byte-order reversal.
+
+    The N64 is big-endian; the emulator host (x86/ARM) is little-endian.
+    The mupen64plus core's DMA routines apply a per-byte XOR (^S8) when
+    transferring between RDRAM and the cart bus, which is equivalent to
+    reversing the byte order within every 32-bit word. This swap undoes
+    (or re-applies) that transformation so data can move between the
+    emulator's host-order .srm and native N64 big-endian files.
+
+    Used for SRAM and FlashRAM regions.
+    """
+    words = len(data) // 4
+    return struct.pack('<' + 'I'*words, *struct.unpack('>' + 'I'*words, data))
+
+
 def combine(save_set: N64SaveSet) -> bytes:
     """Pack a saveset into a 296,960-byte mupen64plus-format `.srm`.
 
@@ -139,19 +168,19 @@ def combine(save_set: N64SaveSet) -> bytes:
             raise ValueError(
                 f"eeprom region overflow: got {len(save_set.eeprom)} bytes, "
                 f"max {EEPROM_SIZE}")
-        out[EEPROM_OFFSET:EEPROM_OFFSET + len(save_set.eeprom)] = save_set.eeprom
+        out[EEPROM_OFFSET:EEPROM_OFFSET + len(save_set.eeprom)] = _swap16(save_set.eeprom)
     if save_set.sram is not None:
         if len(save_set.sram) != SRAM_SIZE:
             raise ValueError(
                 f"sram must be exactly {SRAM_SIZE} bytes, "
                 f"got {len(save_set.sram)}")
-        out[SRAM_OFFSET:SRAM_OFFSET + SRAM_SIZE] = save_set.sram
+        out[SRAM_OFFSET:SRAM_OFFSET + SRAM_SIZE] = _swap32(save_set.sram)
     if save_set.flashram is not None:
         if len(save_set.flashram) != FLASHRAM_SIZE:
             raise ValueError(
                 f"flashram must be exactly {FLASHRAM_SIZE} bytes, "
                 f"got {len(save_set.flashram)}")
-        out[FLASHRAM_OFFSET:FLASHRAM_OFFSET + FLASHRAM_SIZE] = save_set.flashram
+        out[FLASHRAM_OFFSET:FLASHRAM_OFFSET + FLASHRAM_SIZE] = _swap32(save_set.flashram)
     for i, cpak_bytes in enumerate(save_set.cpak):
         if cpak_bytes is None:
             continue
@@ -181,7 +210,7 @@ def split(srm: bytes) -> N64SaveSet:
 
     def slice_or_none(off: int, size: int) -> bytes | None:
         chunk = srm[off:off + size]
-        if all(b == 0 for b in chunk):
+        if all(b == 0 for b in chunk) or all(b == 255 for b in chunk):
             return None
         return chunk
 
@@ -191,17 +220,21 @@ def split(srm: bytes) -> N64SaveSet:
     # zeros so the per-format file matches the game's natural size.
     # (combine() re-pads on the way back, so the round-trip is exact.)
     if eeprom is not None:
-        eeprom = _trim_trailing_zeros_to_natural_eeprom(eeprom)
+        eeprom = _trim_trailing_zeros_to_natural_eeprom(_swap16(eeprom))
 
     cpak = tuple(
         slice_or_none(off, CPAK_SIZE) for off in CPAK_OFFSETS)
     # mypy/typing: cast the 4-tuple shape explicitly
     cpak4 = (cpak[0], cpak[1], cpak[2], cpak[3])
+    
+    flashram = slice_or_none(FLASHRAM_OFFSET, FLASHRAM_SIZE)
+    if flashram is not None:
+        flashram = _swap32(flashram)
 
     return N64SaveSet(
         eeprom=eeprom,
-        sram=slice_or_none(SRAM_OFFSET, SRAM_SIZE),
-        flashram=slice_or_none(FLASHRAM_OFFSET, FLASHRAM_SIZE),
+        sram=_swap32(slice_or_none(SRAM_OFFSET, SRAM_SIZE)) if slice_or_none(SRAM_OFFSET, SRAM_SIZE) is not None else None,
+        flashram=flashram,
         cpak=cpak4,
     )
 

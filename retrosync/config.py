@@ -59,6 +59,8 @@ class CloudConfig:
     # daemon and the CLI use this exact path so they always agree on
     # which credentials to use.
     rclone_config_path: str = "/var/lib/retrosync/rclone.conf"
+    # Local cache directory to speed up boot-time cloud checks.
+    local_cache_root: str = "/var/lib/retrosync/cloud_cache"
     # Per-game retention behavior; the v1 daemon only reads the default.
     # M4 will introduce per-game overrides via this map.
     retention_default: str = "keep"  # keep|prune|archive
@@ -146,24 +148,6 @@ class Config:
     #     `conflicts/`, leave cloud current alone, require an operator
     #     `retrosync conflicts resolve` decision.
     conflict_winner: str = "device"
-    # When a device with no prior sync_state shows up with bytes that
-    # differ from cloud's current AND don't match any known historical
-    # version, prefer cloud over device. The device's bytes are still
-    # preserved as a versions/* entry (so you can recover them later).
-    # Useful for Pockets whose source_id has changed (per-UUID migration)
-    # and which now look "unknown" but actually have stale data. Default
-    # false (current behavior: device wins).
-    cloud_wins_on_unknown_device: bool = False
-    # Like cloud_wins_on_unknown_device but for case 7 (both moved
-    # since last agreed hash). True is recommended on the Pi/FXPak
-    # side: cart-side bytes diverging from h_last are usually session
-    # noise (a different game's autosave leftover, a hot-swap
-    # artifact, etc.) rather than a deliberate save. Letting cloud
-    # win on case 7 means another device's deliberate save survives
-    # instead of being overwritten by cart-side noise. Device bytes
-    # are still preserved as a versions/* entry for recovery via
-    # `retrosync promote <game> <hash>`.
-    cloud_wins_on_diverged_device: bool = False
     # Per-device-kind byte-count threshold for the "drift filter" — when
     # the engine sees a fast-forward upload AND the device's bytes differ
     # from cloud by ≤ this many bytes, treat as in-sync rather than
@@ -212,10 +196,6 @@ class Config:
             game_aliases=aliases,
             cloud_to_device=bool(raw.get("cloud_to_device", False)),
             conflict_winner=str(raw.get("conflict_winner", "device")),
-            cloud_wins_on_unknown_device=bool(raw.get(
-                "cloud_wins_on_unknown_device", False)),
-            cloud_wins_on_diverged_device=bool(raw.get(
-                "cloud_wins_on_diverged_device", False)),
             drift_threshold=drift,
             lease=lease,
         )
@@ -232,6 +212,8 @@ cloud:
   # rclone's config file. Default is under /var/lib so the daemon's
   # ProtectHome=true doesn't mask it. Change only if you've moved it.
   rclone_config_path: "/var/lib/retrosync/rclone.conf"
+  # Local cache directory to speed up boot-time cloud checks.
+  local_cache_root: "/var/lib/retrosync/cloud_cache"
 
 orchestrator:
   poll_interval_sec: 30
@@ -255,26 +237,8 @@ cloud_to_device: false
 #               alone, require operator `retrosync conflicts resolve`.
 conflict_winner: device
 
-# When a device with no prior sync_state shows up with bytes that differ
-# from cloud's current AND don't match any known historical version,
-# this flag controls whether to trust the device or trust cloud:
-#   false (default): conflict_winner kicks in (typically device wins).
-#   true: preserve the device's bytes as a versions/* entry, then make
-#         cloud's existing current the winner. Useful for Pockets whose
-#         source_id changed (per-physical-device UUID migration) and
-#         which now look "unknown" but actually have stale data.
-cloud_wins_on_unknown_device: false
+# conflict_winner: device
 
-# Like cloud_wins_on_unknown_device but for case 7 (both sides moved
-# since the last agreed hash). True is RECOMMENDED on the Pi/FXPak
-# side: a cart's bytes that diverged from the last agreed hash are
-# usually session noise (a different game's autosave leftover, a
-# hot-swap artifact, etc.) rather than a deliberate user save.
-# Letting cloud win on case 7 means another device's deliberate save
-# survives instead of being overwritten by cart-side noise. Device
-# bytes are preserved as a versions/* entry for recovery via
-# `retrosync promote <game> <hash>`.
-cloud_wins_on_diverged_device: false
 
 # Per-device-kind byte-count threshold for the "drift filter". When the
 # engine sees a fast-forward upload (cloud unchanged since last sync,

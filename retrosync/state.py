@@ -103,6 +103,13 @@ CREATE TABLE IF NOT EXISTS device_filename_map (
   observed_at TEXT NOT NULL,
   PRIMARY KEY (source_id, game_id)
 );
+
+CREATE TABLE IF NOT EXISTS gameplay_sessions (
+    source_id TEXT NOT NULL,
+    game_id TEXT NOT NULL,
+    last_played_at TEXT NOT NULL,
+    PRIMARY KEY (source_id, game_id)
+);
 """
 
 # Lightweight migrations applied on every open. SQLite doesn't have an
@@ -527,6 +534,29 @@ class StateStore:
                     "UPDATE files SET current_hash=NULL "
                     "WHERE source_id=? AND path=?", (source_id, p))
         return len(gone)
+
+    # ----------------------------------------------------------------------
+    # Gameplay Sessions
+    # ----------------------------------------------------------------------
+
+    def record_gameplay_session(self, source_id: str, game_id: str,
+                                played_at: str) -> None:
+        """Record the last time a game was observed playing on a source."""
+        with self._conn:
+            self._conn.execute("""
+                INSERT INTO gameplay_sessions (source_id, game_id, last_played_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(source_id, game_id) DO UPDATE SET
+                    last_played_at = excluded.last_played_at
+            """, (source_id, game_id, played_at))
+
+    def get_last_played_at(self, source_id: str, game_id: str) -> str | None:
+        """Get the last time a game was observed playing on a source."""
+        row = self._conn.execute("""
+            SELECT last_played_at FROM gameplay_sessions
+            WHERE source_id = ? AND game_id = ?
+        """, (source_id, game_id)).fetchone()
+        return row["last_played_at"] if row else None
 
 
 def _row_to_conflict(row: sqlite3.Row) -> ConflictRow:

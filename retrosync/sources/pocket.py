@@ -100,6 +100,9 @@ class PocketSource:
             return HealthStatus(False, f"{d} is not a directory")
         return HealthStatus(True, f"mounted at {self._cfg.mount_path}")
 
+    async def currently_playing_game_id(self) -> str | None:
+        return None
+
     async def list_saves(self) -> list[SaveRef]:
         d = self.saves_dir
         if not d.exists():

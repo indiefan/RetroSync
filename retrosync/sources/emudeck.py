@@ -97,6 +97,9 @@ class EmuDeckSource:
                                 f"saves_root {self.saves_root} missing")
         return HealthStatus(True, f"watching {self.saves_root}")
 
+    async def currently_playing_game_id(self) -> str | None:
+        return None
+
     async def list_saves(self) -> list[SaveRef]:
         d = self.saves_root
         if not d.exists():

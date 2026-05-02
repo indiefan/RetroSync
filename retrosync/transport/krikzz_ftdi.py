@@ -217,7 +217,8 @@ class SerialKrikzzTransport(KrikzzFtdiTransport):
     """
 
     def __init__(self, *, serial_path: str = "/dev/ttyUSB0",
-                 baud: int = 9600, timeout_sec: float = 2.0):
+                 baud: int = 9600, timeout_sec: float = 2.0,
+                 io_timeout_sec: float = 5.0):
         # FT232 over USB does bulk transfers regardless of the "baud
         # rate" the host sets, so 9600 / 115200 / 921600 are all
         # functionally equivalent. 9600 is the kernel default; leave
@@ -225,7 +226,75 @@ class SerialKrikzzTransport(KrikzzFtdiTransport):
         self._path = serial_path
         self._baud = baud
         self._timeout = timeout_sec
+        # io_timeout_sec bounds the wall-clock time for any single
+        # serial operation offloaded to a thread.  This is separate
+        # from pyserial's own `timeout` (which only governs read()
+        # inside the kernel driver).  open(), close(), flush(),
+        # reset_output_buffer(), and write() can all block
+        # indefinitely at the kernel level if the FTDI chip stops
+        # responding — this timeout catches those.
+        self._io_timeout = io_timeout_sec
         self._port = None  # serial.Serial handle
+
+    # ---- helpers: sync wrappers run via asyncio.to_thread ----
+
+    async def _run_with_timeout(self, func, *args):
+        """Run *func* in a thread-pool thread with a wall-clock timeout.
+
+        ``asyncio.wait_for(asyncio.to_thread(func), timeout)`` does NOT
+        work for kernel-blocked threads: ``wait_for`` cancels the
+        ``asyncio.Task``, but cancelling a ``run_in_executor`` future
+        whose thread is stuck in a syscall is a no-op — the ``await``
+        just keeps blocking.
+
+        Instead we race the executor future against an ``asyncio.sleep``
+        timer.  If the timer wins we abandon the blocked thread (it
+        will eventually be interrupted or killed on process exit) and
+        raise ``asyncio.TimeoutError``.
+        """
+        loop = asyncio.get_running_loop()
+        fut = loop.run_in_executor(None, func, *args)
+        timer = asyncio.ensure_future(asyncio.sleep(self._io_timeout))
+        done, pending = await asyncio.wait(
+            {fut, timer}, return_when=asyncio.FIRST_COMPLETED)
+        if fut in done:
+            timer.cancel()
+            return fut.result()         # may re-raise
+        # Timer fired first → the thread is stuck.
+        # Don't cancel `fut` (it's a no-op on a running thread).
+        raise asyncio.TimeoutError()
+
+    def _open_sync(self) -> None:
+        """Synchronous open + drain.  Called from a worker thread."""
+        import serial as _serial
+        self._port = _serial.Serial(
+            self._path, self._baud, timeout=self._timeout,
+            write_timeout=self._timeout)
+        # Aggressive drain of any junk left from prior sessions.
+        # An aborted previous command (e.g. operator Ctrl+C'd
+        # mid-file_info) leaves a 16-byte 'cmd<X>' response in
+        # the FT232's RX buffer that the next health check would
+        # mis-read as its own response. Drain by:
+        #   1. reset_input_buffer (kernel/userland buffer)
+        #   2. brief read with short timeout to consume any bytes
+        #      the FT232 chip is still draining out
+        self._port.reset_input_buffer()
+        self._port.reset_output_buffer()
+        saved_to = self._port.timeout
+        self._port.timeout = 0.1
+        try:
+            stale = self._port.read(256)
+            if stale:
+                log.debug("EverDrive 64 open: drained %d stale bytes",
+                          len(stale))
+        finally:
+            self._port.timeout = saved_to
+
+    def _close_sync(self) -> None:
+        """Synchronous close.  Called from a worker thread."""
+        if self._port is not None:
+            self._port.close()
+            self._port = None
 
     async def open(self) -> None:
         try:
@@ -236,29 +305,19 @@ class SerialKrikzzTransport(KrikzzFtdiTransport):
                 "`sudo apt install python3-serial` "
                 "or `pip install pyserial`") from exc
         try:
-            import serial as _serial
-            self._port = _serial.Serial(
-                self._path, self._baud, timeout=self._timeout,
-                write_timeout=self._timeout)
-            # Aggressive drain of any junk left from prior sessions.
-            # An aborted previous command (e.g. operator Ctrl+C'd
-            # mid-file_info) leaves a 16-byte 'cmd<X>' response in
-            # the FT232's RX buffer that the next health check would
-            # mis-read as its own response. Drain by:
-            #   1. reset_input_buffer (kernel/userland buffer)
-            #   2. brief read with short timeout to consume any bytes
-            #      the FT232 chip is still draining out
-            self._port.reset_input_buffer()
-            self._port.reset_output_buffer()
-            saved_to = self._port.timeout
-            self._port.timeout = 0.1
-            try:
-                stale = self._port.read(256)
-                if stale:
-                    log.debug("EverDrive 64 open: drained %d stale bytes",
-                              len(stale))
-            finally:
-                self._port.timeout = saved_to
+            await self._run_with_timeout(self._open_sync)
+        except asyncio.TimeoutError:
+            # Port may have been partially opened before the timeout.
+            if self._port is not None:
+                try:
+                    self._port.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                self._port = None
+            raise KrikzzFtdiError(
+                f"opening {self._path}: timed out after "
+                f"{self._io_timeout}s (FTDI chip may be "
+                f"unresponsive)") from None
         except Exception as exc:  # noqa: BLE001
             raise KrikzzFtdiError(
                 f"opening {self._path}: {exc}") from exc
@@ -266,10 +325,10 @@ class SerialKrikzzTransport(KrikzzFtdiTransport):
     async def close(self) -> None:
         if self._port is not None:
             try:
-                self._port.close()
-            except Exception:  # noqa: BLE001
-                pass
-            self._port = None
+                await self._run_with_timeout(self._close_sync)
+            except (asyncio.TimeoutError, Exception):  # noqa: BLE001
+                # Best-effort; don't let a stuck close propagate.
+                self._port = None
 
     async def health(self) -> tuple[bool, str]:
         if self._port is None:
@@ -292,13 +351,21 @@ class SerialKrikzzTransport(KrikzzFtdiTransport):
             except KrikzzFtdiError as exc:
                 if attempt == 0 and "unexpected response" in str(exc):
                     # Drain and retry — buffer was holding stale bytes.
-                    self._port.reset_input_buffer()
-                    saved = self._port.timeout
-                    self._port.timeout = 0.2
+                    # Run in a thread so a stuck drain doesn't block
+                    # the event loop.
+                    def _drain_sync():
+                        self._port.reset_input_buffer()
+                        saved = self._port.timeout
+                        self._port.timeout = 0.2
+                        try:
+                            self._port.read(256)
+                        finally:
+                            self._port.timeout = saved
                     try:
-                        self._port.read(256)
-                    finally:
-                        self._port.timeout = saved
+                        await self._run_with_timeout(_drain_sync)
+                    except (asyncio.TimeoutError, Exception):  # noqa: BLE001
+                        return False, (
+                            f"drain timed out after {self._io_timeout}s")
                     continue
                 return False, str(exc)
         return False, "health retry exhausted"
@@ -312,10 +379,18 @@ class SerialKrikzzTransport(KrikzzFtdiTransport):
             raise KrikzzFtdiError("transport not open")
         frame = build_command_frame(cmd, address=address,
                                     length=length, arg=arg)
-        try:
+        def _tx_sync():
             self._port.reset_input_buffer()
             written = self._port.write(frame)
             self._port.flush()
+            return written
+        try:
+            written = await self._run_with_timeout(_tx_sync)
+        except asyncio.TimeoutError:
+            raise KrikzzFtdiError(
+                f"write timed out after {self._io_timeout}s") from None
+        except KrikzzFtdiError:
+            raise
         except Exception as exc:  # noqa: BLE001
             raise KrikzzFtdiError(f"write failed: {exc}") from exc
         if written != COMMAND_FRAME_SIZE:
@@ -333,7 +408,13 @@ class SerialKrikzzTransport(KrikzzFtdiTransport):
         if self._port is None:
             raise KrikzzFtdiError("transport not open")
         try:
-            resp = self._port.read(RESPONSE_FRAME_SIZE)
+            resp = await self._run_with_timeout(
+                self._port.read, RESPONSE_FRAME_SIZE)
+        except asyncio.TimeoutError:
+            raise KrikzzFtdiError(
+                f"read timed out after {self._io_timeout}s") from None
+        except KrikzzFtdiError:
+            raise
         except Exception as exc:  # noqa: BLE001
             raise KrikzzFtdiError(f"read failed: {exc}") from exc
         if len(resp) < RESPONSE_FRAME_SIZE:
@@ -371,9 +452,18 @@ class SerialKrikzzTransport(KrikzzFtdiTransport):
         if self._port is None:
             raise KrikzzFtdiError("transport not open")
         padded = pad_to_min_block(data)
-        try:
+        def _write_sync():
             n = self._port.write(padded)
             self._port.flush()
+            return n
+        try:
+            n = await self._run_with_timeout(_write_sync)
+        except asyncio.TimeoutError:
+            raise KrikzzFtdiError(
+                f"payload write timed out after "
+                f"{self._io_timeout}s") from None
+        except KrikzzFtdiError:
+            raise
         except Exception as exc:  # noqa: BLE001
             raise KrikzzFtdiError(f"payload write failed: {exc}") from exc
         if n != len(padded):
@@ -392,7 +482,14 @@ class SerialKrikzzTransport(KrikzzFtdiTransport):
                 block_len // MIN_BLOCK_SIZE * MIN_BLOCK_SIZE
                 + MIN_BLOCK_SIZE)
         try:
-            data = self._port.read(block_len)
+            data = await self._run_with_timeout(
+                self._port.read, block_len)
+        except asyncio.TimeoutError:
+            raise KrikzzFtdiError(
+                f"payload read timed out after "
+                f"{self._io_timeout}s") from None
+        except KrikzzFtdiError:
+            raise
         except Exception as exc:  # noqa: BLE001
             raise KrikzzFtdiError(f"payload read failed: {exc}") from exc
         if len(data) < block_len:

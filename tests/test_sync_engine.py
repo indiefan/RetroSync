@@ -75,7 +75,7 @@ async def test_in_sync() -> bool:
 
     ref = SaveRef(path="/Mario.srm")
     out1 = await sync_one_game(source=cart, ref=ref, ctx=ctx)
-    refresh_manifest(source=cart, save_path=ref.path,
+    await refresh_manifest(source=cart, save_path=ref.path,
                      game_id=out1.game_id, paths=out1.paths, ctx=ctx)
     # Drop the in-mem cache so the second pass re-reads the manifest
     ctx.invalidate_manifest(out1.paths)
@@ -98,7 +98,7 @@ async def test_cloud_to_device_pull() -> bool:
     ref = SaveRef(path="/Mario.srm")
 
     out1 = await sync_one_game(source=cart, ref=ref, ctx=ctx)
-    refresh_manifest(source=cart, save_path=ref.path,
+    await refresh_manifest(source=cart, save_path=ref.path,
                      game_id=out1.game_id, paths=out1.paths, ctx=ctx)
     h_a = sha256_bytes(b"abc" * 100)
 
@@ -109,7 +109,7 @@ async def test_cloud_to_device_pull() -> bool:
     files["/Mario.srm"] = b"def" * 100
     ctx.invalidate_manifest(out1.paths)
     out_push = await sync_one_game(source=cart, ref=ref, ctx=ctx)
-    refresh_manifest(source=cart, save_path=ref.path,
+    await refresh_manifest(source=cart, save_path=ref.path,
                      game_id=out_push.game_id, paths=out_push.paths, ctx=ctx)
     if out_push.result != SyncResult.UPLOADED:
         print(f"FAIL: setup: cloud advance push got {out_push.result}")
@@ -147,7 +147,7 @@ async def test_case_4_stale_device_pulls_cloud() -> bool:
                       cfg=SyncConfig(cloud_to_device=True))
     out_a = await sync_one_game(source=fx_a,
                                 ref=SaveRef(path="/Mario.srm"), ctx=ctx)
-    refresh_manifest(source=fx_a, save_path="/Mario.srm",
+    await refresh_manifest(source=fx_a, save_path="/Mario.srm",
                      game_id=out_a.game_id, paths=out_a.paths, ctx=ctx)
     h_a = sha256_bytes(b"abc" * 100)
 
@@ -156,7 +156,7 @@ async def test_case_4_stale_device_pulls_cloud() -> bool:
     ctx.invalidate_manifest(out_a.paths)
     out_a2 = await sync_one_game(source=fx_a,
                                  ref=SaveRef(path="/Mario.srm"), ctx=ctx)
-    refresh_manifest(source=fx_a, save_path="/Mario.srm",
+    await refresh_manifest(source=fx_a, save_path="/Mario.srm",
                      game_id=out_a2.game_id, paths=out_a2.paths, ctx=ctx)
 
     # New device shows up with the OLD bytes (hash h_a). It has no
@@ -193,13 +193,13 @@ async def test_case_4_drift_from_known_pulls_cloud() -> bool:
                                      drift_threshold={"snes": 4}))
     out_a = await sync_one_game(source=fx_a,
                                 ref=SaveRef(path="/Mario.srm"), ctx=ctx)
-    refresh_manifest(source=fx_a, save_path="/Mario.srm",
+    await refresh_manifest(source=fx_a, save_path="/Mario.srm",
                      game_id=out_a.game_id, paths=out_a.paths, ctx=ctx)
     fx_a.files["/Mario.srm"] = b"newer-bytes" + b"\x00" * 100
     ctx.invalidate_manifest(out_a.paths)
     out_a2 = await sync_one_game(source=fx_a,
                                  ref=SaveRef(path="/Mario.srm"), ctx=ctx)
-    refresh_manifest(source=fx_a, save_path="/Mario.srm",
+    await refresh_manifest(source=fx_a, save_path="/Mario.srm",
                      game_id=out_a2.game_id, paths=out_a2.paths, ctx=ctx)
 
     # New device (no sync_state) shows up with bytes that are h_a + 1
@@ -224,8 +224,8 @@ async def test_case_4_drift_from_known_pulls_cloud() -> bool:
 
 
 async def test_case_4_unknown_device_cloud_wins_policy() -> bool:
-    """With cloud_wins_on_unknown_device=true, a device showing up with
-    truly-new bytes (not in history) gets its bytes preserved as a
+    """If a device shows up with truly-new bytes (not in history)
+    and we haven't seen it actively played, preserve its bytes as a
     version, but cloud's current wins."""
     _, state, cloud = _setup()
     # Establish cloud with one device's bytes.
@@ -233,11 +233,10 @@ async def test_case_4_unknown_device_cloud_wins_policy() -> bool:
     state.upsert_source(id=fx_a.id, system=fx_a.system,
                         adapter="MockFXPakSource", config_json="{}")
     ctx = SyncContext(state=state, cloud=cloud,
-                      cfg=SyncConfig(cloud_to_device=True,
-                                     cloud_wins_on_unknown_device=True))
+                      cfg=SyncConfig(cloud_to_device=True))
     out_a = await sync_one_game(source=fx_a,
                                 ref=SaveRef(path="/Mario.srm"), ctx=ctx)
-    refresh_manifest(source=fx_a, save_path="/Mario.srm",
+    await refresh_manifest(source=fx_a, save_path="/Mario.srm",
                      game_id=out_a.game_id, paths=out_a.paths, ctx=ctx)
     cloud_bytes = b"abc" * 100
 
@@ -278,7 +277,7 @@ async def test_conflict_no_prior_agreement_preserve() -> bool:
                                      conflict_winner="preserve"))
     out_setup = await sync_one_game(source=fx2,
                                     ref=SaveRef(path="/Mario.srm"), ctx=ctx)
-    refresh_manifest(source=fx2, save_path="/Mario.srm",
+    await refresh_manifest(source=fx2, save_path="/Mario.srm",
                      game_id=out_setup.game_id, paths=out_setup.paths, ctx=ctx)
 
     # New device with diverging bytes, never synced before.
@@ -286,6 +285,7 @@ async def test_conflict_no_prior_agreement_preserve() -> bool:
     fx = MockFXPakSource(id="fx-new", files=fx_files)
     state.upsert_source(id=fx.id, system=fx.system,
                         adapter="MockFXPakSource", config_json="{}")
+    state.record_gameplay_session(fx.id, "mario", "9999-12-31T23:59:59Z")
     ctx.invalidate_manifest(out_setup.paths)
     out = await sync_one_game(source=fx, ref=SaveRef(path="/Mario.srm"),
                               ctx=ctx)
@@ -314,7 +314,7 @@ async def test_conflict_device_wins_default() -> bool:
                       cfg=SyncConfig(cloud_to_device=True))
     out_setup = await sync_one_game(source=fx2,
                                     ref=SaveRef(path="/Mario.srm"), ctx=ctx)
-    refresh_manifest(source=fx2, save_path="/Mario.srm",
+    await refresh_manifest(source=fx2, save_path="/Mario.srm",
                      game_id=out_setup.game_id, paths=out_setup.paths, ctx=ctx)
     cloud_loser_path = out_setup.paths.current
     cloud_loser_bytes = cloud.download_bytes(src=cloud_loser_path)
@@ -325,6 +325,7 @@ async def test_conflict_device_wins_default() -> bool:
     fx = MockFXPakSource(id="fx-new", files=fx_files)
     state.upsert_source(id=fx.id, system=fx.system,
                         adapter="MockFXPakSource", config_json="{}")
+    state.record_gameplay_session(fx.id, "mario", "9999-12-31T23:59:59Z")
     ctx.invalidate_manifest(out_setup.paths)
     out = await sync_one_game(source=fx, ref=SaveRef(path="/Mario.srm"),
                               ctx=ctx)
@@ -361,7 +362,7 @@ async def test_cloud_to_device_off_skips_pull() -> bool:
                       cfg=SyncConfig(cloud_to_device=False))
     out_setup = await sync_one_game(source=fx2,
                                     ref=SaveRef(path="/Mario.srm"), ctx=ctx)
-    refresh_manifest(source=fx2, save_path="/Mario.srm",
+    await refresh_manifest(source=fx2, save_path="/Mario.srm",
                      game_id=out_setup.game_id, paths=out_setup.paths, ctx=ctx)
 
     # Same device, in sync.
@@ -378,7 +379,7 @@ async def test_cloud_to_device_off_skips_pull() -> bool:
     ctx.invalidate_manifest(out_setup.paths)
     out_push = await sync_one_game(source=fx2,
                                    ref=SaveRef(path="/Mario.srm"), ctx=ctx)
-    refresh_manifest(source=fx2, save_path="/Mario.srm",
+    await refresh_manifest(source=fx2, save_path="/Mario.srm",
                      game_id=out_push.game_id, paths=out_push.paths, ctx=ctx)
 
     # Set up device with same hash as cloud's PREVIOUS version (pre-push).
@@ -413,7 +414,7 @@ async def test_resolve_conflict_to_device() -> bool:
                                      conflict_winner="preserve"))
     out_setup = await sync_one_game(source=fx2,
                                     ref=SaveRef(path="/Mario.srm"), ctx=ctx)
-    refresh_manifest(source=fx2, save_path="/Mario.srm",
+    await refresh_manifest(source=fx2, save_path="/Mario.srm",
                      game_id=out_setup.game_id, paths=out_setup.paths, ctx=ctx)
 
     # Brand-new device with diverging bytes → CONFLICT.
@@ -421,6 +422,7 @@ async def test_resolve_conflict_to_device() -> bool:
     fx = MockFXPakSource(id="fx-new", files=fx_files)
     state.upsert_source(id=fx.id, system=fx.system,
                         adapter="MockFXPakSource", config_json="{}")
+    state.record_gameplay_session(fx.id, "mario", "9999-12-31T23:59:59Z")
     ctx.invalidate_manifest(out_setup.paths)
     out_conflict = await sync_one_game(source=fx,
                                        ref=SaveRef(path="/Mario.srm"), ctx=ctx)
@@ -466,13 +468,14 @@ async def test_resolve_with_stale_cloud_path() -> bool:
                                      conflict_winner="preserve"))
     out_setup = await sync_one_game(source=fx2,
                                     ref=SaveRef(path="/Mario.srm"), ctx=ctx)
-    refresh_manifest(source=fx2, save_path="/Mario.srm",
+    await refresh_manifest(source=fx2, save_path="/Mario.srm",
                      game_id=out_setup.game_id, paths=out_setup.paths, ctx=ctx)
 
     fx_files = {"/Mario.srm": b"xyz" * 100}
     fx = MockFXPakSource(id="fx-new", files=fx_files)
     state.upsert_source(id=fx.id, system=fx.system,
                         adapter="MockFXPakSource", config_json="{}")
+    state.record_gameplay_session(fx.id, "mario", "9999-12-31T23:59:59Z")
     ctx.invalidate_manifest(out_setup.paths)
     out_conflict = await sync_one_game(source=fx,
                                        ref=SaveRef(path="/Mario.srm"), ctx=ctx)
@@ -514,7 +517,7 @@ async def test_drift_filter_skips_small_byte_changes() -> bool:
     # Initial bootstrap upload.
     out1 = await sync_one_game(source=cart,
                                ref=SaveRef(path="/Mario.srm"), ctx=ctx)
-    refresh_manifest(source=cart, save_path="/Mario.srm",
+    await refresh_manifest(source=cart, save_path="/Mario.srm",
                      game_id=out1.game_id, paths=out1.paths, ctx=ctx)
 
     # Mutate a single byte — within threshold (4).
@@ -555,7 +558,7 @@ async def test_drift_filter_passes_large_changes() -> bool:
 
     out1 = await sync_one_game(source=cart,
                                ref=SaveRef(path="/Mario.srm"), ctx=ctx)
-    refresh_manifest(source=cart, save_path="/Mario.srm",
+    await refresh_manifest(source=cart, save_path="/Mario.srm",
                      game_id=out1.game_id, paths=out1.paths, ctx=ctx)
 
     files["/Mario.srm"] = b"xyz" * 100  # 300 bytes all different
@@ -589,7 +592,7 @@ async def test_drift_filter_case_7_pulls_cloud() -> bool:
                                      drift_threshold={"snes": 4}))
     out_a = await sync_one_game(source=fx_a,
                                 ref=SaveRef(path="/Mario.srm"), ctx=ctx)
-    refresh_manifest(source=fx_a, save_path="/Mario.srm",
+    await refresh_manifest(source=fx_a, save_path="/Mario.srm",
                      game_id=out_a.game_id, paths=out_a.paths, ctx=ctx)
 
     # Cart B (different source) syncs and gets the same bytes.
@@ -601,7 +604,7 @@ async def test_drift_filter_case_7_pulls_cloud() -> bool:
     out_b = await sync_one_game(source=fx_b,
                                 ref=SaveRef(path="/Mario.srm"), ctx=ctx)
     # Cart B is now in_sync. sync_state[fx-b] = h_a.
-    refresh_manifest(source=fx_b, save_path="/Mario.srm",
+    await refresh_manifest(source=fx_b, save_path="/Mario.srm",
                      game_id=out_b.game_id, paths=out_b.paths, ctx=ctx)
 
     # Cart A advances cloud with new bytes (real save).
@@ -609,7 +612,7 @@ async def test_drift_filter_case_7_pulls_cloud() -> bool:
     ctx.invalidate_manifest(out_a.paths)
     out_a2 = await sync_one_game(source=fx_a,
                                  ref=SaveRef(path="/Mario.srm"), ctx=ctx)
-    refresh_manifest(source=fx_a, save_path="/Mario.srm",
+    await refresh_manifest(source=fx_a, save_path="/Mario.srm",
                      game_id=out_a2.game_id, paths=out_a2.paths, ctx=ctx)
 
     # Cart B comes back with bytes that drifted by 1 byte from h_last.
@@ -675,7 +678,7 @@ async def test_no_duplicate_upload_on_transient_manifest_failure() -> bool:
 
     out_setup = await sync_one_game(source=fx,
                                     ref=SaveRef(path="/Mario.srm"), ctx=ctx)
-    refresh_manifest(source=fx, save_path="/Mario.srm",
+    await refresh_manifest(source=fx, save_path="/Mario.srm",
                      game_id=out_setup.game_id, paths=out_setup.paths, ctx=ctx)
     if out_setup.result != SyncResult.BOOTSTRAP_UPLOADED:
         print(f"FAIL: setup expected BOOTSTRAP_UPLOADED, got {out_setup.result}")

@@ -79,6 +79,24 @@ class FXPakSource:
         except Usb2SnesError as exc:
             return HealthStatus(False, f"sni unreachable: {exc}")
 
+    async def currently_playing_game_id(self) -> str | None:
+        try:
+            async with Usb2SnesClient(self._cfg.sni_url) as cart:
+                devs = await cart.device_list()
+                if not devs:
+                    return None
+                await cart.attach(devs[0])
+                info = await cart.info()
+                rom_name = info.get("rom_name", "").strip()
+                if not rom_name:
+                    return None
+                # Clean up the name like we do for full filenames
+                spaced = rom_name.replace("(", " ").replace(")", " ") \\
+                                 .replace("[", " ").replace("]", " ")
+                return canonical_slug(spaced)
+        except Usb2SnesError:
+            return None
+
     async def list_saves(self) -> list[SaveRef]:
         try:
             async with Usb2SnesClient(self._cfg.sni_url) as cart:

@@ -182,6 +182,9 @@ class EverDrive64Source:
         self._rom_stem_cache.clear()
         return HealthStatus(ok, detail)
 
+    async def currently_playing_game_id(self) -> str | None:
+        return None
+
     async def list_saves(self) -> list[SaveRef]:
         t = await self._open()
         # Strategy chain (most authoritative first):
@@ -437,7 +440,10 @@ class EverDrive64Source:
         if not refs:
             return n64.combine(n64.empty_set())
         ss = await self._read_saveset(refs)
-        return n64.combine(ss)
+        try:
+            return n64.combine(ss)
+        except ValueError as exc:
+            raise SourceError(f"invalid save format: {exc}") from exc
 
     async def write_canonical_bytes(self, refs: list[SaveRef],
                                     data: bytes) -> None:

@@ -57,6 +57,7 @@ class OrchestratorDeps:
     cfg: OrchestratorConfig
     sync_cfg: SyncConfig = None  # type: ignore[assignment]
     lease_cfg: LeaseConfig = None  # type: ignore[assignment]
+    mirror: "CloudMirror | None" = None
 
     def __post_init__(self):
         if self.sync_cfg is None:
@@ -178,6 +179,16 @@ class BackupOrchestrator:
                          self._source.id, health.detail)
                 return
 
+        # Poll currently active game, if the source supports it.
+        try:
+            active_game_id = await self._source.currently_playing_game_id()
+            if active_game_id:
+                self._deps.state.record_gameplay_session(
+                    self._source.id, active_game_id, utc_iso())
+        except SourceError as exc:
+            log.debug("currently_playing_game_id failed for %s: %s",
+                      self._source.id, exc)
+
         try:
             refs = await self._source.list_saves()
         except SourceError as exc:
@@ -185,7 +196,7 @@ class BackupOrchestrator:
             return
 
         ctx = SyncContext(state=self._deps.state, cloud=self._deps.cloud,
-                          cfg=self._deps.sync_cfg)
+                          cfg=self._deps.sync_cfg, mirror=self._deps.mirror)
         refresh_targets: dict[str, tuple[str, str, object]] = {}
 
         present_paths = {ref.path for ref in refs}
@@ -226,8 +237,8 @@ class BackupOrchestrator:
         # Final manifest refresh per affected game — once per pass.
         for game_id, save_path, paths in refresh_targets.values():
             try:
-                refresh_manifest(source=self._source, save_path=save_path,
-                                 game_id=game_id, paths=paths, ctx=ctx)
+                await refresh_manifest(source=self._source, save_path=save_path,
+                                       game_id=game_id, paths=paths, ctx=ctx)
             except CloudError as exc:
                 log.warning("manifest refresh failed for %s; next pass "
                             "will retry: %s", save_path, exc)
@@ -281,6 +292,13 @@ class BackupOrchestrator:
                     if not first_path:
                         continue
                     first_path = first_path[0]
+                
+                group_refs = []
+                for p in targets.values():
+                    if isinstance(p, list):
+                        group_refs.extend(SaveRef(path=x) for x in p)
+                    else:
+                        group_refs.append(SaveRef(path=p))
             else:
                 # Fallback for single-file sources that haven't migrated
                 target_method_single = getattr(self._source, "target_save_path_for", None)
@@ -294,7 +312,7 @@ class BackupOrchestrator:
 
             ref = SaveRef(path=first_path)
             try:
-                outcome = await sync_one_game(source=self._source, ref=ref, ctx=ctx)
+                outcome = await sync_one_game(source=self._source, ref=ref, ctx=ctx, group_refs=group_refs if target_method is not None else None)
             except CloudError as exc:
                 log.warning("bootstrap-pull %s failed: %s", game_id, exc)
                 continue
@@ -368,6 +386,7 @@ class BackupOrchestrator:
                 outcome = await sync_one_game(
                     source=self._source, ref=ref, ctx=ctx,
                     primed_data=data, primed_hash=h,
+                    group_refs=group_refs,
                 )
                 self._record_refresh(outcome, refresh_targets)
             return game_id
@@ -491,6 +510,7 @@ class BackupOrchestrator:
             return await sync_one_game(
                 source=self._source, ref=ref, ctx=ctx,
                 primed_data=data, primed_hash=h, version_row=v,
+                group_refs=group_refs,
             )
         except CloudError as exc:
             log.warning("sync failed for v%d (%s); will retry next pass: %s",
@@ -558,10 +578,15 @@ async def run_all(config: Config, *,
         cloud_wins_on_unknown_device=config.cloud_wins_on_unknown_device,
         cloud_wins_on_diverged_device=config.cloud_wins_on_diverged_device,
         drift_threshold=dict(config.drift_threshold))
+        
+    from .cloud_mirror import CloudMirror
+    mirror = CloudMirror(config.cloud.local_cache_root)
+
     deps = OrchestratorDeps(state=state, cloud=cloud,
                             cfg=config.orchestrator,
                             sync_cfg=sync_cfg,
-                            lease_cfg=config.lease)
+                            lease_cfg=config.lease,
+                            mirror=mirror)
     sources = []
     for s in config.sources:
         # Pocket sources are wired up via udev — daemon doesn't
@@ -593,9 +618,18 @@ async def run_all(config: Config, *,
         on_started(orchestrators)
     tasks = [asyncio.create_task(o.run()) for o in orchestrators]
 
+    async def cloud_poller_task():
+        while True:
+            await mirror.background_poll(cloud)
+            await asyncio.sleep(config.orchestrator.poll_interval_sec)
+
+    poller = asyncio.create_task(cloud_poller_task())
+    tasks.append(poller)
+
     try:
         await asyncio.gather(*tasks)
     finally:
+        poller.cancel()
         for o in orchestrators:
             o.cancel()
         state.close()

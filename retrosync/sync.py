@@ -147,13 +147,14 @@ class SyncContext:
     state: StateStore
     cloud: RcloneCloud
     cfg: SyncConfig = field(default_factory=SyncConfig)
+    mirror: "CloudMirror | None" = None
     # In-memory manifest cache, scoped to one engine pass. Keyed by
     # CloudPaths.base. None means "we looked and the manifest doesn't exist
     # in cloud yet" — distinguish from "cache miss".
     _manifest_cache: dict[str, Manifest | None] = field(default_factory=dict)
     _UNCACHED = object()
 
-    def manifest_for(self, paths: CloudPaths) -> Manifest | None:
+    async def manifest_for(self, paths: CloudPaths) -> Manifest | None:
         """Read the cloud manifest. Raises CloudError on transient
         failures (rate limit, network blip) so callers can SKIP rather
         than mis-treat the absence as "no cloud version → bootstrap
@@ -161,7 +162,13 @@ class SyncContext:
         """
         if paths.base in self._manifest_cache:
             return self._manifest_cache[paths.base]
-        m = self.cloud.read_manifest(paths)
+        
+        if getattr(self, "mirror", None) is not None:
+            m = await self.mirror.refresh_manifest(paths, self.cloud)
+        else:
+            # Fallback if no mirror is provided
+            m = self.cloud.read_manifest(paths)
+            
         self._manifest_cache[paths.base] = m
         return m
 
@@ -196,6 +203,7 @@ async def sync_one_game(*, source: SaveSource, ref: SaveRef,
                         primed_data: bytes | None = None,
                         primed_hash: str | None = None,
                         version_row: VersionRow | None = None,
+                        group_refs: list[SaveRef] | None = None,
                         ) -> SyncOutcome:
     """Reconcile a single (source, save) with the cloud.
 
@@ -207,7 +215,7 @@ async def sync_one_game(*, source: SaveSource, ref: SaveRef,
     game_id = await _resolve_game_id(source, ref)
     paths = _compose_paths(source, ref, game_id=game_id, cloud=ctx.cloud)
     try:
-        manifest = ctx.manifest_for(paths)
+        manifest = await ctx.manifest_for(paths)
     except CloudError as exc:
         # Transient cloud failure (rate limit, network blip). DON'T treat
         # this as "no manifest → bootstrap upload" — that's how we got
@@ -319,7 +327,8 @@ async def sync_one_game(*, source: SaveSource, ref: SaveRef,
                 SyncResult.SKIPPED, game_id, ref.path, paths,
                 "cloud_to_device disabled — not pulling missing save")
         actual = await _pull_to_device(source=source, ref=ref, paths=paths,
-                                       expected_hash=h_cloud, ctx=ctx)
+                                       expected_hash=h_cloud, ctx=ctx,
+                                       group_refs=group_refs)
         ctx.state.set_sync_state(
             source_id=source.id, game_id=game_id,
             last_synced_hash=actual, device_seen_path=ref.path)
@@ -357,23 +366,27 @@ async def sync_one_game(*, source: SaveSource, ref: SaveRef,
                     "stale device but cloud_to_device disabled")
             actual = await _pull_to_device(
                 source=source, ref=ref, paths=paths,
-                expected_hash=h_cloud, ctx=ctx)
+                expected_hash=h_cloud, ctx=ctx, group_refs=group_refs)
             ctx.state.set_sync_state(
                 source_id=source.id, game_id=game_id,
                 last_synced_hash=actual, device_seen_path=ref.path)
             return SyncOutcome(SyncResult.DOWNLOADED, game_id,
                                ref.path, paths,
                                f"stale device had ~{hash8(h_dev)}")
-        # Unknown-device policy: when configured, preserve the device's
-        # bytes as a versions/* entry (so they're recoverable) but let
-        # cloud's current win. Useful for Pockets whose source_id has
-        # changed (per-UUID migration) and which now look "unknown" but
-        # actually have stale data.
-        if (ctx.cfg.cloud_wins_on_unknown_device
+        # Unknown-device policy: if we haven't seen the game actively played,
+        # preserve the device's bytes as a versions/* entry but let cloud's
+        # current win. Protects cloud from session noise or unobserved offline play
+        # when plugged in to a new/unknown device.
+        played_recently = False
+        last_played_at = ctx.state.get_last_played_at(source.id, game_id)
+        if last_played_at is not None:
+            played_recently = True
+
+        if (not played_recently
                 and manifest is not None
                 and len(manifest.versions) > 0):
             log.info(
-                "%s on %s: cloud_wins_on_unknown_device set; preserving "
+                "%s on %s: not played recently; preserving "
                 "device bytes %s as a versions/* entry (NOT touching "
                 "current.srm), then pulling cloud's current %s",
                 game_id, source.id, hash8(h_dev), hash8(h_cloud))
@@ -386,7 +399,7 @@ async def sync_one_game(*, source: SaveSource, ref: SaveRef,
             if ctx.cfg.cloud_to_device:
                 actual = await _pull_to_device(
                     source=source, ref=ref, paths=paths,
-                    expected_hash=h_cloud, ctx=ctx)
+                    expected_hash=h_cloud, ctx=ctx, group_refs=group_refs)
                 ctx.state.set_sync_state(
                     source_id=source.id, game_id=game_id,
                     last_synced_hash=actual, device_seen_path=ref.path)
@@ -444,7 +457,8 @@ async def sync_one_game(*, source: SaveSource, ref: SaveRef,
                 SyncResult.SKIPPED, game_id, ref.path, paths,
                 "cloud_to_device disabled — not pulling cloud-newer save")
         actual = await _pull_to_device(source=source, ref=ref, paths=paths,
-                                       expected_hash=h_cloud, ctx=ctx)
+                                       expected_hash=h_cloud, ctx=ctx,
+                                       group_refs=group_refs)
         ctx.state.set_sync_state(
             source_id=source.id, game_id=game_id,
             last_synced_hash=actual, device_seen_path=ref.path)
@@ -465,24 +479,30 @@ async def sync_one_game(*, source: SaveSource, ref: SaveRef,
                 SyncResult.SKIPPED, game_id, ref.path, paths,
                 "drift but cloud_to_device disabled")
         actual = await _pull_to_device(source=source, ref=ref, paths=paths,
-                                       expected_hash=h_cloud, ctx=ctx)
+                                       expected_hash=h_cloud, ctx=ctx,
+                                       group_refs=group_refs)
         ctx.state.set_sync_state(
             source_id=source.id, game_id=game_id,
             last_synced_hash=actual, device_seen_path=ref.path)
-        return SyncOutcome(SyncResult.DOWNLOADED, game_id, ref.path,
-                           paths, "drift filter case 7 → cloud wins")
+        return SyncOutcome(SyncResult.DOWNLOADED, game_id,
+                           ref.path, paths, "drift filter case 7 → cloud wins")
 
-    # Diverged-device policy: preserve the device's bytes as a
-    # versions/* entry (recoverable via `retrosync promote`) but let
-    # cloud's current win. Mirrors `cloud_wins_on_unknown_device` for
-    # case 7 — typical use case is the FXPak Pro where cart-side
-    # divergence is usually session noise rather than a deliberate
-    # save the operator wants to publish.
-    if (ctx.cfg.cloud_wins_on_diverged_device
+    # Diverged-device policy: if the game hasn't been played recently,
+    # preserve the device's bytes as a versions/* entry (recoverable via 
+    # `retrosync promote`) but let cloud's current win. This safely ignores
+    # session noise while allowing legitimate, observed offline play to win.
+    played_recently = False
+    last_played_at = ctx.state.get_last_played_at(source.id, game_id)
+    if last_played_at is not None:
+        last_synced_at = sync_state.last_synced_at if sync_state else None
+        if not last_synced_at or last_played_at > last_synced_at:
+            played_recently = True
+
+    if (not played_recently
             and manifest is not None
             and len(manifest.versions) > 0):
         log.info(
-            "%s on %s: cloud_wins_on_diverged_device set; preserving "
+            "%s on %s: not played recently; preserving "
             "device bytes %s as a versions/* entry (NOT touching "
             "current.<ext>), then pulling cloud's current %s",
             game_id, source.id, hash8(h_dev), hash8(h_cloud))
@@ -561,7 +581,13 @@ async def _upload_version_path(*, source: SaveSource, ref: SaveRef,
         )
         if update_current:
             await asyncio.sleep(ctx.cfg.inter_op_sleep_sec)
-            ctx.cloud.overwrite_current(paths=paths, save_data=data)
+            await asyncio.to_thread(ctx.cloud.overwrite_current, paths=paths, save_data=data)
+            if getattr(ctx, "mirror", None) is not None:
+                # Also update the local mirror if the Pi uploaded it
+                # We need the most recent manifest for this
+                manifest = await ctx.manifest_for(paths)
+                if manifest:
+                    ctx.mirror.update_local(paths, manifest, data)
         ctx.state.mark_uploaded(v_id, cloud_path=version_path)
         log.info("sync: uploaded %s for %s → %s",
                  hash8(h), game_id, version_path)
@@ -713,7 +739,8 @@ async def _manifest_drifted(*, ctx: SyncContext, paths: CloudPaths,
 
 async def _pull_to_device(*, source: SaveSource, ref: SaveRef,
                           paths: CloudPaths, expected_hash: str,
-                          ctx: SyncContext) -> str:
+                          ctx: SyncContext,
+                          group_refs: list[SaveRef] | None = None) -> str:
     """Download cloud's current.* and write to the device.
 
     Also keeps state.db in step so the next poll sees the new hash as
@@ -729,15 +756,24 @@ async def _pull_to_device(*, source: SaveSource, ref: SaveRef,
     refresh_manifest pass will then write a manifest whose
     current_hash matches reality, repairing the cloud-side desync.
     """
-    data = ctx.cloud.download_bytes(src=paths.current)
+    if ctx.mirror is not None:
+        data = await ctx.mirror.get_current_bytes(paths, expected_hash, ctx.cloud)
+    else:
+        data = await asyncio.to_thread(ctx.cloud.download_bytes, src=paths.current)
+    
     got = sha256_bytes(data)
     if got != expected_hash:
         log.warning(
             "manifest/current.<ext> desync for %s: manifest says %s, "
-            "actual current.<ext> is %s. Trusting the bytes; manifest "
-            "current_hash will be repaired by the next refresh.",
+            "actual current.<ext> is %s. Trusting the bytes; manifest ",
             paths.current, hash8(expected_hash), hash8(got))
-    await source.write_save(ref, data)
+    
+    write_method = getattr(source, "write_canonical_bytes", None)
+    if write_method and group_refs is not None:
+        await write_method(group_refs, data)
+    else:
+        await source.write_save(ref, data)
+        
     game_id = paths.base.rsplit("/", 1)[-1]
     ctx.state.touch_file(source_id=source.id, path=ref.path,
                          game_id=game_id)
@@ -784,7 +820,7 @@ async def _auto_resolve_device_wins(*, source: SaveSource, ref: SaveRef,
     records the divergence so the loser is discoverable later via
     `retrosync conflicts show <id>`."""
     cloud_version = _find_cloud_version_path(
-        ctx.manifest_for(paths), h_cloud)
+        await ctx.manifest_for(paths), h_cloud)
     await _upload_version_path(
         source=source, ref=ref, data=data, h=h_dev,
         paths=paths, game_id=game_id, ctx=ctx,
@@ -846,7 +882,7 @@ async def _record_conflict(*, source: SaveSource, ref: SaveRef,
         device_kind=getattr(source, "device_kind", source.system),
     )
     ctx.cloud.upload_bytes(data=data, dest=conflict_path)
-    cloud_version = _find_cloud_version_path(ctx.manifest_for(paths), h_cloud)
+    cloud_version = _find_cloud_version_path(await ctx.manifest_for(paths), h_cloud)
     cid = ctx.state.insert_conflict(
         game_id=game_id, system=source.system, source_id=source.id,
         base_hash=base, cloud_hash=h_cloud, device_hash=h_dev,
@@ -874,8 +910,8 @@ def _find_cloud_version_path(manifest: Manifest | None,
 # Manifest refresh — orchestrator calls this after a batch of sync ops.
 # --------------------------------------------------------------------------
 
-def refresh_manifest(*, source: SaveSource, save_path: str, game_id: str,
-                     paths: CloudPaths, ctx: SyncContext) -> None:
+async def refresh_manifest(*, source: SaveSource, save_path: str, game_id: str,
+                           paths: CloudPaths, ctx: SyncContext) -> None:
     """Rebuild manifest.json for one game from SQLite + sync state.
 
     Called by orchestrators after a batch of sync_one_game calls so
@@ -957,5 +993,5 @@ def refresh_manifest(*, source: SaveSource, save_path: str, game_id: str,
         versions=entries,
         device_state=device_state, conflicts=conflicts,
     )
-    ctx.cloud.write_manifest(paths=paths, manifest=manifest)
+    await asyncio.to_thread(ctx.cloud.write_manifest, paths=paths, manifest=manifest)
     ctx.invalidate_manifest(paths)

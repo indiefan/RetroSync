@@ -69,7 +69,7 @@ async def _seed_case_7(state, cloud):
                       cfg=SyncConfig(cloud_to_device=True))
     out = await sync_one_game(
         source=src, ref=SaveRef(path="/Foo.srm"), ctx=ctx)
-    refresh_manifest(source=src, save_path="/Foo.srm",
+    await refresh_manifest(source=src, save_path="/Foo.srm",
                      game_id=out.game_id, paths=out.paths, ctx=ctx)
     old_hash = sha256_bytes(files["/Foo.srm"])
 
@@ -89,8 +89,25 @@ async def _seed_case_7(state, cloud):
     return src, files, old_hash, new_hash, diverged_hash, out
 
 
-async def test_case_7_default_device_wins() -> bool:
-    """Default config: case 7 → conflict_winner=device → upload."""
+async def test_case_7_played_recently_device_wins() -> bool:
+    """When a game has been actively played since the last sync,
+    case 7 → conflict_winner=device → upload."""
+    _, state, cloud = _setup()
+    src, files, old_h, new_h, div_h, out0 = await _seed_case_7(state, cloud)
+    # Simulate the game being played AFTER the last sync
+    state.record_gameplay_session(src.id, "foo", "9999-12-31T23:59:59Z")
+    
+    ctx = SyncContext(state=state, cloud=cloud, cfg=SyncConfig(
+        cloud_to_device=True))
+    out = await sync_one_game(
+        source=src, ref=SaveRef(path="/Foo.srm"), ctx=ctx)
+    state.close()
+    return _check(out.result, SyncResult.CONFLICT_RESOLVED,
+                  "played recently: conflict_winner=device auto-resolves")
+
+
+async def test_case_7_unplayed_cloud_wins() -> bool:
+    """When a game has NOT been played recently: case 7 → preserve device bytes + cloud wins."""
     _, state, cloud = _setup()
     src, files, old_h, new_h, div_h, out0 = await _seed_case_7(state, cloud)
     ctx = SyncContext(state=state, cloud=cloud, cfg=SyncConfig(
@@ -98,35 +115,20 @@ async def test_case_7_default_device_wins() -> bool:
     out = await sync_one_game(
         source=src, ref=SaveRef(path="/Foo.srm"), ctx=ctx)
     state.close()
-    return _check(out.result, SyncResult.CONFLICT_RESOLVED,
-                  "default: conflict_winner=device auto-resolves")
-
-
-async def test_case_7_cloud_wins_on_diverged_device() -> bool:
-    """Opt-in: case 7 → preserve device bytes + cloud wins."""
-    _, state, cloud = _setup()
-    src, files, old_h, new_h, div_h, out0 = await _seed_case_7(state, cloud)
-    ctx = SyncContext(state=state, cloud=cloud, cfg=SyncConfig(
-        cloud_to_device=True,
-        cloud_wins_on_diverged_device=True))
-    out = await sync_one_game(
-        source=src, ref=SaveRef(path="/Foo.srm"), ctx=ctx)
-    state.close()
     ok = _check(out.result, SyncResult.DOWNLOADED,
-                "opt-in: cloud wins, device gets cloud's bytes")
+                "unplayed: cloud wins, device gets cloud's bytes")
     ok &= _check(sha256_bytes(files["/Foo.srm"]), new_h,
                  "device file overwritten with cloud's NEW bytes")
     return ok
 
 
-async def test_case_7_cloud_wins_preserves_device_bytes() -> bool:
+async def test_case_7_unplayed_cloud_wins_preserves_device_bytes() -> bool:
     """The diverged device bytes still land in versions/ (recoverable
     via `retrosync promote`) even though cloud wins."""
     _, state, cloud = _setup()
     src, files, old_h, new_h, div_h, out0 = await _seed_case_7(state, cloud)
     ctx = SyncContext(state=state, cloud=cloud, cfg=SyncConfig(
-        cloud_to_device=True,
-        cloud_wins_on_diverged_device=True))
+        cloud_to_device=True))
     await sync_one_game(
         source=src, ref=SaveRef(path="/Foo.srm"), ctx=ctx)
     # Was there a versions/* row inserted with the diverged hash?
@@ -141,11 +143,9 @@ async def test_case_7_cloud_wins_preserves_device_bytes() -> bool:
 def main() -> int:
     ok = True
     for name, fn in [
-        ("case_7_default_device_wins", test_case_7_default_device_wins),
-        ("case_7_cloud_wins_on_diverged_device",
-         test_case_7_cloud_wins_on_diverged_device),
-        ("case_7_cloud_wins_preserves_device_bytes",
-         test_case_7_cloud_wins_preserves_device_bytes),
+        ("case_7_played_recently_device_wins", test_case_7_played_recently_device_wins),
+        ("case_7_unplayed_cloud_wins", test_case_7_unplayed_cloud_wins),
+        ("case_7_unplayed_cloud_wins_preserves_device_bytes", test_case_7_unplayed_cloud_wins_preserves_device_bytes),
     ]:
         print(f"--- {name} ---")
         ok &= asyncio.run(fn())

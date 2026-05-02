@@ -64,6 +64,10 @@ class SaveSource(Protocol):
 
     async def health(self) -> HealthStatus: ...
 
+    async def currently_playing_game_id(self) -> str | None:
+        """Return the game_id of the currently active/loaded ROM, if any."""
+        return None
+
     async def list_saves(self) -> list[SaveRef]: ...
 
     async def read_save(self, ref: SaveRef) -> bytes: ...
