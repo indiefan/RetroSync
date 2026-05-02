@@ -191,6 +191,7 @@ class BackupOrchestrator:
 
         try:
             refs = await self._source.list_saves()
+            log.debug("starting sync pass for %s, found %d saves", self._source.id, len(refs))
         except SourceError as exc:
             log.warning("list_saves failed for %s: %s", self._source.id, exc)
             return
@@ -383,11 +384,14 @@ class BackupOrchestrator:
                 # newer copies and pull them down. Engine returns IN_SYNC
                 # cheaply when nothing's changed, courtesy of the per-pass
                 # manifest cache.
+                log.debug("save %s is stable; checking against cloud state", ref.path)
                 outcome = await sync_one_game(
                     source=self._source, ref=ref, ctx=ctx,
                     primed_data=data, primed_hash=h,
                     group_refs=group_refs,
                 )
+                if outcome and outcome.result == SyncResult.IN_SYNC:
+                    log.debug("%s is already in sync", ref.path)
                 self._record_refresh(outcome, refresh_targets)
             return game_id
 

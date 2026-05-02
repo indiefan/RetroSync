@@ -277,6 +277,7 @@ async def sync_one_game(*, source: SaveSource, ref: SaveRef,
         ctx.state.set_sync_state(
             source_id=source.id, game_id=game_id,
             last_synced_hash=h_dev, device_seen_path=ref.path)
+        log.info("sync: %s on %s is fully in sync with cloud (hash: %s)", game_id, source.id, hash8(h_dev))
         return SyncOutcome(SyncResult.IN_SYNC, game_id, ref.path, paths)
 
     # 2. No cloud version yet → bootstrap upload from device.
