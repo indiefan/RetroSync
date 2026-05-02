@@ -32,7 +32,6 @@ class CloudMirror:
         self._cloud_modtimes: dict[str, str] = {}
         if self._modtimes_path.exists():
             try:
-                import json
                 with open(self._modtimes_path, "r") as f:
                     self._cloud_modtimes = json.load(f)
             except Exception:
@@ -168,7 +167,6 @@ class CloudMirror:
                 
         # Persist modtimes to disk so they survive daemon restarts
         try:
-            import json
             self._atomic_write(self._modtimes_path, json.dumps(self._cloud_modtimes).encode("utf-8"))
         except Exception as e:
             log.warning("failed to persist modtimes to disk: %s", e)
