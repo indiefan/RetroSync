@@ -149,8 +149,7 @@ class CloudMirror:
             try:
                 manifest = await self.refresh_manifest(paths, cloud)
                 if manifest and manifest.current_hash and manifest.current_hash != local_hash:
-                    log.info("background poll: caching newer save for %s/%s", system, game_id)
-                    await self.get_current_bytes(paths, manifest.current_hash, cloud)
+                    log.info("background poll: caching newer save manifest for %s/%s", system, game_id)
                 
                 # Mark as seen
                 self._cloud_modtimes[rel_path] = cloud_modtime
