@@ -173,7 +173,7 @@ async def run_pocket_sync(*, source: PocketSource, config: Config,
     state.upsert_source(id=source.id, system=source.system,
                         adapter="PocketSource", config_json="{}")
     from ..cloud_mirror import CloudMirror
-    mirror = CloudMirror(config.cloud.local_cache_path)
+    mirror = CloudMirror(config.cloud.local_cache_root)
     
     # Bulk-refresh local manifest cache so we don't hit Drive 100 times
     log.info("pocket: bulk-refreshing cloud manifest cache...")
