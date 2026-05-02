@@ -29,11 +29,13 @@ class CloudMirror:
         self._cloud_modtimes: dict[str, str] = {}
 
     def _local_manifest_path(self, paths: CloudPaths) -> Path:
-        return self.root / paths.system / paths.game_id / "manifest.json"
+        system, game_id = paths.base.rsplit("/", 2)[-2:]
+        return self.root / system / game_id / "manifest.json"
 
     def _local_current_path(self, paths: CloudPaths) -> Path:
+        system, game_id = paths.base.rsplit("/", 2)[-2:]
         ext = Path(paths.current).suffix
-        return self.root / paths.system / paths.game_id / f"current{ext}"
+        return self.root / system / game_id / f"current{ext}"
 
     def _atomic_write(self, dest: Path, data: bytes) -> None:
         dest.parent.mkdir(parents=True, exist_ok=True)
