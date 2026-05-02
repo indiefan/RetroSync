@@ -550,7 +550,8 @@ async def _upload_version_path(*, source: SaveSource, ref: SaveRef,
 
     ctx.state.mark_uploading(v_id)
     try:
-        version_path = ctx.cloud.upload_version(
+        version_path = await asyncio.to_thread(
+            ctx.cloud.upload_version,
             paths=paths, save_data=data, full_hash=h,
             observed_at=utc_iso(),
             device_kind=getattr(source, "device_kind", source.system),
