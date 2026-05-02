@@ -85,6 +85,12 @@ class SyncConfig:
       `retrosync conflicts resolve` decision. Conservative, more work.
     """
 
+    trust_manifest_cache: bool = False
+    """If true, reads manifests from the CloudMirror cache without
+    doing a network validation. Useful for one-shot bulk jobs that pre-fetch
+    metadata.
+    """
+
     drift_threshold: dict[str, int] = field(default_factory=dict)
     """Per-device-kind byte-count threshold for the "drift filter".
 
@@ -129,10 +135,15 @@ class SyncContext:
             return self._manifest_cache[paths.base]
         
         if getattr(self, "mirror", None) is not None:
+            if self.cfg.trust_manifest_cache:
+                m = self.mirror.get_manifest(paths)
+                if m is not None:
+                    self._manifest_cache[paths.base] = m
+                    return m
             m = await self.mirror.refresh_manifest(paths, self.cloud)
         else:
             # Fallback if no mirror is provided
-            m = self.cloud.read_manifest(paths)
+            m = await asyncio.to_thread(self.cloud.read_manifest, paths)
             
         self._manifest_cache[paths.base] = m
         return m

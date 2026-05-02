@@ -59,6 +59,16 @@ class CloudMirror:
                                manifest.to_json().encode("utf-8"))
         return manifest
 
+    def get_manifest(self, paths: CloudPaths) -> Manifest | None:
+        """Read manifest directly from the local cache without network calls."""
+        local_path = self._local_manifest_path(paths)
+        if local_path.exists():
+            try:
+                return Manifest.from_json(local_path.read_bytes().decode("utf-8"))
+            except Exception:
+                pass
+        return None
+
     async def get_current_bytes(self, paths: CloudPaths, expected_hash: str, cloud: RcloneCloud) -> bytes:
         """Return save bytes, preferring the local cache if the hash matches."""
         local_path = self._local_current_path(paths)

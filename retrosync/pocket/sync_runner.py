@@ -172,11 +172,19 @@ async def run_pocket_sync(*, source: PocketSource, config: Config,
                         config_path=config.cloud.rclone_config_path)
     state.upsert_source(id=source.id, system=source.system,
                         adapter="PocketSource", config_json="{}")
+    from ..cloud_mirror import CloudMirror
+    mirror = CloudMirror(config.cloud.local_cache_path)
+    
+    # Bulk-refresh local manifest cache so we don't hit Drive 100 times
+    log.info("pocket: bulk-refreshing cloud manifest cache...")
+    await mirror.background_poll(cloud)
+
     sync_cfg = SyncConfig(
         cloud_to_device=config.cloud_to_device,
         conflict_winner=config.conflict_winner,
+        trust_manifest_cache=True,
         drift_threshold=dict(config.drift_threshold))
-    ctx = SyncContext(state=state, cloud=cloud, cfg=sync_cfg)
+    ctx = SyncContext(state=state, cloud=cloud, cfg=sync_cfg, mirror=mirror)
     summary = PocketSyncSummary()
     refresh_targets: dict[str, tuple[str, str, object]] = {}
     # One lease per game we sync; released in the `finally` below so
