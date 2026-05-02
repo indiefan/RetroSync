@@ -85,41 +85,6 @@ class SyncConfig:
       `retrosync conflicts resolve` decision. Conservative, more work.
     """
 
-    cloud_wins_on_unknown_device: bool = False
-    """When a device with no prior sync_state shows up with bytes that
-    differ from cloud's current AND don't match any known historical
-    version (case 4), what do we do?
-
-    - False (default): conflict_winner kicks in — typically `device`
-      wins, the device's bytes become the new cloud current. Best when
-      the device is genuinely new and you trust its data.
-    - True: preserve the device's bytes as a versions/* entry (so they
-      can be recovered later) but make cloud's existing current the
-      winner; if cloud_to_device is on, write cloud's bytes onto the
-      device. Best when the device is a reused-but-stale source — e.g.
-      a Pocket whose source_id changed (per-physical-device UUID
-      migration) and you'd rather inherit the cloud-side latest than
-      regress to a stale local copy.
-    """
-
-    cloud_wins_on_diverged_device: bool = False
-    """Like `cloud_wins_on_unknown_device` but for case 7 (both sides
-    moved since the last agreed hash). Default False preserves the
-    legacy `conflict_winner=device` auto-resolve, which uploads the
-    device's bytes and effectively overrides cloud — fine when the
-    device's edits are real, terrible when the device's "edits" are
-    just stale SRAM from a power-cycle.
-
-    True is recommended on the Pi/FXPak side: a cart's bytes that
-    diverged from the last agreed hash are usually unrelated session
-    artifacts (prior savestate hot-swap, a different game's autosave
-    leftover, etc.) rather than a deliberate user save. Letting cloud
-    win on case 7 means the cart picks up another device's deliberate
-    save instead of overwriting it with cart-side noise. The device's
-    bytes are still preserved as a versions/* entry for recovery via
-    `retrosync promote <game> <hash>`.
-    """
-
     drift_threshold: dict[str, int] = field(default_factory=dict)
     """Per-device-kind byte-count threshold for the "drift filter".
 
