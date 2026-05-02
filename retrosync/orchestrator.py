@@ -575,6 +575,7 @@ async def run_all(config: Config, *,
     sync_cfg = SyncConfig(
         cloud_to_device=config.cloud_to_device,
         conflict_winner=config.conflict_winner,
+        trust_manifest_cache=True,
         drift_threshold=dict(config.drift_threshold))
         
     from .cloud_mirror import CloudMirror
