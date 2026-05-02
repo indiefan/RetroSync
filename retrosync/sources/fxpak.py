@@ -91,8 +91,8 @@ class FXPakSource:
                 if not rom_name:
                     return None
                 # Clean up the name like we do for full filenames
-                spaced = rom_name.replace("(", " ").replace(")", " ") \\
-                                 .replace("[", " ").replace("]", " ")
+                spaced = (rom_name.replace("(", " ").replace(")", " ")
+                                  .replace("[", " ").replace("]", " "))
                 return canonical_slug(spaced)
         except Usb2SnesError:
             return None
