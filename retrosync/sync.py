@@ -560,8 +560,9 @@ async def _upload_version_path(*, source: SaveSource, ref: SaveRef,
             await asyncio.to_thread(ctx.cloud.overwrite_current, paths=paths, save_data=data)
             if getattr(ctx, "mirror", None) is not None:
                 # Also update the local mirror if the Pi uploaded it
-                # We need the most recent manifest for this
-                manifest = await ctx.manifest_for(paths)
+                # We need the most recent manifest for this, so explicitly refresh
+                # it from the cloud (otherwise manifest_for just reads the stale cache!)
+                manifest = await ctx.mirror.refresh_manifest(paths, ctx.cloud)
                 if manifest:
                     ctx.mirror.update_local(paths, manifest, data)
         ctx.state.mark_uploaded(v_id, cloud_path=version_path)

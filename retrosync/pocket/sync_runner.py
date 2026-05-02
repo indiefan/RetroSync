@@ -175,9 +175,9 @@ async def run_pocket_sync(*, source: PocketSource, config: Config,
     from ..cloud_mirror import CloudMirror
     mirror = CloudMirror(config.cloud.local_cache_root)
     
-    # Bulk-refresh local manifest cache so we don't hit Drive 100 times
-    log.info("pocket: bulk-refreshing cloud manifest cache...")
-    await mirror.background_poll(cloud)
+    # We no longer bulk-refresh the cache here. 
+    # The background daemon does it every 30s, keeping the disk cache fresh.
+    # pocket-sync will just instantly read the daemon's disk cache.
 
     sync_cfg = SyncConfig(
         cloud_to_device=config.cloud_to_device,
