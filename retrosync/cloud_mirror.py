@@ -25,8 +25,18 @@ log = logging.getLogger(__name__)
 class CloudMirror:
     def __init__(self, cache_root: str | os.PathLike):
         self.root = Path(cache_root)
+        self.root.mkdir(parents=True, exist_ok=True)
+        self._modtimes_path = self.root / "modtimes.json"
+        
         # Maps cloud rel_path (e.g. "snes/super_metroid/manifest.json") to Drive ModTime
         self._cloud_modtimes: dict[str, str] = {}
+        if self._modtimes_path.exists():
+            try:
+                import json
+                with open(self._modtimes_path, "r") as f:
+                    self._cloud_modtimes = json.load(f)
+            except Exception:
+                pass
 
     def _local_manifest_path(self, paths: CloudPaths) -> Path:
         system, game_id = paths.base.rsplit("/", 2)[-2:]
@@ -155,3 +165,10 @@ class CloudMirror:
                 self._cloud_modtimes[rel_path] = cloud_modtime
             except Exception as e:
                 log.warning("background poll failed to cache %s/%s: %s", system, game_id, e)
+                
+        # Persist modtimes to disk so they survive daemon restarts
+        try:
+            import json
+            self._atomic_write(self._modtimes_path, json.dumps(self._cloud_modtimes).encode("utf-8"))
+        except Exception as e:
+            log.warning("failed to persist modtimes to disk: %s", e)
