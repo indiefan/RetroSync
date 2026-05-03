@@ -196,8 +196,13 @@ class BackupOrchestrator:
             log.warning("list_saves failed for %s: %s", self._source.id, exc)
             return
 
+        from dataclasses import replace
+        # The daemon has a background poller keeping the mirror cache fresh.
+        # We MUST trust the cache here, otherwise we do a blocking `rclone cat`
+        # for every single game on the SD card sequentially (taking 5s per game)!
+        fast_cfg = replace(self._deps.sync_cfg, trust_manifest_cache=True)
         ctx = SyncContext(state=self._deps.state, cloud=self._deps.cloud,
-                          cfg=self._deps.sync_cfg, mirror=self._deps.mirror)
+                          cfg=fast_cfg, mirror=self._deps.mirror)
         refresh_targets: dict[str, tuple[str, str, object]] = {}
 
         present_paths = {ref.path for ref in refs}
