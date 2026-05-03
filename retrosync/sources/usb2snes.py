@@ -206,7 +206,8 @@ class Usb2SnesClient:
         return entries
 
     async def list_recursive(self, root: str = "/", *,
-                             max_depth: int = 8) -> list[str]:
+                             max_depth: int = 8,
+                             exclude_dirs: tuple[str, ...] = ()) -> list[str]:
         """List all *file* paths under root. Slow on large SDs; cache results."""
         out: list[str] = []
         stack: list[tuple[str, int]] = [(root, 0)]
@@ -221,6 +222,8 @@ class Usb2SnesClient:
                 continue
             for e in entries:
                 child = path.rstrip("/") + "/" + e.name
+                if any(child.startswith(excl) for excl in exclude_dirs):
+                    continue
                 if e.is_dir:
                     stack.append((child, depth + 1))
                 else:

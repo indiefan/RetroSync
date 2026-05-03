@@ -37,7 +37,8 @@ SRM_SUFFIX = ".srm"
 class FXPakConfig:
     id: str
     sni_url: str = "ws://127.0.0.1:23074"
-    sd_root: str = "/"
+    sd_root: str = "/sd2snes/saves"
+    exclude_dirs: tuple[str, ...] = ("/.Trash", "/.Trashes", "/.fseventsd", "/ED64", "/roms")
     save_extensions: tuple[str, ...] = (SRM_SUFFIX,)
     game_aliases: dict[str, list[str]] = field(default_factory=dict)
     # FXPak only ships SNES today, but `system` is now first-class
@@ -101,7 +102,7 @@ class FXPakSource:
         try:
             async with Usb2SnesClient(self._cfg.sni_url) as cart:
                 await cart.attach()
-                paths = await cart.list_recursive(self._cfg.sd_root)
+                paths = await cart.list_recursive(self._cfg.sd_root, exclude_dirs=self._cfg.exclude_dirs)
         except Usb2SnesError as exc:
             raise SourceError(str(exc)) from exc
 
