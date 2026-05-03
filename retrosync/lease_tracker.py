@@ -18,6 +18,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+import asyncio
 
 from . import leases as leases_mod
 from .cloud import ActiveLease, CloudError, CloudPaths, RcloneCloud
@@ -43,7 +44,7 @@ class LeaseTracker:
     cfg: LeaseConfig = field(default_factory=LeaseConfig)
     _held: dict[str, _Held] = field(default_factory=dict)
 
-    def ensure(self, *, game_id: str, paths: CloudPaths,
+    async def ensure(self, *, game_id: str, paths: CloudPaths,
                current_hash: str | None = None) -> bool:
         """Acquire (or heartbeat) the lease for `game_id`.
 
@@ -59,7 +60,8 @@ class LeaseTracker:
             if elapsed < self.cfg.heartbeat_minutes * 60:
                 return True
             try:
-                ok = leases_mod.heartbeat(
+                ok = await asyncio.to_thread(
+                    leases_mod.heartbeat,
                     cloud=self.cloud, paths=paths,
                     source_id=self.source_id,
                     ttl_minutes=self.cfg.ttl_minutes)
@@ -73,7 +75,8 @@ class LeaseTracker:
             # acquire below.
             self._held.pop(game_id, None)
         try:
-            outcome = leases_mod.acquire(
+            outcome = await asyncio.to_thread(
+                leases_mod.acquire,
                 cloud=self.cloud, paths=paths,
                 source_id=self.source_id, mode=self.cfg.mode,
                 ttl_minutes=self.cfg.ttl_minutes,

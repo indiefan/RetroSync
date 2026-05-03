@@ -269,7 +269,7 @@ class BackupOrchestrator:
         for game_id, paths in cloud_games:
             if game_id in seen_game_ids:
                 continue
-            if not self._lease_tracker.ensure(game_id=game_id, paths=paths):
+            if not await self._lease_tracker.ensure(game_id=game_id, paths=paths):
                 log.info("  bootstrap %s → SKIPPED (lease contention)", game_id)
                 continue
             
@@ -371,7 +371,7 @@ class BackupOrchestrator:
         paths = compose_paths(remote=self._deps.cloud.remote,
                               system=self._source.system,
                               game_id=game_id, save_filename=ref.path)
-        if not self._lease_tracker.ensure(
+        if not await self._lease_tracker.ensure(
                 game_id=game_id, paths=paths, current_hash=h):
             log.info("hard-mode lease contention for %s on %s; skipping "
                      "this game until the holder releases",
