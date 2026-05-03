@@ -302,8 +302,8 @@ class StateStore:
         """Drop a stale pending/debouncing version when a newer hash arrives."""
         with self.tx() as c:
             c.execute("UPDATE versions SET state='tombstoned' "
-                      "WHERE id=? AND state IN (?, ?)",
-                      (version_id, ST_PENDING, ST_DEBOUNCING))
+                      "WHERE id=? AND state IN (?, ?, ?)",
+                      (version_id, ST_PENDING, ST_DEBOUNCING, ST_READY))
 
     def mark_uploading(self, version_id: int) -> None:
         with self.tx() as c:
