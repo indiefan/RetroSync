@@ -180,6 +180,7 @@ class BackupOrchestrator:
                 return
 
         # Poll currently active game, if the source supports it.
+        active_game_id = None
         try:
             active_game_id = await self._source.currently_playing_game_id()
             if active_game_id:
@@ -224,7 +225,7 @@ class BackupOrchestrator:
         seen_game_ids: set[str] = set()
         for group_key, group_refs in groups.items():
             game_id = await self._poll_one_group(group_key, group_refs, ctx,
-                                                 refresh_targets)
+                                                 refresh_targets, active_game_id)
             if game_id:
                 seen_game_ids.add(game_id)
 
@@ -332,7 +333,8 @@ class BackupOrchestrator:
     async def _poll_one_group(self, group_key: str,
                               group_refs: list[SaveRef],
                               ctx: SyncContext,
-                              refresh_targets: dict[str, tuple[str, str, object]]
+                              refresh_targets: dict[str, tuple[str, str, object]],
+                              active_game_id: str | None = None
                               ) -> str | None:
         """Process one logical save (one or more device-side files).
 
@@ -371,12 +373,15 @@ class BackupOrchestrator:
         paths = compose_paths(remote=self._deps.cloud.remote,
                               system=self._source.system,
                               game_id=game_id, save_filename=ref.path)
-        if not await self._lease_tracker.ensure(
-                game_id=game_id, paths=paths, current_hash=h):
-            log.info("hard-mode lease contention for %s on %s; skipping "
-                     "this game until the holder releases",
-                     game_id, self._source.id)
-            return game_id
+                              
+        needs_lease = (h != prev_h) or (game_id == active_game_id)
+        if needs_lease:
+            if not await self._lease_tracker.ensure(
+                    game_id=game_id, paths=paths, current_hash=h):
+                log.info("hard-mode lease contention for %s on %s; skipping "
+                         "this game until the holder releases",
+                         game_id, self._source.id)
+                return game_id
 
         if h == prev_h:
             latest = self._deps.state.latest_active_version(
