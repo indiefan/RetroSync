@@ -252,7 +252,7 @@ async def sync_one_game(*, source: SaveSource, ref: SaveRef,
         # lsjson and compares size + ModTime against the manifest;
         # if either looks off, force a re-pull via _pull_to_device
         # (which itself self-heals on hash mismatch).
-        if manifest is not None and await _manifest_drifted(
+        if manifest is not None and ctx.cfg.cloud_to_device and await _manifest_drifted(
                 ctx=ctx, paths=paths,
                 expected_size=manifest.current_size,
                 manifest_updated_at=manifest.updated_at):
@@ -683,7 +683,7 @@ async def _manifest_drifted(*, ctx: SyncContext, paths: CloudPaths,
          GoodTools-vs-No-Intro N64 migration was the motivating case.)
     """
     try:
-        entries = ctx.cloud.lsjson(paths.current)
+        entries = await asyncio.to_thread(ctx.cloud.lsjson, paths.current)
     except CloudError as exc:
         log.debug("manifest drift check: lsjson failed (%s); skipping",
                   exc)
